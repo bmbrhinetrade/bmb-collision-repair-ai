@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: bmb-collision-repair-ai
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VISION_MODEL
+        value: gpt-4.1
+      - key: VIN_EXTRA_PROVIDER_URL
+        sync: false
+      - key: VIN_EXTRA_PROVIDER_TOKEN
+        sync: false
+      - key: BMB_LOGO_URL
+        value: https://framerusercontent.com/images/mYEOmnUYBqG1jUuiKqIAFXijrIM.png?height=926&width=2828

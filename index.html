@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BMB Collision Repair AI - VIN + Vision + PDF</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="layout">
+    <header class="hero panel">
+      <h1>BMB Collision Repair AI</h1>
+      <p>VIN decode + AI vision estimate from photos + email-ready PDF export.</p>
+    </header>
+
+    <section class="workspace">
+      <aside class="panel controls">
+        <h2>Intake</h2>
+
+        <div class="field-grid two-up">
+          <label>
+            Estimating System
+            <select id="system">
+              <option value="mitchell">Mitchell</option>
+              <option value="ccc">CCC</option>
+              <option value="audatex">Audatex</option>
+              <option value="unknown">Unknown / System-neutral</option>
+            </select>
+          </label>
+          <label>
+            Estimate Type
+            <select id="estimateType">
+              <option value="preliminary">Preliminary</option>
+              <option value="supplement">Supplement</option>
+              <option value="final">Final</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="field-grid two-up">
+          <label>Year <input id="year" type="number" placeholder="2022" min="1980" max="2099"></label>
+          <label>Make <input id="make" type="text" placeholder="Toyota"></label>
+          <label>Model <input id="model" type="text" placeholder="Camry"></label>
+          <label>VIN <input id="vin" type="text" placeholder="1HGCM82633A..."></label>
+        </div>
+
+        <div class="action-row compact">
+          <button id="decodeVin">Decode VIN</button>
+          <p id="vinStatus" class="muted inline">VIN not decoded yet.</p>
+        </div>
+
+        <div id="vehicleDecoded" class="decoded"></div>
+
+        <div class="group-block">
+          <h3>Customer (Supplement Header)</h3>
+          <div class="field-grid">
+            <label>Full Name <input id="customerName" type="text" placeholder="Client full legal name"></label>
+            <label>Address <input id="customerAddress" type="text" placeholder="Street, City, State ZIP"></label>
+          </div>
+          <div class="field-grid two-up">
+            <label>Phone <input id="customerPhone" type="text" placeholder="(555) 555-5555"></label>
+            <label>Email <input id="customerEmail" type="email" placeholder="client@email.com"></label>
+          </div>
+
+          <div class="action-row compact">
+            <input id="licensePhoto" type="file" accept="image/*">
+            <button id="extractLicense" class="secondary">Extract License</button>
+          </div>
+          <p id="licenseStatus" class="muted">No license photo processed yet.</p>
+          <div id="licensePreview" class="license-preview"></div>
+        </div>
+
+        <div class="group-block">
+          <h3>Impact Areas</h3>
+          <div class="chips">
+            <label><input type="checkbox" id="impactFront" checked> Front</label>
+            <label><input type="checkbox" id="impactRear"> Rear</label>
+            <label><input type="checkbox" id="impactLeft"> Left</label>
+            <label><input type="checkbox" id="impactRight"> Right</label>
+          </div>
+        </div>
+
+        <div class="field-grid two-up">
+          <label>
+            Severity
+            <select id="severity">
+              <option value="cosmetic">Cosmetic</option>
+              <option value="functional" selected>Functional</option>
+              <option value="structural">Structural-suspect</option>
+              <option value="srs">Airbag / SRS-involved</option>
+            </select>
+          </label>
+          <label>
+            Drivable
+            <select id="drivable">
+              <option value="yes">Yes</option>
+              <option value="no">No</option>
+              <option value="unknown">Unknown</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="group-block">
+          <h3>Visible Triggers</h3>
+          <div class="chips">
+            <label><input type="checkbox" id="tAdas" checked> ADAS sensors/cameras visible</label>
+            <label><input type="checkbox" id="tLamps" checked> Lamp assemblies disturbed</label>
+            <label><input type="checkbox" id="tWheel"> Wheel or suspension clues</label>
+            <label><input type="checkbox" id="tBareMetal"> Bare metal / seam disturbance</label>
+            <label><input type="checkbox" id="tCooling"> Cooling stack risk (front impact)</label>
+            <label><input type="checkbox" id="tWindshield"> Windshield / mirror camera involvement</label>
+            <label><input type="checkbox" id="tAirbags"> Airbag or SRS indicators</label>
+            <label><input type="checkbox" id="tNoise"> Wind-noise / fitment concern</label>
+          </div>
+        </div>
+
+        <label>
+          Observed Notes (optional)
+          <textarea id="observedNotes" rows="4" placeholder="Example: RF bumper torn, radar emblem cracked, LF wheel appears out of alignment."></textarea>
+        </label>
+
+        <div class="group-block">
+          <h3>Photo Upload</h3>
+          <input id="photos" type="file" accept="image/*" multiple>
+          <p id="photoStats" class="muted">No photos uploaded.</p>
+          <div id="photoGrid" class="photo-grid"></div>
+        </div>
+
+        <div class="action-row">
+          <button id="generate">Generate Estimate From Photos</button>
+          <button id="clearPhotos" class="secondary">Clear Photos</button>
+        </div>
+      </aside>
+
+      <section class="panel results">
+        <div class="results-head">
+          <h2>Estimator Output</h2>
+          <div class="action-row inline-actions">
+            <button id="downloadPdf" class="secondary">Download PDF</button>
+            <button id="copyReport" class="secondary">Copy Report</button>
+          </div>
+        </div>
+
+        <p id="runStatus" class="status">Waiting for generation...</p>
+
+        <div id="summary" class="summary"></div>
+        <div id="outputs"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
