@@ -773,95 +773,100 @@ app.post("/api/estimate/generate", upload.fields([
   { name: "photos", maxCount: 20 },
   { name: "license", maxCount: 1 }
 ]), async (req, res) => {
-  const payload = safeJsonParse(req.body.payload, {}) || {};
-  payload.customer = normalizeCustomer(payload.customer);
-
-  const filesByField = req.files && typeof req.files === "object" ? req.files : {};
-  const photos = Array.isArray(filesByField.photos) ? filesByField.photos : [];
-  const licenseFile = Array.isArray(filesByField.license) && filesByField.license.length ? filesByField.license[0] : null;
-  const photoCount = photos.length;
-  let extractedCustomer = normalizeCustomer({});
-  let licenseNotes = [];
-  let licenseSource = "none";
-
-  if (licenseFile) {
     try {
-      const extracted = await extractCustomerFromLicense(licenseFile);
-      extractedCustomer = extracted.customer;
-      licenseNotes = extracted.notes || [];
-      licenseSource = extracted.source || "license-ai";
-    } catch (error) {
-      licenseNotes.push(`License extraction failed: ${error.message}`);
-      licenseSource = "license-error";
-    }
-  }
+      const body = req.body && typeof req.body === "object" ? req.body : {};
+      const payload = safeJsonParse(body.payload || "{}", {}) || {};
+      payload.customer = normalizeCustomer(payload.customer);
 
-  const mergedCustomer = mergeCustomers(payload.customer, extractedCustomer);
+      const filesByField = req.files && typeof req.files === "object" ? req.files : {};
+      const photos = Array.isArray(filesByField.photos) ? filesByField.photos : [];
+      const licenseFile = Array.isArray(filesByField.license) && filesByField.license.length ? filesByField.license[0] : null;
+      const photoCount = photos.length;
+      let extractedCustomer = normalizeCustomer({});
+      let licenseNotes = [];
+      let licenseSource = "none";
 
-  const vin = sanitizeVin(payload.vin || "");
+      if (licenseFile) {
+        try {
+          const extracted = await extractCustomerFromLicense(licenseFile);
+          extractedCustomer = extracted.customer;
+          licenseNotes = extracted.notes || [];
+          licenseSource = extracted.source || "license-ai";
+        } catch (error) {
+          licenseNotes.push(`License extraction failed: ${error.message}`);
+          licenseSource = "license-error";
+        }
+      }
 
-  let decodedVehicle = {
-    vin,
-    year: String(payload.year || ""),
-    make: payload.make || "",
-    model: payload.model || "",
-    trim: "",
-    paintCode: null,
-    paintDescription: null
-  };
+      const mergedCustomer = mergeCustomers(payload.customer, extractedCustomer);
 
-  if (vin && isVinValidShape(vin)) {
-    try {
-      const core = await decodeVinFromNhtsa(vin);
-      const extra = await decodeVinFromExtraProvider(vin);
-      decodedVehicle = {
+      const vin = sanitizeVin(payload.vin || "");
+
+      let decodedVehicle = {
         vin,
-        year: core.year,
-        make: core.make,
-        model: core.model,
-        trim: core.trim,
-        bodyClass: core.bodyClass,
-        paintCode: extra.paintCode,
-        paintDescription: extra.paintDescription
+        year: String(payload.year || ""),
+        make: payload.make || "",
+        model: payload.model || "",
+        trim: "",
+        paintCode: null,
+        paintDescription: null
       };
-    } catch {
-      // Keep intake fields if VIN decode fails during estimate.
-    }
-  }
 
-  if (!openaiClient || photoCount === 0) {
-    const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
-    if (licenseSource !== "none") {
-      fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
-      for (const note of licenseNotes) {
-        fallback.assumptions.push(note);
+      if (vin && isVinValidShape(vin)) {
+        try {
+          const core = await decodeVinFromNhtsa(vin);
+          const extra = await decodeVinFromExtraProvider(vin);
+          decodedVehicle = {
+            vin,
+            year: core.year,
+            make: core.make,
+            model: core.model,
+            trim: core.trim,
+            bodyClass: core.bodyClass,
+            paintCode: extra.paintCode,
+            paintDescription: extra.paintDescription
+          };
+        } catch {
+          // Keep intake fields if VIN decode fails during estimate.
+        }
       }
-    }
-    return res.json({ ok: true, report: fallback });
-  }
 
-  try {
-    const aiRaw = await generateVisionEstimate(payload, decodedVehicle, photos);
-    const normalized = normalizeReport(aiRaw, payload, decodedVehicle, photoCount, mergedCustomer);
-    if (licenseSource !== "none") {
-      normalized.assumptions = Array.isArray(normalized.assumptions) ? normalized.assumptions : [];
-      normalized.assumptions.push(`Customer data source: ${licenseSource}.`);
-      for (const note of licenseNotes) {
-        normalized.assumptions.push(note);
+      if (!openaiClient || photoCount === 0) {
+        const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
+        if (licenseSource !== "none") {
+          fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
+          for (const note of licenseNotes) {
+            fallback.assumptions.push(note);
+          }
+        }
+        return res.json({ ok: true, report: fallback });
       }
-    }
-    return res.json({ ok: true, report: normalized });
-  } catch (error) {
-    const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
-    fallback.assumptions.push(`AI vision generation failed: ${error.message}`);
-    if (licenseSource !== "none") {
-      fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
-      for (const note of licenseNotes) {
-        fallback.assumptions.push(note);
+
+      try {
+        const aiRaw = await generateVisionEstimate(payload, decodedVehicle, photos);
+        const normalized = normalizeReport(aiRaw, payload, decodedVehicle, photoCount, mergedCustomer);
+        if (licenseSource !== "none") {
+          normalized.assumptions = Array.isArray(normalized.assumptions) ? normalized.assumptions : [];
+          normalized.assumptions.push(`Customer data source: ${licenseSource}.`);
+          for (const note of licenseNotes) {
+            normalized.assumptions.push(note);
+          }
+        }
+        return res.json({ ok: true, report: normalized });
+      } catch (error) {
+        const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
+        fallback.assumptions.push(`AI vision generation failed: ${error.message}`);
+        if (licenseSource !== "none") {
+          fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
+          for (const note of licenseNotes) {
+            fallback.assumptions.push(note);
+          }
+        }
+        return res.json({ ok: true, report: fallback });
       }
+    } catch (error) {
+      return res.status(500).json({ ok: false, error: error.message || "Estimate generation crashed" });
     }
-    return res.json({ ok: true, report: fallback });
-  }
 });
 
 app.post("/api/report/pdf", async (req, res) => {
@@ -894,6 +899,11 @@ app.get("*", (req, res, next) => {
   }
 
   return next();
+});
+
+app.use((err, _req, res, _next) => {
+  const message = err && err.message ? err.message : "Unexpected server error";
+  return res.status(500).json({ ok: false, error: message });
 });
 
 if (require.main === module) {
