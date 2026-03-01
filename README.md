@@ -45,6 +45,7 @@ Open:
 ## Deploy to cloud
 
 This repo is now pre-configured for both Railway and Render.
+Nixpacks is explicitly pinned to Node via `nixpacks.toml`.
 
 ### Option A: Railway (recommended fastest path)
 
