@@ -71,6 +71,26 @@
         </div>
 
         <div class="group-block">
+          <h3>Shop Rates & Charges</h3>
+          <div class="field-grid two-up">
+            <label>Paint & Body ($/hr) <input id="rateBody" type="number" min="0" step="0.01" value="83"></label>
+            <label>Structural ($/hr) <input id="rateStructural" type="number" min="0" step="0.01" value="83"></label>
+            <label>Frame Straightening ($/hr) <input id="rateFrame" type="number" min="0" step="0.01" value="135"></label>
+            <label>Mechanical ($/hr) <input id="rateMechanical" type="number" min="0" step="0.01" value="175"></label>
+            <label>Electrical ($/hr) <input id="rateElectrical" type="number" min="0" step="0.01" value="150"></label>
+            <label>Paint Materials ($/paint hr) <input id="ratePaintMaterials" type="number" min="0" step="0.01" value="46"></label>
+            <label>Inside Storage ($/day) <input id="rateInsideStorage" type="number" min="0" step="0.01" value="180"></label>
+            <label>Outside Storage ($/day) <input id="rateOutsideStorage" type="number" min="0" step="0.01" value="180"></label>
+            <label>Towing ($/mile) <input id="rateTowing" type="number" min="0" step="0.01" value="12"></label>
+          </div>
+          <div class="field-grid two-up">
+            <label>Inside Storage Days <input id="chargeInsideStorageDays" type="number" min="0" step="1" value="0"></label>
+            <label>Outside Storage Days <input id="chargeOutsideStorageDays" type="number" min="0" step="1" value="0"></label>
+            <label>Towing Miles <input id="chargeTowingMiles" type="number" min="0" step="0.1" value="0"></label>
+          </div>
+        </div>
+
+        <div class="group-block">
           <h3>Impact Areas</h3>
           <div class="chips">
             <label><input type="checkbox" id="impactFront" checked> Front</label>

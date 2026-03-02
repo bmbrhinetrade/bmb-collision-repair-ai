@@ -18,6 +18,18 @@ const refs = {
   extractLicense: document.getElementById("extractLicense"),
   licenseStatus: document.getElementById("licenseStatus"),
   licensePreview: document.getElementById("licensePreview"),
+  rateBody: document.getElementById("rateBody"),
+  rateStructural: document.getElementById("rateStructural"),
+  rateFrame: document.getElementById("rateFrame"),
+  rateMechanical: document.getElementById("rateMechanical"),
+  rateElectrical: document.getElementById("rateElectrical"),
+  ratePaintMaterials: document.getElementById("ratePaintMaterials"),
+  rateInsideStorage: document.getElementById("rateInsideStorage"),
+  rateOutsideStorage: document.getElementById("rateOutsideStorage"),
+  rateTowing: document.getElementById("rateTowing"),
+  chargeInsideStorageDays: document.getElementById("chargeInsideStorageDays"),
+  chargeOutsideStorageDays: document.getElementById("chargeOutsideStorageDays"),
+  chargeTowingMiles: document.getElementById("chargeTowingMiles"),
   impactFront: document.getElementById("impactFront"),
   impactRear: document.getElementById("impactRear"),
   impactLeft: document.getElementById("impactLeft"),
@@ -128,6 +140,34 @@ function collectCustomer() {
   };
 }
 
+function asNonNegativeNumber(value, fallback) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return fallback;
+  return num;
+}
+
+function collectRates() {
+  return {
+    bodyLaborPerHour: asNonNegativeNumber(refs.rateBody.value, 83),
+    structuralLaborPerHour: asNonNegativeNumber(refs.rateStructural.value, 83),
+    frameLaborPerHour: asNonNegativeNumber(refs.rateFrame.value, 135),
+    mechanicalLaborPerHour: asNonNegativeNumber(refs.rateMechanical.value, 175),
+    electricalLaborPerHour: asNonNegativeNumber(refs.rateElectrical.value, 150),
+    paintMaterialsPerPaintHour: asNonNegativeNumber(refs.ratePaintMaterials.value, 46),
+    insideStoragePerDay: asNonNegativeNumber(refs.rateInsideStorage.value, 180),
+    outsideStoragePerDay: asNonNegativeNumber(refs.rateOutsideStorage.value, 180),
+    towingPerMile: asNonNegativeNumber(refs.rateTowing.value, 12)
+  };
+}
+
+function collectCharges() {
+  return {
+    insideStorageDays: asNonNegativeNumber(refs.chargeInsideStorageDays.value, 0),
+    outsideStorageDays: asNonNegativeNumber(refs.chargeOutsideStorageDays.value, 0),
+    towingMiles: asNonNegativeNumber(refs.chargeTowingMiles.value, 0)
+  };
+}
+
 function collectInputs() {
   const notes = refs.observedNotes.value.trim();
   const triggers = {
@@ -155,7 +195,9 @@ function collectInputs() {
     drivable: refs.drivable.value,
     notes,
     triggers,
-    customer: collectCustomer()
+    customer: collectCustomer(),
+    rates: collectRates(),
+    charges: collectCharges()
   };
 }
 
@@ -337,6 +379,8 @@ function renderSummary(report) {
   const v = report.vehicle || {};
   const s = report.summary || {};
   const c = report.customer || {};
+  const calc = report.calculation || {};
+  const grandTotal = Number(calc.grandTotal || 0);
 
   const vehicle = [v.year, v.make, v.model].filter(Boolean).join(" ") || "Vehicle not set";
   const impacts = Array.isArray(s.impacts) ? s.impacts.join(" / ") : "N/A";
@@ -371,20 +415,41 @@ function renderSummary(report) {
       <h4>Customer</h4>
       <p>${escapeHtml(c.fullName || "Not set")}</p>
     </article>
+    <article class="metric">
+      <h4>Estimate Total</h4>
+      <p>$${escapeHtml(grandTotal.toFixed(2))}</p>
+    </article>
   `;
 }
 
 function renderReport(report) {
   renderSummary(report);
   const customer = report.customer || {};
+  const calc = report.calculation || {};
+  const laborByType = calc.laborByType || {};
+  const lineItems = Array.isArray(calc.lineItems) ? calc.lineItems : [];
 
-  const output1Rows = (report.output1 || []).map((row) => [
-    row.component,
-    row.action,
-    row.laborBucket,
-    row.notes,
-    row.confidence
-  ]);
+  const output1Rows = lineItems.length
+    ? lineItems.map((row) => [
+      row.component,
+      row.action,
+      row.laborType,
+      Number(row.laborHours || 0).toFixed(2),
+      `$${Number(row.ratePerHour || 0).toFixed(2)}`,
+      `$${Number(row.laborTotal || 0).toFixed(2)}`,
+      Number(row.paintHours || 0).toFixed(2),
+      row.notes || ""
+    ])
+    : (report.output1 || []).map((row) => [
+      row.component,
+      row.action,
+      row.laborBucket,
+      "-",
+      "-",
+      "-",
+      "-",
+      row.notes
+    ]);
 
   const output2Rows = (report.output2 || []).map((row) => [
     row.missingOperation,
@@ -396,7 +461,7 @@ function renderReport(report) {
   ]);
 
   const output1 = output1Rows.length
-    ? tableHtml(["Component/Panel", "Action", "Labor Bucket", "Notes/Triggers", "Confidence"], output1Rows)
+    ? tableHtml(["Component/Panel", "Action", "Labor Type", "Hours", "Rate", "Labor Total", "Paint Hrs", "Notes/Triggers"], output1Rows)
     : "<p class=\"empty\">No repair/replace lines returned.</p>";
 
   const output2 = output2Rows.length
@@ -419,6 +484,20 @@ function renderReport(report) {
     ? `<ul>${report.assumptions.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
     : "<p class=\"empty\">No additional assumptions listed.</p>";
 
+  const totalsRows = [
+    ["Body Labor", Number((laborByType.body && laborByType.body.hours) || 0).toFixed(2), `$${Number((laborByType.body && laborByType.body.rate) || 0).toFixed(2)}`, `$${Number((laborByType.body && laborByType.body.total) || 0).toFixed(2)}`],
+    ["Structural Labor", Number((laborByType.structural && laborByType.structural.hours) || 0).toFixed(2), `$${Number((laborByType.structural && laborByType.structural.rate) || 0).toFixed(2)}`, `$${Number((laborByType.structural && laborByType.structural.total) || 0).toFixed(2)}`],
+    ["Frame Labor", Number((laborByType.frame && laborByType.frame.hours) || 0).toFixed(2), `$${Number((laborByType.frame && laborByType.frame.rate) || 0).toFixed(2)}`, `$${Number((laborByType.frame && laborByType.frame.total) || 0).toFixed(2)}`],
+    ["Mechanical Labor", Number((laborByType.mechanical && laborByType.mechanical.hours) || 0).toFixed(2), `$${Number((laborByType.mechanical && laborByType.mechanical.rate) || 0).toFixed(2)}`, `$${Number((laborByType.mechanical && laborByType.mechanical.total) || 0).toFixed(2)}`],
+    ["Electrical Labor", Number((laborByType.electrical && laborByType.electrical.hours) || 0).toFixed(2), `$${Number((laborByType.electrical && laborByType.electrical.rate) || 0).toFixed(2)}`, `$${Number((laborByType.electrical && laborByType.electrical.total) || 0).toFixed(2)}`],
+    ["Paint Labor", Number((laborByType.paint && laborByType.paint.hours) || 0).toFixed(2), `$${Number((laborByType.paint && laborByType.paint.rate) || 0).toFixed(2)}`, `$${Number((laborByType.paint && laborByType.paint.total) || 0).toFixed(2)}`],
+    ["Paint Materials", "-", "-", `$${Number(calc.paintMaterialsTotal || 0).toFixed(2)}`],
+    ["Inside Storage", `${Number((calc.charges && calc.charges.insideStorageDays) || 0).toFixed(2)} day`, `$${Number((calc.rates && calc.rates.insideStoragePerDay) || 0).toFixed(2)}`, `$${Number(calc.insideStorageTotal || 0).toFixed(2)}`],
+    ["Outside Storage", `${Number((calc.charges && calc.charges.outsideStorageDays) || 0).toFixed(2)} day`, `$${Number((calc.rates && calc.rates.outsideStoragePerDay) || 0).toFixed(2)}`, `$${Number(calc.outsideStorageTotal || 0).toFixed(2)}`],
+    ["Towing", `${Number((calc.charges && calc.charges.towingMiles) || 0).toFixed(2)} mi`, `$${Number((calc.rates && calc.rates.towingPerMile) || 0).toFixed(2)}`, `$${Number(calc.towingTotal || 0).toFixed(2)}`],
+    ["Grand Total", "-", "-", `$${Number(calc.grandTotal || 0).toFixed(2)}`]
+  ];
+
   refs.outputs.innerHTML = `
     <section class="block">
       <h3>Customer (Supplement Header)</h3>
@@ -433,6 +512,11 @@ function renderReport(report) {
     <section class="block">
       <h3>Output 1: Repair vs Replace Table</h3>
       ${output1}
+    </section>
+
+    <section class="block">
+      <h3>Estimate Totals</h3>
+      ${tableHtml(["Category", "Qty/Hrs", "Rate", "Amount"], totalsRows)}
     </section>
 
     <section class="block">
@@ -467,6 +551,7 @@ function buildPlainTextReport(report) {
   const vehicle = report.vehicle || {};
   const customer = report.customer || {};
   const summary = report.summary || {};
+  const calc = report.calculation || {};
 
   lines.push("BMB COLLISION REPAIR AI");
   lines.push(`Generated: ${report.generatedAt || new Date().toISOString()}`);
@@ -480,12 +565,20 @@ function buildPlainTextReport(report) {
   lines.push(`Customer email: ${customer.email || "N/A"}`);
   lines.push(`Source: ${report.source || "unknown"}`);
   lines.push(`Context: ${summary.estimateType || "preliminary"} | impacts: ${(summary.impacts || []).join(", ")} | severity: ${summary.severity || "functional"}`);
+  lines.push(`Estimated total: $${Number(calc.grandTotal || 0).toFixed(2)}`);
   lines.push("");
 
   lines.push("OUTPUT 1 - REPAIR VS REPLACE");
-  for (const row of report.output1 || []) {
-    lines.push(`- ${row.component} | ${row.action} | ${row.laborBucket} | ${row.confidence}`);
-    lines.push(`  Notes: ${row.notes}`);
+  if (Array.isArray(calc.lineItems) && calc.lineItems.length) {
+    for (const row of calc.lineItems) {
+      lines.push(`- ${row.component} | ${row.action} | ${row.laborType} | ${Number(row.laborHours || 0).toFixed(2)} hr | $${Number(row.laborTotal || 0).toFixed(2)}`);
+      lines.push(`  Notes: ${row.notes}`);
+    }
+  } else {
+    for (const row of report.output1 || []) {
+      lines.push(`- ${row.component} | ${row.action} | ${row.laborBucket} | ${row.confidence}`);
+      lines.push(`  Notes: ${row.notes}`);
+    }
   }
 
   lines.push("");
@@ -496,6 +589,16 @@ function buildPlainTextReport(report) {
     lines.push(`  Why: ${row.why}`);
     lines.push(`  Proof: ${row.bestProof}`);
   }
+
+  lines.push("");
+  lines.push("ESTIMATE TOTALS");
+  lines.push(`- Labor subtotal: $${Number(calc.laborSubtotal || 0).toFixed(2)}`);
+  lines.push(`- Paint materials: $${Number(calc.paintMaterialsTotal || 0).toFixed(2)}`);
+  lines.push(`- Inside storage: $${Number(calc.insideStorageTotal || 0).toFixed(2)}`);
+  lines.push(`- Outside storage: $${Number(calc.outsideStorageTotal || 0).toFixed(2)}`);
+  lines.push(`- Towing: $${Number(calc.towingTotal || 0).toFixed(2)}`);
+  lines.push(`- Grand total: $${Number(calc.grandTotal || 0).toFixed(2)}`);
+  lines.push("");
 
   lines.push("");
   lines.push("OUTPUT 3 - NOTES");
@@ -527,6 +630,17 @@ function buildPlainTextReport(report) {
 }
 
 function buildClientFallback(inputs) {
+  const rates = inputs.rates || {};
+  const charges = inputs.charges || {};
+  const bodyRate = Number(rates.bodyLaborPerHour || 83);
+  const laborHours = 2.5;
+  const laborSubtotal = laborHours * bodyRate;
+  const paintMaterials = Number(rates.paintMaterialsPerPaintHour || 46) * 1.5;
+  const insideStorageTotal = Number(charges.insideStorageDays || 0) * Number(rates.insideStoragePerDay || 180);
+  const outsideStorageTotal = Number(charges.outsideStorageDays || 0) * Number(rates.outsideStoragePerDay || 180);
+  const towingTotal = Number(charges.towingMiles || 0) * Number(rates.towingPerMile || 12);
+  const grandTotal = laborSubtotal + paintMaterials + insideStorageTotal + outsideStorageTotal + towingTotal;
+
   const output1 = [
     {
       component: inputs.impacts.includes("rear") ? "Rear bumper cover" : "Front bumper cover",
@@ -573,6 +687,45 @@ function buildClientFallback(inputs) {
       severity: inputs.severity,
       photoCount: state.photos.length,
       confidence: "low"
+    },
+    rates,
+    calculation: {
+      lineItems: [
+        {
+          component: output1[0].component,
+          action: output1[0].action,
+          laborType: "body",
+          laborHours,
+          ratePerHour: bodyRate,
+          laborTotal: laborSubtotal,
+          paintHours: 1.5,
+          notes: output1[0].notes
+        }
+      ],
+      laborByType: {
+        body: { hours: laborHours, rate: bodyRate, total: laborSubtotal },
+        structural: { hours: 0, rate: Number(rates.structuralLaborPerHour || 83), total: 0 },
+        frame: { hours: 0, rate: Number(rates.frameLaborPerHour || 135), total: 0 },
+        mechanical: { hours: 0, rate: Number(rates.mechanicalLaborPerHour || 175), total: 0 },
+        electrical: { hours: 0, rate: Number(rates.electricalLaborPerHour || 150), total: 0 },
+        paint: { hours: 1.5, rate: Number(rates.bodyLaborPerHour || 83), total: 1.5 * Number(rates.bodyLaborPerHour || 83) }
+      },
+      rates: {
+        insideStoragePerDay: Number(rates.insideStoragePerDay || 180),
+        outsideStoragePerDay: Number(rates.outsideStoragePerDay || 180),
+        towingPerMile: Number(rates.towingPerMile || 12)
+      },
+      charges: {
+        insideStorageDays: Number(charges.insideStorageDays || 0),
+        outsideStorageDays: Number(charges.outsideStorageDays || 0),
+        towingMiles: Number(charges.towingMiles || 0)
+      },
+      laborSubtotal,
+      paintMaterialsTotal: paintMaterials,
+      insideStorageTotal,
+      outsideStorageTotal,
+      towingTotal,
+      grandTotal
     },
     output1,
     output2,

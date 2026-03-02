@@ -5,6 +5,7 @@ This version is a full-stack app with:
 - VIN decode (NHTSA + optional extra provider for paint/build data)
 - AI photo analysis for automatic preliminary estimate write-up
 - Driver's license extraction for customer supplement fields (name/address/phone/email)
+- Default shop labor rates + automated labor-hour/total estimate calculation
 - 5 required deliverables (repair/replace, missing ops, notes, red flags, system notes)
 - Email-ready PDF export
 
@@ -85,6 +86,20 @@ Nixpacks is explicitly pinned to Node via `nixpacks.toml`.
 4. Click `Generate Estimate From Photos`.
 5. Review all 5 deliverables + customer supplement header.
 6. Click `Download PDF` for email-ready output.
+
+## Default shop rates (preloaded)
+
+- Paint & Body Labor: `$83/hr`
+- Structural Labor: `$83/hr`
+- Frame Straightening: `$135/hr`
+- Mechanical Labor: `$175/hr`
+- Electrical Labor: `$150/hr`
+- Paint Materials: `$46 per paint hour`
+- Inside Storage: `$180/day`
+- Outside Storage: `$180/day`
+- Towing: `$12/mile`
+
+These are editable in the app before generating each estimate.
 
 ## Paint code behavior
 

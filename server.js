@@ -23,6 +23,18 @@ const publicRoot = __dirname;
 const defaultLogoUrl = process.env.BMB_LOGO_URL || "https://framerusercontent.com/images/mYEOmnUYBqG1jUuiKqIAFXijrIM.png?height=926&width=2828";
 const defaultLogoLocalPath = path.join(publicRoot, "assets", "bmb-logo.png");
 
+const DEFAULT_SHOP_RATES = {
+  bodyLaborPerHour: 83,
+  structuralLaborPerHour: 83,
+  frameLaborPerHour: 135,
+  mechanicalLaborPerHour: 175,
+  electricalLaborPerHour: 150,
+  paintMaterialsPerPaintHour: 46,
+  insideStoragePerDay: 180,
+  outsideStoragePerDay: 180,
+  towingPerMile: 12
+};
+
 const openaiClient = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
 app.use(express.json({ limit: "20mb" }));
@@ -176,6 +188,171 @@ function mergeCustomers(primary, secondary) {
     phone: b.phone || a.phone,
     email: b.email || a.email
   };
+}
+
+function asNonNegativeNumber(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
+function normalizeShopRates(input) {
+  const value = input && typeof input === "object" ? input : {};
+  return {
+    bodyLaborPerHour: asNonNegativeNumber(value.bodyLaborPerHour, DEFAULT_SHOP_RATES.bodyLaborPerHour),
+    structuralLaborPerHour: asNonNegativeNumber(value.structuralLaborPerHour, DEFAULT_SHOP_RATES.structuralLaborPerHour),
+    frameLaborPerHour: asNonNegativeNumber(value.frameLaborPerHour, DEFAULT_SHOP_RATES.frameLaborPerHour),
+    mechanicalLaborPerHour: asNonNegativeNumber(value.mechanicalLaborPerHour, DEFAULT_SHOP_RATES.mechanicalLaborPerHour),
+    electricalLaborPerHour: asNonNegativeNumber(value.electricalLaborPerHour, DEFAULT_SHOP_RATES.electricalLaborPerHour),
+    paintMaterialsPerPaintHour: asNonNegativeNumber(value.paintMaterialsPerPaintHour, DEFAULT_SHOP_RATES.paintMaterialsPerPaintHour),
+    insideStoragePerDay: asNonNegativeNumber(value.insideStoragePerDay, DEFAULT_SHOP_RATES.insideStoragePerDay),
+    outsideStoragePerDay: asNonNegativeNumber(value.outsideStoragePerDay, DEFAULT_SHOP_RATES.outsideStoragePerDay),
+    towingPerMile: asNonNegativeNumber(value.towingPerMile, DEFAULT_SHOP_RATES.towingPerMile)
+  };
+}
+
+function normalizeAdditionalCharges(input) {
+  const value = input && typeof input === "object" ? input : {};
+  return {
+    insideStorageDays: asNonNegativeNumber(value.insideStorageDays, 0),
+    outsideStorageDays: asNonNegativeNumber(value.outsideStorageDays, 0),
+    towingMiles: asNonNegativeNumber(value.towingMiles, 0)
+  };
+}
+
+function classifyLaborType(component, action) {
+  const text = `${component || ""} ${action || ""}`.toLowerCase();
+
+  if (/(frame|straighten|rail|pull|bench|measure)/.test(text)) return "frame";
+  if (/(support|rocker|pillar|quarter panel|rear body panel|apron|tie bar|structural|srs)/.test(text)) return "structural";
+  if (/(cooling stack|radiator|condenser|suspension|steering|alignment|wheel|engine|mechanical|ac )/.test(text)) return "mechanical";
+  if (/(sensor|camera|radar|module|harness|electrical|headlamp|tail lamp|lamp|scan|calibration|aim)/.test(text)) return "electrical";
+  return "body";
+}
+
+function estimateLaborHours(component, action, severity) {
+  const text = `${component || ""}`.toLowerCase();
+  const act = String(action || "").toLowerCase();
+  let hours = 1.5;
+
+  if (act.includes("replace")) hours = 2.5;
+  else if (act.includes("repair")) hours = 3.0;
+  else if (act.includes("r&i") || act.includes("r&r")) hours = 1.2;
+  else if (act.includes("inspect")) hours = 0.5;
+  else if (act.includes("overhaul")) hours = 2.0;
+
+  if (/(bumper cover|grille|emblem)/.test(text)) hours += 0.7;
+  if (/(headlamp|tail lamp|lamp)/.test(text)) hours += 0.4;
+  if (/(liner|shield|undertray|splash)/.test(text)) hours -= 0.3;
+  if (/(reinforcement|absorber)/.test(text)) hours += 0.5;
+  if (/(support|cooling stack|radiator|condenser)/.test(text)) hours += 1.0;
+  if (/(door shell)/.test(text)) hours += 1.5;
+  if (/(quarter panel|rocker|pillar)/.test(text)) hours += 2.0;
+  if (/(srs|restraint)/.test(text)) hours += 1.0;
+
+  if (severity === "structural") hours *= 1.2;
+  if (severity === "srs") hours *= 1.25;
+
+  return Math.max(0.3, Number(hours.toFixed(2)));
+}
+
+function estimatePaintHours(component, action) {
+  const text = `${component || ""}`.toLowerCase();
+  const act = String(action || "").toLowerCase();
+  if (!(act.includes("replace") || act.includes("repair"))) return 0;
+
+  let paintHours = 0;
+  if (/(bumper|fender|door|quarter|hood|decklid|trunk|panel)/.test(text)) {
+    paintHours = act.includes("repair") ? 2.2 : 1.8;
+  }
+  if (/(bumper cover)/.test(text)) {
+    paintHours += 0.6;
+  }
+  return Number(Math.max(0, paintHours).toFixed(2));
+}
+
+function getLaborRateByType(laborType, rates) {
+  if (laborType === "body" || laborType === "paint") return rates.bodyLaborPerHour;
+  if (laborType === "structural") return rates.structuralLaborPerHour;
+  if (laborType === "frame") return rates.frameLaborPerHour;
+  if (laborType === "mechanical") return rates.mechanicalLaborPerHour;
+  if (laborType === "electrical") return rates.electricalLaborPerHour;
+  return rates.bodyLaborPerHour;
+}
+
+function applyEstimateCalculations(report, ratesInput, chargesInput) {
+  const rates = normalizeShopRates(ratesInput);
+  const charges = normalizeAdditionalCharges(chargesInput);
+
+  const severity = report && report.summary ? report.summary.severity : "functional";
+  const baseLines = Array.isArray(report.output1) ? report.output1 : [];
+
+  const lineItems = baseLines.map((row) => {
+    const laborType = classifyLaborType(row.component, row.action);
+    const laborHours = estimateLaborHours(row.component, row.action, severity);
+    const ratePerHour = getLaborRateByType(laborType, rates);
+    const laborTotal = Number((laborHours * ratePerHour).toFixed(2));
+    const paintHours = estimatePaintHours(row.component, row.action);
+    return {
+      component: row.component || "",
+      action: row.action || "",
+      laborType,
+      laborHours,
+      ratePerHour,
+      laborTotal,
+      paintHours,
+      notes: row.notes || ""
+    };
+  });
+
+  const laborByType = {
+    body: { hours: 0, rate: rates.bodyLaborPerHour, total: 0 },
+    structural: { hours: 0, rate: rates.structuralLaborPerHour, total: 0 },
+    frame: { hours: 0, rate: rates.frameLaborPerHour, total: 0 },
+    mechanical: { hours: 0, rate: rates.mechanicalLaborPerHour, total: 0 },
+    electrical: { hours: 0, rate: rates.electricalLaborPerHour, total: 0 },
+    paint: { hours: 0, rate: rates.bodyLaborPerHour, total: 0 }
+  };
+
+  for (const item of lineItems) {
+    const bucket = laborByType[item.laborType] || laborByType.body;
+    bucket.hours = Number((bucket.hours + item.laborHours).toFixed(2));
+    bucket.total = Number((bucket.total + item.laborTotal).toFixed(2));
+    laborByType.paint.hours = Number((laborByType.paint.hours + item.paintHours).toFixed(2));
+  }
+
+  laborByType.paint.total = Number((laborByType.paint.hours * laborByType.paint.rate).toFixed(2));
+
+  const laborSubtotal = Number(
+    Object.values(laborByType).reduce((sum, item) => sum + Number(item.total || 0), 0).toFixed(2)
+  );
+  const paintMaterialsTotal = Number((laborByType.paint.hours * rates.paintMaterialsPerPaintHour).toFixed(2));
+  const insideStorageTotal = Number((charges.insideStorageDays * rates.insideStoragePerDay).toFixed(2));
+  const outsideStorageTotal = Number((charges.outsideStorageDays * rates.outsideStoragePerDay).toFixed(2));
+  const towingTotal = Number((charges.towingMiles * rates.towingPerMile).toFixed(2));
+  const grandTotal = Number(
+    (laborSubtotal + paintMaterialsTotal + insideStorageTotal + outsideStorageTotal + towingTotal).toFixed(2)
+  );
+
+  report.rates = rates;
+  report.charges = charges;
+  report.calculation = {
+    lineItems,
+    laborByType,
+    rates: {
+      insideStoragePerDay: rates.insideStoragePerDay,
+      outsideStoragePerDay: rates.outsideStoragePerDay,
+      towingPerMile: rates.towingPerMile
+    },
+    charges,
+    laborSubtotal,
+    paintMaterialsTotal,
+    insideStorageTotal,
+    outsideStorageTotal,
+    towingTotal,
+    grandTotal
+  };
+  return report;
 }
 
 function buildLicensePrompt() {
@@ -648,6 +825,7 @@ function buildPdfBuffer(report, logoBuffer) {
     writeLine(doc, `Email: ${c.email || "N/A"}`);
 
     const s = report.summary || {};
+    const calc = report.calculation || {};
     writeHeading(doc, "Summary");
     writeLine(doc, `Estimate type: ${toSentenceCase(s.estimateType || "preliminary")}`);
     writeLine(doc, `Impacts: ${Array.isArray(s.impacts) ? s.impacts.join(", ") : "N/A"}`);
@@ -655,11 +833,38 @@ function buildPdfBuffer(report, logoBuffer) {
     writeLine(doc, `Photos reviewed: ${s.photoCount || 0}`);
     writeLine(doc, `Confidence: ${toSentenceCase(s.confidence || "low")}`);
 
+    writeHeading(doc, "Rates");
+    const rates = report.rates || {};
+    writeLine(doc, `Body labor: $${Number(rates.bodyLaborPerHour || DEFAULT_SHOP_RATES.bodyLaborPerHour).toFixed(2)} / hr`);
+    writeLine(doc, `Structural labor: $${Number(rates.structuralLaborPerHour || DEFAULT_SHOP_RATES.structuralLaborPerHour).toFixed(2)} / hr`);
+    writeLine(doc, `Frame labor: $${Number(rates.frameLaborPerHour || DEFAULT_SHOP_RATES.frameLaborPerHour).toFixed(2)} / hr`);
+    writeLine(doc, `Mechanical labor: $${Number(rates.mechanicalLaborPerHour || DEFAULT_SHOP_RATES.mechanicalLaborPerHour).toFixed(2)} / hr`);
+    writeLine(doc, `Electrical labor: $${Number(rates.electricalLaborPerHour || DEFAULT_SHOP_RATES.electricalLaborPerHour).toFixed(2)} / hr`);
+    writeLine(doc, `Paint materials: $${Number(rates.paintMaterialsPerPaintHour || DEFAULT_SHOP_RATES.paintMaterialsPerPaintHour).toFixed(2)} / paint hr`);
+    writeLine(doc, `Inside storage: $${Number(rates.insideStoragePerDay || DEFAULT_SHOP_RATES.insideStoragePerDay).toFixed(2)} / day`);
+    writeLine(doc, `Outside storage: $${Number(rates.outsideStoragePerDay || DEFAULT_SHOP_RATES.outsideStoragePerDay).toFixed(2)} / day`);
+    writeLine(doc, `Towing: $${Number(rates.towingPerMile || DEFAULT_SHOP_RATES.towingPerMile).toFixed(2)} / mile`);
+
     writeHeading(doc, "Output 1: Repair vs Replace");
-    for (const row of report.output1 || []) {
-      writeLine(doc, `${row.component} | ${row.action} | ${row.laborBucket} | ${row.confidence}`);
-      writeLine(doc, `  Notes: ${row.notes}`);
+    if (Array.isArray(calc.lineItems) && calc.lineItems.length) {
+      for (const row of calc.lineItems) {
+        writeLine(doc, `${row.component} | ${row.action} | ${row.laborType} | ${Number(row.laborHours || 0).toFixed(2)} hr | $${Number(row.laborTotal || 0).toFixed(2)}`);
+        writeLine(doc, `  Notes: ${row.notes}`);
+      }
+    } else {
+      for (const row of report.output1 || []) {
+        writeLine(doc, `${row.component} | ${row.action} | ${row.laborBucket} | ${row.confidence}`);
+        writeLine(doc, `  Notes: ${row.notes}`);
+      }
     }
+
+    writeHeading(doc, "Estimate Totals");
+    writeLine(doc, `Labor subtotal: $${Number(calc.laborSubtotal || 0).toFixed(2)}`);
+    writeLine(doc, `Paint materials: $${Number(calc.paintMaterialsTotal || 0).toFixed(2)}`);
+    writeLine(doc, `Inside storage: $${Number(calc.insideStorageTotal || 0).toFixed(2)}`);
+    writeLine(doc, `Outside storage: $${Number(calc.outsideStorageTotal || 0).toFixed(2)}`);
+    writeLine(doc, `Towing: $${Number(calc.towingTotal || 0).toFixed(2)}`);
+    writeLine(doc, `Grand total: $${Number(calc.grandTotal || 0).toFixed(2)}`);
 
     writeHeading(doc, "Output 2: Missing Ops");
     for (const row of report.output2 || []) {
@@ -777,6 +982,8 @@ app.post("/api/estimate/generate", upload.fields([
       const body = req.body && typeof req.body === "object" ? req.body : {};
       const payload = safeJsonParse(body.payload || "{}", {}) || {};
       payload.customer = normalizeCustomer(payload.customer);
+      payload.rates = normalizeShopRates(payload.rates);
+      payload.charges = normalizeAdditionalCharges(payload.charges);
 
       const filesByField = req.files && typeof req.files === "object" ? req.files : {};
       const photos = Array.isArray(filesByField.photos) ? filesByField.photos : [];
@@ -833,6 +1040,7 @@ app.post("/api/estimate/generate", upload.fields([
 
       if (!openaiClient || photoCount === 0) {
         const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
+        applyEstimateCalculations(fallback, payload.rates, payload.charges);
         if (licenseSource !== "none") {
           fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
           for (const note of licenseNotes) {
@@ -845,6 +1053,7 @@ app.post("/api/estimate/generate", upload.fields([
       try {
         const aiRaw = await generateVisionEstimate(payload, decodedVehicle, photos);
         const normalized = normalizeReport(aiRaw, payload, decodedVehicle, photoCount, mergedCustomer);
+        applyEstimateCalculations(normalized, payload.rates, payload.charges);
         if (licenseSource !== "none") {
           normalized.assumptions = Array.isArray(normalized.assumptions) ? normalized.assumptions : [];
           normalized.assumptions.push(`Customer data source: ${licenseSource}.`);
@@ -855,6 +1064,7 @@ app.post("/api/estimate/generate", upload.fields([
         return res.json({ ok: true, report: normalized });
       } catch (error) {
         const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
+        applyEstimateCalculations(fallback, payload.rates, payload.charges);
         fallback.assumptions.push(`AI vision generation failed: ${error.message}`);
         if (licenseSource !== "none") {
           fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
