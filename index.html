@@ -49,6 +49,16 @@
           <p id="vinStatus" class="muted inline">VIN not decoded yet.</p>
         </div>
 
+        <div class="group-block">
+          <h3>Door-Jamb Label (VIN + Paint)</h3>
+          <div class="action-row compact">
+            <input id="vehicleLabelPhoto" type="file" accept="image/*">
+            <button id="extractVehicleLabel" class="secondary">Extract Label</button>
+          </div>
+          <p id="vehicleLabelStatus" class="muted">No door-jamb label processed yet.</p>
+          <div id="vehicleLabelPreview" class="license-preview"></div>
+        </div>
+
         <div id="vehicleDecoded" class="decoded"></div>
 
         <div class="group-block">
@@ -138,6 +148,16 @@
           Observed Notes (optional)
           <textarea id="observedNotes" rows="4" placeholder="Example: RF bumper torn, radar emblem cracked, LF wheel appears out of alignment."></textarea>
         </label>
+
+        <div class="group-block">
+          <h3>Voice Edit (Real-time)</h3>
+          <div class="action-row compact">
+            <button id="talkToggle" class="secondary">Start Talk Edit</button>
+            <p id="talkStatus" class="muted inline">Voice control idle.</p>
+          </div>
+          <p id="talkHeard" class="muted">Last command: none</p>
+          <p class="muted">Examples: "set body labor to 95", "inside storage days 3", "replace front bumper cover", "remove line grille assembly".</p>
+        </div>
 
         <div class="group-block">
           <h3>Photo Upload</h3>

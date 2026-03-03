@@ -220,6 +220,59 @@ function normalizeAdditionalCharges(input) {
   };
 }
 
+function normalizeVehicleLabel(input) {
+  const value = input && typeof input === "object" ? input : {};
+  return {
+    vin: sanitizeVin(value.vin || ""),
+    paintCode: String(value.paintCode || "").trim(),
+    paintDescription: String(value.paintDescription || "").trim(),
+    modelCode: String(value.modelCode || "").trim(),
+    productionDate: String(value.productionDate || "").trim(),
+    confidence: String(value.confidence || "").toLowerCase() || "low",
+    source: String(value.source || "").trim() || "none",
+    notes: Array.isArray(value.notes) ? value.notes.map((note) => String(note || "").trim()).filter(Boolean) : []
+  };
+}
+
+function mergeVehicleLabels(primary, secondary) {
+  const first = normalizeVehicleLabel(primary);
+  const second = normalizeVehicleLabel(secondary);
+
+  return {
+    vin: second.vin || first.vin,
+    paintCode: second.paintCode || first.paintCode,
+    paintDescription: second.paintDescription || first.paintDescription,
+    modelCode: second.modelCode || first.modelCode,
+    productionDate: second.productionDate || first.productionDate,
+    confidence: second.confidence || first.confidence || "low",
+    source: second.source !== "none" ? second.source : first.source,
+    notes: [...new Set([...(first.notes || []), ...(second.notes || [])])]
+  };
+}
+
+function applyVehicleLabelToVehicle(vehicle, labelInput) {
+  const base = vehicle && typeof vehicle === "object" ? { ...vehicle } : {};
+  const label = normalizeVehicleLabel(labelInput);
+
+  if (label.vin) base.vin = label.vin;
+  if (label.paintCode) base.paintCode = label.paintCode;
+  if (label.paintDescription) base.paintDescription = label.paintDescription;
+
+  return base;
+}
+
+function appendAssumptions(report, entries) {
+  if (!report || typeof report !== "object") return;
+  const list = Array.isArray(entries) ? entries : [];
+  report.assumptions = Array.isArray(report.assumptions) ? report.assumptions : [];
+  for (const raw of list) {
+    const text = String(raw || "").trim();
+    if (text && !report.assumptions.includes(text)) {
+      report.assumptions.push(text);
+    }
+  }
+}
+
 function classifyLaborType(component, action) {
   const text = `${component || ""} ${action || ""}`.toLowerCase();
 
@@ -283,6 +336,7 @@ function getLaborRateByType(laborType, rates) {
 function applyEstimateCalculations(report, ratesInput, chargesInput) {
   const rates = normalizeShopRates(ratesInput);
   const charges = normalizeAdditionalCharges(chargesInput);
+  const parts = normalizeParts(report && report.parts);
 
   const severity = report && report.summary ? report.summary.severity : "functional";
   const baseLines = Array.isArray(report.output1) ? report.output1 : [];
@@ -330,12 +384,17 @@ function applyEstimateCalculations(report, ratesInput, chargesInput) {
   const insideStorageTotal = Number((charges.insideStorageDays * rates.insideStoragePerDay).toFixed(2));
   const outsideStorageTotal = Number((charges.outsideStorageDays * rates.outsideStoragePerDay).toFixed(2));
   const towingTotal = Number((charges.towingMiles * rates.towingPerMile).toFixed(2));
+  const partsSubtotal = Number(asNonNegativeNumber(parts.subtotal, 0).toFixed(2));
   const grandTotal = Number(
-    (laborSubtotal + paintMaterialsTotal + insideStorageTotal + outsideStorageTotal + towingTotal).toFixed(2)
+    (laborSubtotal + paintMaterialsTotal + partsSubtotal + insideStorageTotal + outsideStorageTotal + towingTotal).toFixed(2)
   );
 
   report.rates = rates;
   report.charges = charges;
+  report.parts = {
+    ...parts,
+    subtotal: partsSubtotal
+  };
   report.calculation = {
     lineItems,
     laborByType,
@@ -347,6 +406,7 @@ function applyEstimateCalculations(report, ratesInput, chargesInput) {
     charges,
     laborSubtotal,
     paintMaterialsTotal,
+    partsSubtotal,
     insideStorageTotal,
     outsideStorageTotal,
     towingTotal,
@@ -414,7 +474,228 @@ async function extractCustomerFromLicense(licenseFile) {
   };
 }
 
-function buildRuleBasedFallback(payload, decodedVehicle, photoCount, customer) {
+function buildVehicleLabelPrompt() {
+  return `Extract structured data from this vehicle door-jamb label image (barcode/sticker).
+Return strict JSON only:
+{
+  "vin": string,
+  "paintCode": string,
+  "paintDescription": string,
+  "modelCode": string,
+  "productionDate": string,
+  "confidence": "high"|"medium"|"low",
+  "notes": string[]
+}
+Rules:
+- Return empty string when a field is not readable.
+- Do not hallucinate VIN or paint code.
+- VIN must be exactly what is visible on label if readable.
+- If barcode cannot be decoded, use visible printed text only.`;
+}
+
+async function extractVehicleLabelFromImage(vehicleLabelFile) {
+  if (!openaiClient || !vehicleLabelFile) {
+    return {
+      vehicleLabel: normalizeVehicleLabel({}),
+      source: "vehicle-label-fallback",
+      confidence: "low",
+      notes: ["Door-jamb extraction unavailable (missing file or OpenAI key)."]
+    };
+  }
+
+  const model = process.env.OPENAI_VISION_MODEL || "gpt-4.1";
+  const base64 = vehicleLabelFile.buffer.toString("base64");
+  const mime = vehicleLabelFile.mimetype || "image/jpeg";
+
+  const response = await openaiClient.responses.create({
+    model,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: buildVehicleLabelPrompt() },
+          { type: "input_image", image_url: `data:${mime};base64,${base64}` }
+        ]
+      }
+    ],
+    max_output_tokens: 700
+  });
+
+  const text = response.output_text || "";
+  const parsed = safeJsonParse(text, null) || extractJsonObject(text);
+  if (!parsed) {
+    throw new Error("Door-jamb extraction response was not valid JSON");
+  }
+
+  const normalized = normalizeVehicleLabel({
+    vin: parsed.vin,
+    paintCode: parsed.paintCode,
+    paintDescription: parsed.paintDescription,
+    modelCode: parsed.modelCode,
+    productionDate: parsed.productionDate,
+    confidence: parsed.confidence || "low",
+    notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+    source: "vehicle-label-ai"
+  });
+
+  return {
+    vehicleLabel: normalized,
+    source: "vehicle-label-ai",
+    confidence: normalized.confidence,
+    notes: normalized.notes
+  };
+}
+
+function normalizeParts(parts) {
+  const value = parts && typeof parts === "object" ? parts : {};
+  const itemsRaw = Array.isArray(value.items) ? value.items : [];
+  const items = itemsRaw.map((entry) => {
+    const quantity = asNonNegativeNumber(entry.quantity, 1);
+    const listPrice = asNonNegativeNumber(entry.listPrice, 0);
+    const computedLineTotal = Number((quantity * listPrice).toFixed(2));
+    const lineTotal = asNonNegativeNumber(entry.lineTotal, computedLineTotal);
+    return {
+      component: String(entry.component || "").trim(),
+      partNumber: String(entry.partNumber || "").trim(),
+      description: String(entry.description || "").trim(),
+      quantity,
+      listPrice,
+      lineTotal,
+      source: String(entry.source || "").trim() || "unknown"
+    };
+  });
+
+  const computedSubtotal = Number(items.reduce((sum, item) => sum + Number(item.lineTotal || 0), 0).toFixed(2));
+  const subtotal = asNonNegativeNumber(value.subtotal, computedSubtotal);
+
+  return {
+    source: String(value.source || "").trim() || "not-configured",
+    items,
+    subtotal,
+    assumptions: Array.isArray(value.assumptions) ? value.assumptions.map((note) => String(note || "").trim()).filter(Boolean) : []
+  };
+}
+
+function deriveBrokenComponents(report) {
+  const rows = Array.isArray(report && report.output1) ? report.output1 : [];
+  const components = [];
+  for (const row of rows) {
+    const component = String(row.component || "").trim();
+    const action = String(row.action || "").toLowerCase();
+    if (!component) continue;
+    if (/(replace|repair|r&i|r&r|section|blend)/.test(action)) {
+      components.push(component);
+    }
+  }
+  return [...new Set(components)];
+}
+
+function buildPlaceholderOemParts(components, reason) {
+  const items = components.map((component) => ({
+    component,
+    partNumber: "OEM-LOOKUP-REQUIRED",
+    description: "OEM part lookup required",
+    quantity: 1,
+    listPrice: 0,
+    lineTotal: 0,
+    source: "placeholder"
+  }));
+
+  return normalizeParts({
+    source: "placeholder",
+    items,
+    assumptions: [reason]
+  });
+}
+
+async function fetchOemPartsFromProvider(vehicle, components) {
+  if (!components.length) {
+    return normalizeParts({
+      source: "none",
+      items: [],
+      assumptions: ["No broken components were identified for OEM parts lookup."]
+    });
+  }
+
+  const providerUrl = process.env.OEM_PARTS_PROVIDER_URL;
+  if (!providerUrl) {
+    return buildPlaceholderOemParts(
+      components,
+      "OEM parts provider is not configured. Add OEM_PARTS_PROVIDER_URL and token for live dealership part numbers/pricing."
+    );
+  }
+
+  const headers = { "Content-Type": "application/json" };
+  if (process.env.OEM_PARTS_PROVIDER_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.OEM_PARTS_PROVIDER_TOKEN}`;
+  }
+
+  try {
+    const response = await fetch(providerUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        vehicle: {
+          vin: vehicle.vin || "",
+          year: vehicle.year || "",
+          make: vehicle.make || "",
+          model: vehicle.model || "",
+          trim: vehicle.trim || ""
+        },
+        components
+      })
+    });
+
+    if (!response.ok) {
+      return buildPlaceholderOemParts(
+        components,
+        `OEM parts provider request failed (${response.status}). Using placeholder parts without pricing.`
+      );
+    }
+
+    const json = await response.json();
+    const rawItems = Array.isArray(json.items) ? json.items : (Array.isArray(json.parts) ? json.parts : []);
+    if (!rawItems.length) {
+      return buildPlaceholderOemParts(
+        components,
+        "OEM parts provider returned no parts for current components."
+      );
+    }
+
+    const items = rawItems.map((entry) => ({
+      component: entry.component || entry.partName || "",
+      partNumber: entry.partNumber || entry.oemPartNumber || entry.number || "",
+      description: entry.description || entry.partDescription || "",
+      quantity: asNonNegativeNumber(entry.quantity, 1),
+      listPrice: asNonNegativeNumber(entry.listPrice, asNonNegativeNumber(entry.price, 0)),
+      lineTotal: asNonNegativeNumber(
+        entry.lineTotal,
+        Number((asNonNegativeNumber(entry.quantity, 1) * asNonNegativeNumber(entry.listPrice, asNonNegativeNumber(entry.price, 0))).toFixed(2))
+      ),
+      source: entry.source || entry.vendor || "oem-provider"
+    }));
+
+    return normalizeParts({
+      source: "oem-provider",
+      items,
+      subtotal: asNonNegativeNumber(json.subtotal, NaN),
+      assumptions: Array.isArray(json.assumptions) ? json.assumptions : []
+    });
+  } catch (error) {
+    return buildPlaceholderOemParts(
+      components,
+      `OEM parts provider request failed (${error.message || "network error"}). Using placeholder parts without pricing.`
+    );
+  }
+}
+
+async function buildOemPartsForReport(report) {
+  const vehicle = report && report.vehicle ? report.vehicle : {};
+  const components = deriveBrokenComponents(report);
+  return fetchOemPartsFromProvider(vehicle, components);
+}
+
+function buildRuleBasedFallback(payload, decodedVehicle, photoCount, customer, vehicleLabel) {
   const impacts = getImpacts(payload);
   const severity = payload.severity || "functional";
 
@@ -531,6 +812,7 @@ function buildRuleBasedFallback(payload, decodedVehicle, photoCount, customer) {
     source: "rules-fallback",
     generatedAt: nowIso(),
     customer: normalizeCustomer(customer || payload.customer),
+    vehicleLabel: normalizeVehicleLabel(vehicleLabel),
     vehicle: decodedVehicle,
     summary: {
       estimateType: payload.estimateType || "preliminary",
@@ -629,6 +911,7 @@ Context:
 - Drivable: ${payload.drivable || "unknown"}
 - User notes: ${payload.notes || "none"}
 - Customer baseline: ${JSON.stringify(normalizeCustomer(payload.customer))}
+- Door-jamb label baseline: ${JSON.stringify(normalizeVehicleLabel(payload.vehicleLabel))}
 - VIN decoded baseline: ${JSON.stringify({
     vin: decodedVehicle.vin || "",
     year: decodedVehicle.year || "",
@@ -685,17 +968,18 @@ async function generateVisionEstimate(payload, decodedVehicle, photos) {
 function normalizeReport(report, payload, decodedVehicle, photoCount, customer) {
   const safe = report || {};
   const mergedCustomer = mergeCustomers(payload.customer, mergeCustomers(customer, safe.customer));
+  const mergedVehicleLabel = mergeVehicleLabels(payload.vehicleLabel, safe.vehicleLabel);
 
   const vehicle = safe.vehicle || {};
   const finalVehicle = {
-    vin: vehicle.vin || decodedVehicle.vin || payload.vin || "",
+    vin: vehicle.vin || mergedVehicleLabel.vin || decodedVehicle.vin || payload.vin || "",
     year: vehicle.year || decodedVehicle.year || String(payload.year || ""),
     make: vehicle.make || decodedVehicle.make || payload.make || "",
     model: vehicle.model || decodedVehicle.model || payload.model || "",
     trim: vehicle.trim || decodedVehicle.trim || "",
-    paintCode: vehicle.paintCode || decodedVehicle.paintCode || "Unknown",
-    paintDescription: vehicle.paintDescription || decodedVehicle.paintDescription || "Unknown",
-    paintConfidence: vehicle.paintConfidence || (decodedVehicle.paintCode ? "High" : "Low")
+    paintCode: vehicle.paintCode || mergedVehicleLabel.paintCode || decodedVehicle.paintCode || "Unknown",
+    paintDescription: vehicle.paintDescription || mergedVehicleLabel.paintDescription || decodedVehicle.paintDescription || "Unknown",
+    paintConfidence: vehicle.paintConfidence || (mergedVehicleLabel.paintCode || decodedVehicle.paintCode ? "High" : "Low")
   };
 
   const summary = safe.summary || {};
@@ -715,6 +999,7 @@ function normalizeReport(report, payload, decodedVehicle, photoCount, customer) 
     source: safe.source || "ai-vision",
     generatedAt: safe.generatedAt || nowIso(),
     customer: mergedCustomer,
+    vehicleLabel: mergedVehicleLabel,
     vehicle: finalVehicle,
     summary: {
       estimateType: summary.estimateType || payload.estimateType || "preliminary",
@@ -812,10 +1097,18 @@ function buildPdfBuffer(report, logoBuffer) {
 
     writeHeading(doc, "Vehicle");
     const v = report.vehicle || {};
+    const vl = normalizeVehicleLabel(report.vehicleLabel);
     writeLine(doc, `VIN: ${v.vin || "N/A"}`);
     writeLine(doc, `Year/Make/Model: ${[v.year, v.make, v.model].filter(Boolean).join(" ") || "N/A"}`);
     writeLine(doc, `Trim: ${v.trim || "N/A"}`);
     writeLine(doc, `Paint: ${v.paintCode || "Unknown"} ${v.paintDescription ? `(${v.paintDescription})` : ""}`);
+    if (vl.vin || vl.paintCode || vl.modelCode || vl.productionDate) {
+      writeHeading(doc, "Door-Jamb Label");
+      writeLine(doc, `Label VIN: ${vl.vin || "N/A"}`);
+      writeLine(doc, `Label paint: ${vl.paintCode || "Unknown"} ${vl.paintDescription ? `(${vl.paintDescription})` : ""}`);
+      writeLine(doc, `Model code: ${vl.modelCode || "N/A"}`);
+      writeLine(doc, `Production date: ${vl.productionDate || "N/A"}`);
+    }
 
     writeHeading(doc, "Customer");
     const c = report.customer || {};
@@ -861,10 +1154,25 @@ function buildPdfBuffer(report, logoBuffer) {
     writeHeading(doc, "Estimate Totals");
     writeLine(doc, `Labor subtotal: $${Number(calc.laborSubtotal || 0).toFixed(2)}`);
     writeLine(doc, `Paint materials: $${Number(calc.paintMaterialsTotal || 0).toFixed(2)}`);
+    writeLine(doc, `OEM parts: $${Number(calc.partsSubtotal || 0).toFixed(2)}`);
     writeLine(doc, `Inside storage: $${Number(calc.insideStorageTotal || 0).toFixed(2)}`);
     writeLine(doc, `Outside storage: $${Number(calc.outsideStorageTotal || 0).toFixed(2)}`);
     writeLine(doc, `Towing: $${Number(calc.towingTotal || 0).toFixed(2)}`);
     writeLine(doc, `Grand total: $${Number(calc.grandTotal || 0).toFixed(2)}`);
+
+    const parts = normalizeParts(report.parts);
+    writeHeading(doc, "OEM Parts & List Pricing");
+    if (parts.items.length) {
+      for (const item of parts.items) {
+        writeLine(
+          doc,
+          `${item.component || "Part"} | PN: ${item.partNumber || "N/A"} | Qty: ${Number(item.quantity || 0).toFixed(2)} | List: $${Number(item.listPrice || 0).toFixed(2)} | Line: $${Number(item.lineTotal || 0).toFixed(2)}`
+        );
+      }
+      writeLine(doc, `Parts subtotal: $${Number(parts.subtotal || 0).toFixed(2)}`);
+    } else {
+      writeLine(doc, "No OEM parts returned.");
+    }
 
     writeHeading(doc, "Output 2: Missing Ops");
     for (const row of report.output2 || []) {
@@ -974,9 +1282,30 @@ app.post("/api/license/extract", upload.single("license"), async (req, res) => {
   }
 });
 
+app.post("/api/vehicle-label/extract", upload.single("vehicleLabel"), async (req, res) => {
+  const vehicleLabelFile = req.file || null;
+  if (!vehicleLabelFile) {
+    return res.status(400).json({ ok: false, error: "Door-jamb label image is required." });
+  }
+
+  try {
+    const extracted = await extractVehicleLabelFromImage(vehicleLabelFile);
+    return res.json({
+      ok: true,
+      vehicleLabel: extracted.vehicleLabel,
+      source: extracted.source,
+      confidence: extracted.confidence,
+      notes: extracted.notes
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "Door-jamb label extraction failed" });
+  }
+});
+
 app.post("/api/estimate/generate", upload.fields([
   { name: "photos", maxCount: 20 },
-  { name: "license", maxCount: 1 }
+  { name: "license", maxCount: 1 },
+  { name: "vehicleLabel", maxCount: 1 }
 ]), async (req, res) => {
     try {
       const body = req.body && typeof req.body === "object" ? req.body : {};
@@ -984,11 +1313,34 @@ app.post("/api/estimate/generate", upload.fields([
       payload.customer = normalizeCustomer(payload.customer);
       payload.rates = normalizeShopRates(payload.rates);
       payload.charges = normalizeAdditionalCharges(payload.charges);
+      payload.vehicleLabel = normalizeVehicleLabel(payload.vehicleLabel);
 
       const filesByField = req.files && typeof req.files === "object" ? req.files : {};
       const photos = Array.isArray(filesByField.photos) ? filesByField.photos : [];
       const licenseFile = Array.isArray(filesByField.license) && filesByField.license.length ? filesByField.license[0] : null;
+      const vehicleLabelFile = Array.isArray(filesByField.vehicleLabel) && filesByField.vehicleLabel.length ? filesByField.vehicleLabel[0] : null;
       const photoCount = photos.length;
+
+      let vehicleLabel = normalizeVehicleLabel(payload.vehicleLabel);
+      const vehicleLabelNotes = [];
+      let vehicleLabelSource = vehicleLabel.source || "payload";
+      if (vehicleLabelFile) {
+        try {
+          const extractedLabel = await extractVehicleLabelFromImage(vehicleLabelFile);
+          vehicleLabel = mergeVehicleLabels(vehicleLabel, extractedLabel.vehicleLabel);
+          vehicleLabelSource = extractedLabel.source || "vehicle-label-ai";
+          if (Array.isArray(extractedLabel.notes)) {
+            for (const note of extractedLabel.notes) {
+              vehicleLabelNotes.push(note);
+            }
+          }
+        } catch (error) {
+          vehicleLabelSource = "vehicle-label-error";
+          vehicleLabelNotes.push(`Door-jamb extraction failed: ${error.message}`);
+        }
+      }
+      payload.vehicleLabel = vehicleLabel;
+
       let extractedCustomer = normalizeCustomer({});
       let licenseNotes = [];
       let licenseSource = "none";
@@ -1007,7 +1359,13 @@ app.post("/api/estimate/generate", upload.fields([
 
       const mergedCustomer = mergeCustomers(payload.customer, extractedCustomer);
 
-      const vin = sanitizeVin(payload.vin || "");
+      const vin = sanitizeVin(payload.vin || vehicleLabel.vin || "");
+      if (vin && !payload.vin) {
+        payload.vin = vin;
+      }
+      if (payload.vin && vehicleLabel.vin && sanitizeVin(payload.vin) !== vehicleLabel.vin) {
+        vehicleLabelNotes.push("VIN mismatch between typed VIN and door-jamb label; review before final billing.");
+      }
 
       let decodedVehicle = {
         vin,
@@ -1037,46 +1395,87 @@ app.post("/api/estimate/generate", upload.fields([
           // Keep intake fields if VIN decode fails during estimate.
         }
       }
+      decodedVehicle = applyVehicleLabelToVehicle(decodedVehicle, vehicleLabel);
 
       if (!openaiClient || photoCount === 0) {
-        const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
+        const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer, vehicleLabel);
+        fallback.parts = await buildOemPartsForReport(fallback);
         applyEstimateCalculations(fallback, payload.rates, payload.charges);
-        if (licenseSource !== "none") {
-          fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
-          for (const note of licenseNotes) {
-            fallback.assumptions.push(note);
-          }
-        }
+        appendAssumptions(fallback, fallback.parts.assumptions);
+        if (licenseSource !== "none") appendAssumptions(fallback, [`Customer data source: ${licenseSource}.`]);
+        if (vehicleLabelSource && vehicleLabelSource !== "none") appendAssumptions(fallback, [`Door-jamb data source: ${vehicleLabelSource}.`]);
+        appendAssumptions(fallback, licenseNotes);
+        appendAssumptions(fallback, vehicleLabelNotes);
         return res.json({ ok: true, report: fallback });
       }
 
       try {
         const aiRaw = await generateVisionEstimate(payload, decodedVehicle, photos);
         const normalized = normalizeReport(aiRaw, payload, decodedVehicle, photoCount, mergedCustomer);
+        normalized.vehicleLabel = mergeVehicleLabels(vehicleLabel, normalized.vehicleLabel);
+        normalized.vehicle = applyVehicleLabelToVehicle(normalized.vehicle, normalized.vehicleLabel);
+        normalized.parts = await buildOemPartsForReport(normalized);
         applyEstimateCalculations(normalized, payload.rates, payload.charges);
-        if (licenseSource !== "none") {
-          normalized.assumptions = Array.isArray(normalized.assumptions) ? normalized.assumptions : [];
-          normalized.assumptions.push(`Customer data source: ${licenseSource}.`);
-          for (const note of licenseNotes) {
-            normalized.assumptions.push(note);
-          }
-        }
+        appendAssumptions(normalized, normalized.parts.assumptions);
+        if (licenseSource !== "none") appendAssumptions(normalized, [`Customer data source: ${licenseSource}.`]);
+        if (vehicleLabelSource && vehicleLabelSource !== "none") appendAssumptions(normalized, [`Door-jamb data source: ${vehicleLabelSource}.`]);
+        appendAssumptions(normalized, licenseNotes);
+        appendAssumptions(normalized, vehicleLabelNotes);
         return res.json({ ok: true, report: normalized });
       } catch (error) {
-        const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer);
+        const fallback = buildRuleBasedFallback(payload, decodedVehicle, photoCount, mergedCustomer, vehicleLabel);
+        fallback.parts = await buildOemPartsForReport(fallback);
         applyEstimateCalculations(fallback, payload.rates, payload.charges);
-        fallback.assumptions.push(`AI vision generation failed: ${error.message}`);
-        if (licenseSource !== "none") {
-          fallback.assumptions.push(`Customer data source: ${licenseSource}.`);
-          for (const note of licenseNotes) {
-            fallback.assumptions.push(note);
-          }
-        }
+        appendAssumptions(fallback, [`AI vision generation failed: ${error.message}`]);
+        appendAssumptions(fallback, fallback.parts.assumptions);
+        if (licenseSource !== "none") appendAssumptions(fallback, [`Customer data source: ${licenseSource}.`]);
+        if (vehicleLabelSource && vehicleLabelSource !== "none") appendAssumptions(fallback, [`Door-jamb data source: ${vehicleLabelSource}.`]);
+        appendAssumptions(fallback, licenseNotes);
+        appendAssumptions(fallback, vehicleLabelNotes);
         return res.json({ ok: true, report: fallback });
       }
     } catch (error) {
       return res.status(500).json({ ok: false, error: error.message || "Estimate generation crashed" });
     }
+});
+
+app.post("/api/estimate/recalculate", async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const reportInput = body.report && typeof body.report === "object" ? body.report : null;
+    if (!reportInput) {
+      return res.status(400).json({ ok: false, error: "Missing report object for recalculate." });
+    }
+
+    const report = safeJsonParse(JSON.stringify(reportInput), {});
+    report.customer = normalizeCustomer(report.customer);
+    report.vehicleLabel = normalizeVehicleLabel(report.vehicleLabel);
+    report.vehicle = report.vehicle && typeof report.vehicle === "object" ? report.vehicle : {};
+    report.vehicle = applyVehicleLabelToVehicle(report.vehicle, report.vehicleLabel);
+    report.summary = report.summary && typeof report.summary === "object" ? report.summary : {};
+    report.output1 = Array.isArray(report.output1) ? report.output1 : [];
+    report.output2 = Array.isArray(report.output2) ? report.output2 : [];
+    report.output3 = Array.isArray(report.output3) ? report.output3 : [];
+    report.output4 = Array.isArray(report.output4) ? report.output4 : [];
+    report.output5 = Array.isArray(report.output5) ? report.output5 : [];
+    report.assumptions = Array.isArray(report.assumptions) ? report.assumptions : [];
+    report.parts = normalizeParts(report.parts);
+
+    const rates = normalizeShopRates(body.rates || report.rates);
+    const charges = normalizeAdditionalCharges(body.charges || report.charges);
+    const refreshParts = Boolean(body.refreshParts);
+
+    if (refreshParts) {
+      report.parts = await buildOemPartsForReport(report);
+    }
+
+    applyEstimateCalculations(report, rates, charges);
+    appendAssumptions(report, report.parts.assumptions);
+
+    return res.json({ ok: true, report });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "Estimate recalculate failed" });
+  }
 });
 
 app.post("/api/report/pdf", async (req, res) => {
@@ -1086,7 +1485,8 @@ app.post("/api/report/pdf", async (req, res) => {
   }
 
   try {
-    const pdfBuffer = await buildPdfBuffer(report);
+    const logoBuffer = await resolveLogoBuffer();
+    const pdfBuffer = await buildPdfBuffer(report, logoBuffer);
     const vin = sanitizeVin((report.vehicle && report.vehicle.vin) || "") || "estimate";
     const filename = `collision-estimate-${vin}-${Date.now()}.pdf`;
 

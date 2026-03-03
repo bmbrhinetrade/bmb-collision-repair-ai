@@ -264,6 +264,11 @@ button:active {
   color: #16483b;
 }
 
+#talkToggle.listening {
+  background: var(--accent);
+  color: #fff;
+}
+
 .results-head {
   display: flex;
   align-items: center;

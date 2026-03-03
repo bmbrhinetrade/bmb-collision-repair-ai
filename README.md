@@ -3,8 +3,11 @@
 This version is a full-stack app with:
 
 - VIN decode (NHTSA + optional extra provider for paint/build data)
+- Door-jamb label photo extraction (VIN + paint code)
 - AI photo analysis for automatic preliminary estimate write-up
+- OEM parts lookup integration (dealership part numbers + list pricing via provider)
 - Driver's license extraction for customer supplement fields (name/address/phone/email)
+- Real-time voice edit button for verbal estimate adjustments
 - Default shop labor rates + automated labor-hour/total estimate calculation
 - 5 required deliverables (repair/replace, missing ops, notes, red flags, system notes)
 - Email-ready PDF export
@@ -31,6 +34,8 @@ Optional:
 - `OPENAI_VISION_MODEL=gpt-4.1`
 - `VIN_EXTRA_PROVIDER_URL=...` (for paint code / richer VIN data)
 - `VIN_EXTRA_PROVIDER_TOKEN=...`
+- `OEM_PARTS_PROVIDER_URL=...` (POST endpoint for OEM part # + list pricing by component)
+- `OEM_PARTS_PROVIDER_TOKEN=...`
 - `PORT=3000`
 
 ## 3) Run
@@ -58,6 +63,8 @@ Nixpacks is explicitly pinned to Node via `nixpacks.toml`.
    - `OPENAI_VISION_MODEL` (optional, default `gpt-4.1`)
    - `VIN_EXTRA_PROVIDER_URL` (optional)
    - `VIN_EXTRA_PROVIDER_TOKEN` (optional)
+   - `OEM_PARTS_PROVIDER_URL` (optional for live OEM parts/pricing)
+   - `OEM_PARTS_PROVIDER_TOKEN` (optional)
    - `BMB_LOGO_URL` (optional override)
 5. Deploy and open:
    - `https://<your-app>.up.railway.app/api/health`
@@ -74,6 +81,8 @@ Nixpacks is explicitly pinned to Node via `nixpacks.toml`.
    - `OPENAI_VISION_MODEL`
    - `VIN_EXTRA_PROVIDER_URL`
    - `VIN_EXTRA_PROVIDER_TOKEN`
+   - `OEM_PARTS_PROVIDER_URL`
+   - `OEM_PARTS_PROVIDER_TOKEN`
    - `BMB_LOGO_URL`
 6. Deploy and verify:
    - `https://<your-render-service>/api/health`
@@ -81,11 +90,13 @@ Nixpacks is explicitly pinned to Node via `nixpacks.toml`.
 ## Usage flow
 
 1. Enter VIN and click `Decode VIN`.
-2. Upload driver's license photo and click `Extract License` (or include it during generate).
-3. Upload collision photos.
-4. Click `Generate Estimate From Photos`.
-5. Review all 5 deliverables + customer supplement header.
-6. Click `Download PDF` for email-ready output.
+2. Upload door-jamb label and click `Extract Label` to pull VIN/paint code.
+3. Upload driver's license photo and click `Extract License` (or include it during generate).
+4. Upload collision photos.
+5. Click `Generate Estimate From Photos`.
+6. Review all 5 deliverables + customer supplement header + OEM parts/pricing + totals.
+7. Click `Download PDF` for email-ready output.
+8. Optional: click `Start Talk Edit` and speak updates (rates, charges, line changes) to update estimate in real time.
 
 ## Default shop rates (preloaded)
 
@@ -111,11 +122,19 @@ These are editable in the app before generating each estimate.
 
 - If OpenAI key is not configured or AI call fails, server falls back to a rule-based preliminary estimate so the app still runs.
 
+## OEM parts behavior
+
+- The app derives damaged components from the estimate and sends them to `OEM_PARTS_PROVIDER_URL` (if configured).
+- Provider should return `items[]` with at least `component`, `partNumber`, `description`, `quantity`, `listPrice`.
+- If no provider is configured (or provider fails), the app inserts placeholder OEM rows with `$0.00` pricing and flags assumptions.
+
 ## API endpoints
 
 - `POST /api/vin/decode`
-- `POST /api/estimate/generate` (multipart form with `photos[]` + JSON `payload`)
+- `POST /api/estimate/generate` (multipart form with `photos[]`, optional `license`, optional `vehicleLabel`, + JSON `payload`)
 - `POST /api/license/extract` (multipart form with `license`)
+- `POST /api/vehicle-label/extract` (multipart form with `vehicleLabel`)
+- `POST /api/estimate/recalculate` (JSON report + rates/charges for live recalculation, used by voice edits)
 - `POST /api/report/pdf`
 - `GET /api/health`
 
