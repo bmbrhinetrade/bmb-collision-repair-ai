@@ -32,6 +32,12 @@ Set at minimum:
 Optional:
 
 - `OPENAI_VISION_MODEL=gpt-4.1`
+- `OPENAI_LICENSE_MODEL=gpt-4.1-mini` (low-cost model for driver's license OCR)
+- `OPENAI_DOOR_LABEL_MODEL=gpt-4.1-mini` (low-cost model for door-jamb OCR)
+- `OPENAI_LICENSE_MAX_OUTPUT_TOKENS=220`
+- `OPENAI_DOOR_LABEL_MAX_OUTPUT_TOKENS=260`
+- `EXTRACTION_CACHE_TTL_SECONDS=86400`
+- `EXTRACTION_CACHE_MAX_ITEMS=300`
 - `VIN_EXTRA_PROVIDER_URL=...` (for paint code / richer VIN data)
 - `VIN_EXTRA_PROVIDER_TOKEN=...`
 - `OEM_PARTS_PROVIDER_URL=...` (POST endpoint for OEM part # + list pricing by component)
@@ -61,6 +67,12 @@ Nixpacks is explicitly pinned to Node via `nixpacks.toml`.
 4. Add environment variables in Railway:
    - `OPENAI_API_KEY` (required)
    - `OPENAI_VISION_MODEL` (optional, default `gpt-4.1`)
+   - `OPENAI_LICENSE_MODEL` (optional, default `gpt-4.1-mini`)
+   - `OPENAI_DOOR_LABEL_MODEL` (optional, default `gpt-4.1-mini`)
+   - `OPENAI_LICENSE_MAX_OUTPUT_TOKENS` (optional, default `220`)
+   - `OPENAI_DOOR_LABEL_MAX_OUTPUT_TOKENS` (optional, default `260`)
+   - `EXTRACTION_CACHE_TTL_SECONDS` (optional, default `86400`)
+   - `EXTRACTION_CACHE_MAX_ITEMS` (optional, default `300`)
    - `VIN_EXTRA_PROVIDER_URL` (optional)
    - `VIN_EXTRA_PROVIDER_TOKEN` (optional)
    - `OEM_PARTS_PROVIDER_URL` (optional for live OEM parts/pricing)
@@ -79,6 +91,12 @@ Nixpacks is explicitly pinned to Node via `nixpacks.toml`.
    - `OPENAI_API_KEY`
 5. Optional variables:
    - `OPENAI_VISION_MODEL`
+   - `OPENAI_LICENSE_MODEL`
+   - `OPENAI_DOOR_LABEL_MODEL`
+   - `OPENAI_LICENSE_MAX_OUTPUT_TOKENS`
+   - `OPENAI_DOOR_LABEL_MAX_OUTPUT_TOKENS`
+   - `EXTRACTION_CACHE_TTL_SECONDS`
+   - `EXTRACTION_CACHE_MAX_ITEMS`
    - `VIN_EXTRA_PROVIDER_URL`
    - `VIN_EXTRA_PROVIDER_TOKEN`
    - `OEM_PARTS_PROVIDER_URL`
@@ -121,6 +139,12 @@ These are editable in the app before generating each estimate.
 ## AI fallback behavior
 
 - If OpenAI key is not configured or AI call fails, server falls back to a rule-based preliminary estimate so the app still runs.
+
+## Low-cost extraction mode
+
+- Driver's license and door-jamb extraction now use dedicated low-cost models (`OPENAI_LICENSE_MODEL`, `OPENAI_DOOR_LABEL_MODEL`).
+- These extraction calls are cached by image hash in-memory, so re-uploading the same image does not call OpenAI again until cache expiry.
+- If OpenAI quota is exceeded (`429`), extraction returns a safe fallback response instead of crashing the flow.
 
 ## OEM parts behavior
 

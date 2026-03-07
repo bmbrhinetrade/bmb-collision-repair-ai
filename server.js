@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 const multer = require("multer");
 const PDFDocument = require("pdfkit");
@@ -36,6 +37,9 @@ const DEFAULT_SHOP_RATES = {
 };
 
 const openaiClient = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+const extractionCache = new Map();
+const EXTRACTION_CACHE_TTL_SECONDS = Number(process.env.EXTRACTION_CACHE_TTL_SECONDS || 86400);
+const EXTRACTION_CACHE_MAX_ITEMS = Number(process.env.EXTRACTION_CACHE_MAX_ITEMS || 300);
 
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -67,6 +71,74 @@ function safeJsonParse(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function deepCloneJson(value) {
+  return safeJsonParse(JSON.stringify(value), null);
+}
+
+function hashBuffer(buffer) {
+  if (!buffer) return "";
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function buildExtractionCacheKey(kind, file) {
+  if (!file || !file.buffer) return "";
+  return `${kind}:${hashBuffer(file.buffer)}`;
+}
+
+function getExtractionCache(key) {
+  if (!key) return null;
+  const ttlSeconds = parsePositiveInteger(EXTRACTION_CACHE_TTL_SECONDS, 86400);
+  if (ttlSeconds <= 0) return null;
+
+  const entry = extractionCache.get(key);
+  if (!entry) return null;
+
+  if (entry.expiresAt <= Date.now()) {
+    extractionCache.delete(key);
+    return null;
+  }
+
+  return deepCloneJson(entry.value);
+}
+
+function setExtractionCache(key, value) {
+  if (!key) return;
+
+  const ttlSeconds = parsePositiveInteger(EXTRACTION_CACHE_TTL_SECONDS, 86400);
+  const maxItems = parsePositiveInteger(EXTRACTION_CACHE_MAX_ITEMS, 300);
+  if (ttlSeconds <= 0 || maxItems <= 0) return;
+
+  while (extractionCache.size >= maxItems) {
+    const oldestKey = extractionCache.keys().next().value;
+    if (!oldestKey) break;
+    extractionCache.delete(oldestKey);
+  }
+
+  extractionCache.set(key, {
+    expiresAt: Date.now() + ttlSeconds * 1000,
+    value: deepCloneJson(value)
+  });
+}
+
+function isOpenAiQuotaError(error) {
+  const status = Number(error && error.status);
+  const code = String(error && (error.code || (error.error && error.error.code) || "")).toLowerCase();
+  const message = String(error && error.message ? error.message : "").toLowerCase();
+
+  return (
+    status === 429 ||
+    code.includes("insufficient_quota") ||
+    message.includes("exceeded your current quota") ||
+    message.includes("insufficient_quota")
+  );
 }
 
 function extractJsonObject(text) {
@@ -433,45 +505,75 @@ Rules:
 }
 
 async function extractCustomerFromLicense(licenseFile) {
-  if (!openaiClient || !licenseFile) {
+  const cacheKey = buildExtractionCacheKey("license", licenseFile);
+  const cached = getExtractionCache(cacheKey);
+  if (cached) {
     return {
+      ...cached,
+      source: `${cached.source || "license-ai"}-cache`
+    };
+  }
+
+  if (!openaiClient || !licenseFile) {
+    const fallback = {
       customer: normalizeCustomer({}),
       confidence: "low",
       notes: ["License extraction unavailable (missing file or OpenAI key)."],
       source: "license-fallback"
     };
+    setExtractionCache(cacheKey, fallback);
+    return fallback;
   }
 
-  const model = process.env.OPENAI_VISION_MODEL || "gpt-4.1";
+  const model = process.env.OPENAI_LICENSE_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
+  const maxOutputTokens = parsePositiveInteger(process.env.OPENAI_LICENSE_MAX_OUTPUT_TOKENS, 220);
   const base64 = licenseFile.buffer.toString("base64");
   const mime = licenseFile.mimetype || "image/jpeg";
 
-  const response = await openaiClient.responses.create({
-    model,
-    input: [
-      {
-        role: "user",
-        content: [
-          { type: "input_text", text: buildLicensePrompt() },
-          { type: "input_image", image_url: `data:${mime};base64,${base64}` }
-        ]
-      }
-    ],
-    max_output_tokens: 700
-  });
+  try {
+    const response = await openaiClient.responses.create({
+      model,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: buildLicensePrompt() },
+            { type: "input_image", image_url: `data:${mime};base64,${base64}` }
+          ]
+        }
+      ],
+      max_output_tokens: maxOutputTokens
+    });
 
-  const text = response.output_text || "";
-  const parsed = safeJsonParse(text, null) || extractJsonObject(text);
-  if (!parsed) {
-    throw new Error("License extraction response was not valid JSON");
+    const text = response.output_text || "";
+    const parsed = safeJsonParse(text, null) || extractJsonObject(text);
+    if (!parsed) {
+      throw new Error("License extraction response was not valid JSON");
+    }
+
+    const result = {
+      customer: normalizeCustomer(parsed),
+      confidence: parsed.confidence || "low",
+      notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+      source: "license-ai"
+    };
+    setExtractionCache(cacheKey, result);
+    return result;
+  } catch (error) {
+    if (isOpenAiQuotaError(error)) {
+      const fallback = {
+        customer: normalizeCustomer({}),
+        confidence: "low",
+        notes: [
+          "OpenAI quota reached for license extraction. Fill customer fields manually or retry after quota resets."
+        ],
+        source: "license-fallback-quota"
+      };
+      setExtractionCache(cacheKey, fallback);
+      return fallback;
+    }
+    throw error;
   }
-
-  return {
-    customer: normalizeCustomer(parsed),
-    confidence: parsed.confidence || "low",
-    notes: Array.isArray(parsed.notes) ? parsed.notes : [],
-    source: "license-ai"
-  };
 }
 
 function buildVehicleLabelPrompt() {
@@ -494,56 +596,84 @@ Rules:
 }
 
 async function extractVehicleLabelFromImage(vehicleLabelFile) {
-  if (!openaiClient || !vehicleLabelFile) {
+  const cacheKey = buildExtractionCacheKey("vehicle-label", vehicleLabelFile);
+  const cached = getExtractionCache(cacheKey);
+  if (cached) {
     return {
+      ...cached,
+      source: `${cached.source || "vehicle-label-ai"}-cache`
+    };
+  }
+
+  if (!openaiClient || !vehicleLabelFile) {
+    const fallback = {
       vehicleLabel: normalizeVehicleLabel({}),
       source: "vehicle-label-fallback",
       confidence: "low",
       notes: ["Door-jamb extraction unavailable (missing file or OpenAI key)."]
     };
+    setExtractionCache(cacheKey, fallback);
+    return fallback;
   }
 
-  const model = process.env.OPENAI_VISION_MODEL || "gpt-4.1";
+  const model = process.env.OPENAI_DOOR_LABEL_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
+  const maxOutputTokens = parsePositiveInteger(process.env.OPENAI_DOOR_LABEL_MAX_OUTPUT_TOKENS, 260);
   const base64 = vehicleLabelFile.buffer.toString("base64");
   const mime = vehicleLabelFile.mimetype || "image/jpeg";
 
-  const response = await openaiClient.responses.create({
-    model,
-    input: [
-      {
-        role: "user",
-        content: [
-          { type: "input_text", text: buildVehicleLabelPrompt() },
-          { type: "input_image", image_url: `data:${mime};base64,${base64}` }
-        ]
-      }
-    ],
-    max_output_tokens: 700
-  });
+  try {
+    const response = await openaiClient.responses.create({
+      model,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: buildVehicleLabelPrompt() },
+            { type: "input_image", image_url: `data:${mime};base64,${base64}` }
+          ]
+        }
+      ],
+      max_output_tokens: maxOutputTokens
+    });
 
-  const text = response.output_text || "";
-  const parsed = safeJsonParse(text, null) || extractJsonObject(text);
-  if (!parsed) {
-    throw new Error("Door-jamb extraction response was not valid JSON");
+    const text = response.output_text || "";
+    const parsed = safeJsonParse(text, null) || extractJsonObject(text);
+    if (!parsed) {
+      throw new Error("Door-jamb extraction response was not valid JSON");
+    }
+
+    const normalized = normalizeVehicleLabel({
+      vin: parsed.vin,
+      paintCode: parsed.paintCode,
+      paintDescription: parsed.paintDescription,
+      modelCode: parsed.modelCode,
+      productionDate: parsed.productionDate,
+      confidence: parsed.confidence || "low",
+      notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+      source: "vehicle-label-ai"
+    });
+
+    const result = {
+      vehicleLabel: normalized,
+      source: "vehicle-label-ai",
+      confidence: normalized.confidence,
+      notes: normalized.notes
+    };
+    setExtractionCache(cacheKey, result);
+    return result;
+  } catch (error) {
+    if (isOpenAiQuotaError(error)) {
+      const fallback = {
+        vehicleLabel: normalizeVehicleLabel({}),
+        source: "vehicle-label-fallback-quota",
+        confidence: "low",
+        notes: ["OpenAI quota reached for door-jamb extraction. Enter VIN/paint manually or retry later."]
+      };
+      setExtractionCache(cacheKey, fallback);
+      return fallback;
+    }
+    throw error;
   }
-
-  const normalized = normalizeVehicleLabel({
-    vin: parsed.vin,
-    paintCode: parsed.paintCode,
-    paintDescription: parsed.paintDescription,
-    modelCode: parsed.modelCode,
-    productionDate: parsed.productionDate,
-    confidence: parsed.confidence || "low",
-    notes: Array.isArray(parsed.notes) ? parsed.notes : [],
-    source: "vehicle-label-ai"
-  });
-
-  return {
-    vehicleLabel: normalized,
-    source: "vehicle-label-ai",
-    confidence: normalized.confidence,
-    notes: normalized.notes
-  };
 }
 
 function normalizeParts(parts) {

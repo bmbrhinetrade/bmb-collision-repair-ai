@@ -782,9 +782,26 @@ async function extractVehicleLabel() {
     state.extractedVehicleLabel = json.vehicleLabel || null;
     applyVehicleLabelData(state.extractedVehicleLabel);
 
+    const source = String(json.source || "unknown");
+    const note = Array.isArray(json.notes) && json.notes.length ? ` ${json.notes[0]}` : "";
     const vin = state.extractedVehicleLabel && state.extractedVehicleLabel.vin ? sanitizeVin(state.extractedVehicleLabel.vin) : "N/A";
     const paint = state.extractedVehicleLabel && state.extractedVehicleLabel.paintCode ? state.extractedVehicleLabel.paintCode : "Unknown";
-    refs.vehicleLabelStatus.textContent = `Door-jamb extracted. VIN: ${vin}, Paint: ${paint}`;
+    if (source.includes("quota")) {
+      refs.vehicleLabelStatus.textContent = `Door-jamb extraction paused (quota reached).${note}`;
+      refs.vehicleLabelStatus.classList.add("warn");
+      return;
+    }
+
+    if (source.includes("fallback")) {
+      refs.vehicleLabelStatus.textContent = `Door-jamb extraction unavailable (${source}).${note}`;
+      refs.vehicleLabelStatus.classList.add("warn");
+      return;
+    }
+
+    const fromCache = source.includes("cache");
+    refs.vehicleLabelStatus.textContent = fromCache
+      ? `Door-jamb loaded from cache. VIN: ${vin}, Paint: ${paint}`
+      : `Door-jamb extracted. VIN: ${vin}, Paint: ${paint}`;
 
     if (vin !== "N/A" && vin.length === 17) {
       await decodeVin();
@@ -825,8 +842,24 @@ async function extractLicense() {
     state.extractedCustomer = json.customer || null;
     applyCustomerData(state.extractedCustomer);
 
-    const source = json.source || "unknown";
-    refs.licenseStatus.textContent = `License extracted (${source}). Review fields before generating.`;
+    const source = String(json.source || "unknown");
+    const note = Array.isArray(json.notes) && json.notes.length ? ` ${json.notes[0]}` : "";
+    if (source.includes("quota")) {
+      refs.licenseStatus.textContent = `License extraction paused (quota reached).${note}`;
+      refs.licenseStatus.classList.add("warn");
+      return;
+    }
+
+    if (source.includes("fallback")) {
+      refs.licenseStatus.textContent = `License extraction unavailable (${source}).${note}`;
+      refs.licenseStatus.classList.add("warn");
+      return;
+    }
+
+    const fromCache = source.includes("cache");
+    refs.licenseStatus.textContent = fromCache
+      ? "License loaded from cache. Review fields before generating."
+      : `License extracted (${source}). Review fields before generating.`;
   } catch (error) {
     refs.licenseStatus.textContent = `License extraction failed: ${error.message}`;
     refs.licenseStatus.classList.add("warn");
