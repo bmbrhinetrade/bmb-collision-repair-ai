@@ -1074,128 +1074,426 @@ async function resolveLogoBuffer() {
   }
 }
 
-function buildPdfBuffer(report, logoBuffer) {
+function buildPdfBuffer(report, logoBuffer, photoFiles) {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: "LETTER", margin: 42 });
+    const doc = new PDFDocument({ size: "LETTER", margin: 24, bufferPages: true });
     const chunks = [];
 
     doc.on("data", (chunk) => chunks.push(chunk));
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    if (logoBuffer) {
-      try {
-        doc.image(logoBuffer, 42, 32, { fit: [130, 56], align: "left", valign: "center" });
-      } catch {
-        // Continue without logo if image decode fails.
-      }
-    }
+    const page = {
+      left: 24,
+      top: 24,
+      width: 564,
+      height: 744,
+      right: 588,
+      bottom: 768
+    };
 
-    doc.font("Helvetica-Bold").fontSize(18).text("BMB Collision Repair AI Estimate", logoBuffer ? 185 : 42, 42);
-    doc.moveDown(0.2);
-    doc.font("Helvetica").fontSize(10).text(`Generated: ${report.generatedAt || nowIso()}`, logoBuffer ? 185 : 42);
-
-    writeHeading(doc, "Vehicle");
     const v = report.vehicle || {};
-    const vl = normalizeVehicleLabel(report.vehicleLabel);
-    writeLine(doc, `VIN: ${v.vin || "N/A"}`);
-    writeLine(doc, `Year/Make/Model: ${[v.year, v.make, v.model].filter(Boolean).join(" ") || "N/A"}`);
-    writeLine(doc, `Trim: ${v.trim || "N/A"}`);
-    writeLine(doc, `Paint: ${v.paintCode || "Unknown"} ${v.paintDescription ? `(${v.paintDescription})` : ""}`);
-    if (vl.vin || vl.paintCode || vl.modelCode || vl.productionDate) {
-      writeHeading(doc, "Door-Jamb Label");
-      writeLine(doc, `Label VIN: ${vl.vin || "N/A"}`);
-      writeLine(doc, `Label paint: ${vl.paintCode || "Unknown"} ${vl.paintDescription ? `(${vl.paintDescription})` : ""}`);
-      writeLine(doc, `Model code: ${vl.modelCode || "N/A"}`);
-      writeLine(doc, `Production date: ${vl.productionDate || "N/A"}`);
-    }
-
-    writeHeading(doc, "Customer");
     const c = report.customer || {};
-    writeLine(doc, `Full name: ${c.fullName || "N/A"}`);
-    writeLine(doc, `Address: ${c.address || "N/A"}`);
-    writeLine(doc, `Phone: ${c.phone || "N/A"}`);
-    writeLine(doc, `Email: ${c.email || "N/A"}`);
-
     const s = report.summary || {};
     const calc = report.calculation || {};
-    writeHeading(doc, "Summary");
-    writeLine(doc, `Estimate type: ${toSentenceCase(s.estimateType || "preliminary")}`);
-    writeLine(doc, `Impacts: ${Array.isArray(s.impacts) ? s.impacts.join(", ") : "N/A"}`);
-    writeLine(doc, `Severity: ${toSentenceCase(s.severity || "functional")}`);
-    writeLine(doc, `Photos reviewed: ${s.photoCount || 0}`);
-    writeLine(doc, `Confidence: ${toSentenceCase(s.confidence || "low")}`);
-
-    writeHeading(doc, "Rates");
-    const rates = report.rates || {};
-    writeLine(doc, `Body labor: $${Number(rates.bodyLaborPerHour || DEFAULT_SHOP_RATES.bodyLaborPerHour).toFixed(2)} / hr`);
-    writeLine(doc, `Structural labor: $${Number(rates.structuralLaborPerHour || DEFAULT_SHOP_RATES.structuralLaborPerHour).toFixed(2)} / hr`);
-    writeLine(doc, `Frame labor: $${Number(rates.frameLaborPerHour || DEFAULT_SHOP_RATES.frameLaborPerHour).toFixed(2)} / hr`);
-    writeLine(doc, `Mechanical labor: $${Number(rates.mechanicalLaborPerHour || DEFAULT_SHOP_RATES.mechanicalLaborPerHour).toFixed(2)} / hr`);
-    writeLine(doc, `Electrical labor: $${Number(rates.electricalLaborPerHour || DEFAULT_SHOP_RATES.electricalLaborPerHour).toFixed(2)} / hr`);
-    writeLine(doc, `Paint materials: $${Number(rates.paintMaterialsPerPaintHour || DEFAULT_SHOP_RATES.paintMaterialsPerPaintHour).toFixed(2)} / paint hr`);
-    writeLine(doc, `Inside storage: $${Number(rates.insideStoragePerDay || DEFAULT_SHOP_RATES.insideStoragePerDay).toFixed(2)} / day`);
-    writeLine(doc, `Outside storage: $${Number(rates.outsideStoragePerDay || DEFAULT_SHOP_RATES.outsideStoragePerDay).toFixed(2)} / day`);
-    writeLine(doc, `Towing: $${Number(rates.towingPerMile || DEFAULT_SHOP_RATES.towingPerMile).toFixed(2)} / mile`);
-
-    writeHeading(doc, "Output 1: Repair vs Replace");
-    if (Array.isArray(calc.lineItems) && calc.lineItems.length) {
-      for (const row of calc.lineItems) {
-        writeLine(doc, `${row.component} | ${row.action} | ${row.laborType} | ${Number(row.laborHours || 0).toFixed(2)} hr | $${Number(row.laborTotal || 0).toFixed(2)}`);
-        writeLine(doc, `  Notes: ${row.notes}`);
-      }
-    } else {
-      for (const row of report.output1 || []) {
-        writeLine(doc, `${row.component} | ${row.action} | ${row.laborBucket} | ${row.confidence}`);
-        writeLine(doc, `  Notes: ${row.notes}`);
-      }
-    }
-
-    writeHeading(doc, "Estimate Totals");
-    writeLine(doc, `Labor subtotal: $${Number(calc.laborSubtotal || 0).toFixed(2)}`);
-    writeLine(doc, `Paint materials: $${Number(calc.paintMaterialsTotal || 0).toFixed(2)}`);
-    writeLine(doc, `OEM parts: $${Number(calc.partsSubtotal || 0).toFixed(2)}`);
-    writeLine(doc, `Inside storage: $${Number(calc.insideStorageTotal || 0).toFixed(2)}`);
-    writeLine(doc, `Outside storage: $${Number(calc.outsideStorageTotal || 0).toFixed(2)}`);
-    writeLine(doc, `Towing: $${Number(calc.towingTotal || 0).toFixed(2)}`);
-    writeLine(doc, `Grand total: $${Number(calc.grandTotal || 0).toFixed(2)}`);
-
     const parts = normalizeParts(report.parts);
-    writeHeading(doc, "OEM Parts & List Pricing");
-    if (parts.items.length) {
-      for (const item of parts.items) {
-        writeLine(
-          doc,
-          `${item.component || "Part"} | PN: ${item.partNumber || "N/A"} | Qty: ${Number(item.quantity || 0).toFixed(2)} | List: $${Number(item.listPrice || 0).toFixed(2)} | Line: $${Number(item.lineTotal || 0).toFixed(2)}`
-        );
+    const vl = normalizeVehicleLabel(report.vehicleLabel);
+    const lineItems = Array.isArray(calc.lineItems) && calc.lineItems.length
+      ? calc.lineItems
+      : (Array.isArray(report.output1) ? report.output1.map((row) => ({
+          component: row.component || "",
+          action: row.action || "",
+          laborType: String(row.laborBucket || "AUTO").toLowerCase(),
+          laborHours: 0,
+          laborTotal: 0,
+          notes: row.notes || ""
+        })) : []);
+    const photoEntries = (Array.isArray(photoFiles) ? photoFiles : [])
+      .filter((file) => file && Buffer.isBuffer(file.buffer) && String(file.mimetype || "").includes("image/"))
+      .slice(0, 24);
+
+    const normalizedForMatch = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+    const findPartForComponent = (component) => {
+      const target = normalizedForMatch(component);
+      if (!target) return null;
+      return parts.items.find((item) => {
+        const candidate = normalizedForMatch(item.component);
+        return candidate.includes(target) || target.includes(candidate);
+      }) || null;
+    };
+
+    const rows = lineItems.map((row, index) => {
+      const part = findPartForComponent(row.component);
+      return {
+        lineNumber: index + 1,
+        entry: String(row.laborBucket || "AUTO"),
+        labor: String(row.laborType || "body").toUpperCase().slice(0, 4),
+        description: `${row.action || ""} ${row.component || ""}`.trim(),
+        partType: part && part.partNumber ? part.partNumber : "Existing",
+        amount: part ? Number(part.lineTotal || 0) : Number(row.laborTotal || 0),
+        laborUnits: Number(row.laborHours || 0)
+      };
+    });
+
+    const generatedDate = report.generatedAt ? new Date(report.generatedAt) : new Date();
+    const dateText = generatedDate.toLocaleDateString("en-US");
+    const timeText = generatedDate.toLocaleTimeString("en-US");
+    const estimateId = `${(v.vin || "EST").slice(-6)}-${String(Math.floor(generatedDate.getTime() / 1000)).slice(-6)}`;
+    const profileId = report.output5 && report.output5[0] && report.output5[0].system ? report.output5[0].system : "Mitchell";
+
+    const setFont = (bold, size) => {
+      doc.font(bold ? "Helvetica-Bold" : "Helvetica");
+      doc.fontSize(size);
+    };
+
+    const drawCellText = (x, y, w, h, text, options = {}) => {
+      const {
+        bold = false,
+        size = 7,
+        align = "left",
+        lineBreak = false,
+        padding = 2
+      } = options;
+      setFont(bold, size);
+      doc.text(String(text || ""), x + padding, y + 2, {
+        width: Math.max(0, w - padding * 2),
+        height: Math.max(0, h - 4),
+        align,
+        lineBreak,
+        ellipsis: !lineBreak
+      });
+    };
+
+    const drawLabelValueRow = (x, y, labelWidth, totalWidth, h, label, value, valueBold) => {
+      doc.rect(x, y, totalWidth, h).stroke();
+      doc.moveTo(x + labelWidth, y).lineTo(x + labelWidth, y + h).stroke();
+      drawCellText(x, y, labelWidth, h, label, { bold: true, size: 7 });
+      drawCellText(x + labelWidth, y, totalWidth - labelWidth, h, value, { bold: Boolean(valueBold), size: 7 });
+    };
+
+    const drawOuterBorder = () => {
+      doc.lineWidth(0.9).rect(page.left, page.top, page.width, page.height).stroke();
+      doc.lineWidth(0.6);
+    };
+
+    const drawFirstPageHeaderBlocks = () => {
+      drawOuterBorder();
+
+      const metaX = 430;
+      const metaY = 24;
+      const metaW = 158;
+      const metaRowH = 11;
+      const metaLabelW = 74;
+      const metaRows = [
+        ["Date", `${dateText} ${timeText}`],
+        ["Estimate ID", estimateId],
+        ["Est Version", "05"],
+        ["Profile ID", profileId],
+        ["Estimate Type", toSentenceCase(s.estimateType || "Preliminary")],
+        ["Severity", toSentenceCase(s.severity || "Functional")]
+      ];
+
+      for (let index = 0; index < metaRows.length; index += 1) {
+        const y = metaY + index * metaRowH;
+        drawLabelValueRow(metaX, y, metaLabelW, metaW, metaRowH, metaRows[index][0], metaRows[index][1], true);
       }
-      writeLine(doc, `Parts subtotal: $${Number(parts.subtotal || 0).toFixed(2)}`);
-    } else {
-      writeLine(doc, "No OEM parts returned.");
+
+      if (logoBuffer) {
+        try {
+          doc.image(logoBuffer, 32, 56, { fit: [120, 38], align: "left", valign: "center" });
+        } catch {
+          // Keep going if logo decode fails.
+        }
+      }
+
+      drawLabelValueRow(162, 82, 250, 250, 16, "", "BMB RHINETRADE INC", true);
+      drawLabelValueRow(162, 98, 250, 250, 14, "", "127 E Dyer Rd, Santa Ana, CA 92707", false);
+      drawLabelValueRow(162, 112, 250, 250, 14, "", "Email: snopro@gmail.com", false);
+
+      const damageX = 28;
+      const damageY = 132;
+      const damageW = 140;
+      drawLabelValueRow(damageX, damageY, 66, damageW, 16, "Damage By", "Mike Saad", true);
+      drawLabelValueRow(damageX, damageY + 16, 66, damageW, 16, "Class", "Audit", true);
+      drawLabelValueRow(damageX, damageY + 36, 66, damageW, 16, "Deductible", "UNKNOWN", true);
+
+      const vehicleX = 28;
+      const vehicleY = 190;
+      const vehicleW = 560;
+      doc.rect(vehicleX, vehicleY, vehicleW, 122).stroke();
+      doc.moveTo(vehicleX, vehicleY + 56).lineTo(vehicleX + vehicleW, vehicleY + 56).stroke();
+      doc.moveTo(vehicleX, vehicleY + 72).lineTo(vehicleX + vehicleW, vehicleY + 72).stroke();
+
+      drawLabelValueRow(vehicleX + 2, vehicleY + 2, 68, 270, 14, "Description", [v.year, v.make, v.model].filter(Boolean).join(" ") || "N/A", true);
+      drawLabelValueRow(vehicleX + 272, vehicleY + 2, 90, 286, 14, "Drive Train", [v.engine, v.driveType].filter(Boolean).join(" ") || "N/A", false);
+      drawLabelValueRow(vehicleX + 2, vehicleY + 16, 68, 270, 14, "Body Style", v.bodyClass || "Sedan", false);
+      drawLabelValueRow(vehicleX + 272, vehicleY + 16, 90, 286, 14, "Search Code", "None", false);
+      drawLabelValueRow(vehicleX + 2, vehicleY + 30, 68, 556, 14, "VIN", v.vin || "N/A", true);
+      drawLabelValueRow(vehicleX + 2, vehicleY + 44, 68, 556, 14, "Paint", `${v.paintCode || "Unknown"} ${v.paintDescription ? `(${v.paintDescription})` : ""}`, false);
+
+      const optionsTextParts = [];
+      if (vl.paintCode) optionsTextParts.push(`Door Label Paint ${vl.paintCode}${vl.paintDescription ? ` (${vl.paintDescription})` : ""}`);
+      if (c.fullName) optionsTextParts.push(`Customer ${c.fullName}`);
+      if (c.phone) optionsTextParts.push(`Phone ${c.phone}`);
+      if (Array.isArray(s.impacts) && s.impacts.length) optionsTextParts.push(`Impacts ${s.impacts.join(", ")}`);
+      optionsTextParts.push(`Confidence ${s.confidence || "low"}`);
+      const optionsText = optionsTextParts.join(", ") || "No additional options.";
+      drawCellText(vehicleX + 4, vehicleY + 58, 64, 12, "Options:", { bold: true, size: 7 });
+      drawCellText(vehicleX + 70, vehicleY + 58, vehicleW - 74, 62, optionsText, { bold: false, size: 7, lineBreak: true });
+    };
+
+    const drawLineItemTableHeader = (tableX, tableY, colWidths, headerHeight) => {
+      const headers = [
+        "Line\nItem",
+        "Entry\nNo",
+        "Labor\nType",
+        "Line Item Description",
+        "Part Type/\nPart Number",
+        "Dollar\nAmount",
+        "Labor\nUnits"
+      ];
+      let x = tableX;
+      for (let index = 0; index < colWidths.length; index += 1) {
+        const w = colWidths[index];
+        doc.rect(x, tableY, w, headerHeight).stroke();
+        drawCellText(x, tableY, w, headerHeight, headers[index], { bold: true, size: 6, align: "center", lineBreak: true, padding: 1 });
+        x += w;
+      }
+    };
+
+    const drawLineItemRows = (tableX, startY, colWidths, rowHeight, tableRows) => {
+      let y = startY;
+      for (const row of tableRows) {
+        let x = tableX;
+        const values = [
+          row.lineNumber,
+          row.entry,
+          row.labor,
+          row.description,
+          row.partType,
+          `$${Number(row.amount || 0).toFixed(2)}`,
+          `${Number(row.laborUnits || 0).toFixed(1)}`
+        ];
+        for (let index = 0; index < colWidths.length; index += 1) {
+          const w = colWidths[index];
+          doc.rect(x, y, w, rowHeight).stroke();
+          drawCellText(x, y, w, rowHeight, values[index], {
+            bold: index !== 3,
+            size: 7,
+            align: index === 5 || index === 6 ? "right" : "left"
+          });
+          x += w;
+        }
+        y += rowHeight;
+      }
+      return y;
+    };
+
+    const drawFirstLinePage = (rowsForPage) => {
+      drawFirstPageHeaderBlocks();
+      const tableX = 24;
+      const tableY = 324;
+      const colWidths = [22, 42, 42, 248, 90, 62, 58];
+      const headerHeight = 18;
+      const rowHeight = 14;
+
+      drawLineItemTableHeader(tableX, tableY, colWidths, headerHeight);
+      drawLineItemRows(tableX, tableY + headerHeight, colWidths, rowHeight, rowsForPage);
+    };
+
+    const drawContinuationLinePage = (rowsForPage, pageIndex) => {
+      drawOuterBorder();
+      drawCellText(28, 34, 560, 16, `LINE ITEM CONTINUATION - PAGE ${pageIndex}`, { bold: true, size: 10, align: "center" });
+      const tableX = 24;
+      const tableY = 58;
+      const colWidths = [22, 42, 42, 248, 90, 62, 58];
+      const headerHeight = 18;
+      const rowHeight = 14;
+      drawLineItemTableHeader(tableX, tableY, colWidths, headerHeight);
+      drawLineItemRows(tableX, tableY + headerHeight, colWidths, rowHeight, rowsForPage);
+    };
+
+    const drawSupplementPage = () => {
+      doc.addPage();
+      drawOuterBorder();
+      drawCellText(28, 30, 560, 16, "SUPPLEMENT DETAILS / MISSING OPERATIONS", { bold: true, size: 11, align: "center" });
+
+      const tableX = 24;
+      const tableY = 56;
+      const colWidths = [220, 58, 110, 74, 102];
+      const headerHeight = 16;
+      const rowHeight = 15;
+      const headers = ["Missing Operation", "Category", "Applies To", "Bill", "Best Proof"];
+      let x = tableX;
+      for (let index = 0; index < colWidths.length; index += 1) {
+        doc.rect(x, tableY, colWidths[index], headerHeight).stroke();
+        drawCellText(x, tableY, colWidths[index], headerHeight, headers[index], { bold: true, size: 7, align: "center" });
+        x += colWidths[index];
+      }
+
+      const missingRows = Array.isArray(report.output2) ? report.output2 : [];
+      const maxRows = Math.min(18, missingRows.length);
+      let y = tableY + headerHeight;
+      for (let rowIndex = 0; rowIndex < maxRows; rowIndex += 1) {
+        const row = missingRows[rowIndex] || {};
+        let cx = tableX;
+        const values = [
+          row.missingOperation || "",
+          row.category || "",
+          row.appliesTo || "",
+          row.billNowOrPending || "",
+          row.bestProof || ""
+        ];
+        for (let col = 0; col < colWidths.length; col += 1) {
+          doc.rect(cx, y, colWidths[col], rowHeight).stroke();
+          drawCellText(cx, y, colWidths[col], rowHeight, values[col], { size: 6.8, lineBreak: false });
+          cx += colWidths[col];
+        }
+        y += rowHeight;
+      }
+
+      const totalsX = 338;
+      const totalsY = 360;
+      const totalsW = 250;
+      const totalsRowH = 15;
+      const totals = [
+        ["Labor Subtotal", `$${Number(calc.laborSubtotal || 0).toFixed(2)}`],
+        ["Paint Materials", `$${Number(calc.paintMaterialsTotal || 0).toFixed(2)}`],
+        ["OEM Parts", `$${Number(calc.partsSubtotal || 0).toFixed(2)}`],
+        ["Inside Storage", `$${Number(calc.insideStorageTotal || 0).toFixed(2)}`],
+        ["Outside Storage", `$${Number(calc.outsideStorageTotal || 0).toFixed(2)}`],
+        ["Towing", `$${Number(calc.towingTotal || 0).toFixed(2)}`],
+        ["Grand Total", `$${Number(calc.grandTotal || 0).toFixed(2)}`]
+      ];
+      for (let index = 0; index < totals.length; index += 1) {
+        const rowY = totalsY + index * totalsRowH;
+        drawLabelValueRow(totalsX, rowY, 140, totalsW, totalsRowH, totals[index][0], totals[index][1], true);
+      }
+
+      const notesY = 360;
+      doc.rect(24, notesY, 304, 150).stroke();
+      drawCellText(28, notesY + 2, 294, 12, "Justification Notes", { bold: true, size: 8 });
+      let noteCursorY = notesY + 16;
+      const notes = Array.isArray(report.output3) ? report.output3 : [];
+      for (const note of notes.slice(0, 6)) {
+        drawCellText(30, noteCursorY, 292, 18, `- ${note}`, { size: 7, lineBreak: true });
+        noteCursorY += 20;
+      }
+
+      const flagsY = 516;
+      doc.rect(24, flagsY, 304, 108).stroke();
+      drawCellText(28, flagsY + 2, 294, 12, "Red Flags / Teardown Questions", { bold: true, size: 8 });
+      let flagCursorY = flagsY + 16;
+      for (const flag of (Array.isArray(report.output4) ? report.output4 : []).slice(0, 5)) {
+        drawCellText(30, flagCursorY, 292, 16, `- ${flag}`, { size: 7, lineBreak: true });
+        flagCursorY += 17;
+      }
+
+      doc.rect(338, 478, 250, 146).stroke();
+      drawCellText(342, 482, 242, 12, "System Entry Notes", { bold: true, size: 8 });
+      let sysY = 496;
+      for (const item of (Array.isArray(report.output5) ? report.output5 : []).slice(0, 5)) {
+        drawCellText(344, sysY, 240, 22, `- ${item.system}: ${item.note}`, { size: 7, lineBreak: true });
+        sysY += 24;
+      }
+    };
+
+    const drawDamagePhotoPages = () => {
+      if (!photoEntries.length) return;
+
+      const pageTitle = "DAMAGE PHOTO SHEET";
+      const gridX = 24;
+      const gridY = 58;
+      const gridW = 560;
+      const gridH = 642;
+      const cols = 2;
+      const rowsPerPage = 2;
+      const photosPerPage = cols * rowsPerPage;
+      const gapX = 12;
+      const gapY = 16;
+      const cellW = (gridW - gapX) / cols;
+      const cellH = (gridH - gapY) / rowsPerPage;
+
+      let cursor = 0;
+      let sheetPage = 1;
+
+      while (cursor < photoEntries.length) {
+        doc.addPage();
+        drawOuterBorder();
+        drawCellText(28, 30, 560, 16, `${pageTitle} - PAGE ${sheetPage}`, { bold: true, size: 11, align: "center" });
+
+        for (let index = 0; index < photosPerPage && cursor < photoEntries.length; index += 1) {
+          const file = photoEntries[cursor];
+          const col = index % cols;
+          const row = Math.floor(index / cols);
+          const cellX = gridX + col * (cellW + gapX);
+          const cellY = gridY + row * (cellH + gapY);
+          const captionH = 16;
+          const imageBoxY = cellY;
+          const imageBoxH = cellH - captionH;
+
+          doc.rect(cellX, imageBoxY, cellW, imageBoxH).stroke();
+          try {
+            doc.image(file.buffer, cellX + 4, imageBoxY + 4, {
+              fit: [cellW - 8, imageBoxH - 8],
+              align: "center",
+              valign: "center"
+            });
+          } catch {
+            drawCellText(cellX, imageBoxY + (imageBoxH / 2) - 7, cellW, 14, "Image render failed", {
+              bold: false,
+              size: 7,
+              align: "center"
+            });
+          }
+
+          doc.rect(cellX, imageBoxY + imageBoxH, cellW, captionH).stroke();
+          drawCellText(
+            cellX,
+            imageBoxY + imageBoxH,
+            cellW,
+            captionH,
+            `Photo ${cursor + 1}: ${file.originalname || "damage-image"}`,
+            { bold: false, size: 6.5, align: "left", lineBreak: false }
+          );
+
+          cursor += 1;
+        }
+
+        sheetPage += 1;
+      }
+    };
+
+    const rowsFirstPageCapacity = 30;
+    const rowsContinuationCapacity = 47;
+    const firstRows = rows.slice(0, rowsFirstPageCapacity);
+    drawFirstLinePage(firstRows);
+
+    let cursor = rowsFirstPageCapacity;
+    let continuationIndex = 2;
+    while (cursor < rows.length) {
+      doc.addPage();
+      const pageRows = rows.slice(cursor, cursor + rowsContinuationCapacity);
+      drawContinuationLinePage(pageRows, continuationIndex);
+      cursor += rowsContinuationCapacity;
+      continuationIndex += 1;
     }
 
-    writeHeading(doc, "Output 2: Missing Ops");
-    for (const row of report.output2 || []) {
-      writeLine(doc, `${row.missingOperation} [${row.category}]`);
-      writeLine(doc, `  Applies to: ${row.appliesTo}`);
-      writeLine(doc, `  Why: ${row.why}`);
-      writeLine(doc, `  Proof: ${row.bestProof} | ${row.billNowOrPending}`);
-    }
+    drawSupplementPage();
+    drawDamagePhotoPages();
 
-    writeHeading(doc, "Output 3: Paste-Ready Notes");
-    writeBullets(doc, report.output3 || []);
-
-    writeHeading(doc, "Output 4: Red Flags / Teardown Questions");
-    writeBullets(doc, report.output4 || []);
-
-    writeHeading(doc, "Output 5: System Entry Notes");
-    for (const row of report.output5 || []) {
-      writeLine(doc, `- ${row.system}: ${row.note}`);
-    }
-
-    if (Array.isArray(report.assumptions) && report.assumptions.length) {
-      writeHeading(doc, "Assumptions");
-      writeBullets(doc, report.assumptions);
+    const range = doc.bufferedPageRange();
+    const totalPages = range.count;
+    const recallNumber = `${dateText} ${timeText}`;
+    for (let pageIndex = range.start; pageIndex < range.start + range.count; pageIndex += 1) {
+      doc.switchToPage(pageIndex);
+      const footerY = 748;
+      doc.moveTo(24, footerY).lineTo(588, footerY).stroke();
+      drawCellText(26, footerY + 2, 200, 12, `ESTIMATE RECALL NUMBER: ${recallNumber}`, { size: 6.5 });
+      drawCellText(26, footerY + 12, 130, 12, "Mitchell Data Version: JUL 23", { size: 6.5 });
+      drawCellText(26, footerY + 22, 100, 12, "Software Version: 7.1.243", { size: 6.5 });
+      drawCellText(180, footerY + 22, 230, 12, "Copyright (C) 1994 - 2026 BMB Collision Repair AI", { size: 6.4, align: "center" });
+      drawCellText(510, footerY + 22, 74, 12, `Page ${pageIndex + 1} of ${totalPages}`, { size: 6.5, align: "right" });
     }
 
     doc.end();
@@ -1478,15 +1776,18 @@ app.post("/api/estimate/recalculate", async (req, res) => {
   }
 });
 
-app.post("/api/report/pdf", async (req, res) => {
-  const report = req.body && req.body.report;
-  if (!report || typeof report !== "object") {
+app.post("/api/report/pdf", upload.array("photos", 24), async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const rawReport = typeof body.report === "string" ? safeJsonParse(body.report, null) : body.report;
+  const report = rawReport && typeof rawReport === "object" ? rawReport : null;
+  if (!report) {
     return res.status(400).json({ ok: false, error: "Missing report object" });
   }
 
   try {
     const logoBuffer = await resolveLogoBuffer();
-    const pdfBuffer = await buildPdfBuffer(report, logoBuffer);
+    const photoFiles = Array.isArray(req.files) ? req.files : [];
+    const pdfBuffer = await buildPdfBuffer(report, logoBuffer, photoFiles);
     const vin = sanitizeVin((report.vehicle && report.vehicle.vin) || "") || "estimate";
     const filename = `collision-estimate-${vin}-${Date.now()}.pdf`;
 

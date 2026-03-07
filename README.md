@@ -135,7 +135,7 @@ These are editable in the app before generating each estimate.
 - `POST /api/license/extract` (multipart form with `license`)
 - `POST /api/vehicle-label/extract` (multipart form with `vehicleLabel`)
 - `POST /api/estimate/recalculate` (JSON report + rates/charges for live recalculation, used by voice edits)
-- `POST /api/report/pdf`
+- `POST /api/report/pdf` (multipart form with `report` JSON string and optional `photos[]` for damage photo pages)
 - `GET /api/health`
 
 ## Logo on supplement PDF

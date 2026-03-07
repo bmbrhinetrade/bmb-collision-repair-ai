@@ -1375,12 +1375,15 @@ async function downloadPdf() {
   setButtonBusy(refs.downloadPdf, "Building PDF...", true);
 
   try {
+    const formData = new FormData();
+    formData.append("report", JSON.stringify(state.lastReport));
+    for (const photoFile of state.photos) {
+      formData.append("photos", photoFile, photoFile.name);
+    }
+
     const response = await fetch("/api/report/pdf", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ report: state.lastReport })
+      body: formData
     });
 
     if (!response.ok) {
