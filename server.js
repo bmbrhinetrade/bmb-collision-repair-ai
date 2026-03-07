@@ -1200,25 +1200,27 @@ function buildPdfBuffer(report, logoBuffer, photoFiles) {
 
       if (logoBuffer) {
         try {
-          doc.image(logoBuffer, 32, 56, { fit: [120, 38], align: "left", valign: "center" });
+          doc.image(logoBuffer, 32, 52, { fit: [150, 46], align: "left", valign: "center" });
         } catch {
           // Keep going if logo decode fails.
         }
+      } else {
+        drawCellText(32, 58, 260, 14, "BMB RHINETRADE INC", { bold: true, size: 12 });
       }
 
-      drawLabelValueRow(162, 82, 250, 250, 16, "", "BMB RHINETRADE INC", true);
-      drawLabelValueRow(162, 98, 250, 250, 14, "", "127 E Dyer Rd, Santa Ana, CA 92707", false);
-      drawLabelValueRow(162, 112, 250, 250, 14, "", "Email: snopro@gmail.com", false);
+      drawCellText(32, 102, 320, 12, "127 E Dyer Rd, Santa Ana, CA 92707", { bold: false, size: 8 });
+      drawCellText(32, 114, 320, 12, "Phone: 714-444-9120", { bold: false, size: 8 });
+      drawCellText(32, 126, 320, 12, "Email: info@bmbrhinetradeinc.com", { bold: false, size: 8 });
 
       const damageX = 28;
-      const damageY = 132;
+      const damageY = 140;
       const damageW = 140;
       drawLabelValueRow(damageX, damageY, 66, damageW, 16, "Damage By", "Mike Saad", true);
       drawLabelValueRow(damageX, damageY + 16, 66, damageW, 16, "Class", "Audit", true);
       drawLabelValueRow(damageX, damageY + 36, 66, damageW, 16, "Deductible", "UNKNOWN", true);
 
       const vehicleX = 28;
-      const vehicleY = 190;
+      const vehicleY = 198;
       const vehicleW = 560;
       doc.rect(vehicleX, vehicleY, vehicleW, 122).stroke();
       doc.moveTo(vehicleX, vehicleY + 56).lineTo(vehicleX + vehicleW, vehicleY + 56).stroke();
