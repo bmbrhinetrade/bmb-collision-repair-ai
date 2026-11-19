@@ -14,7 +14,12 @@ Commands:
 
 Global flags (before the command): ``--settings``, ``--watchlist``, ``--env``.
 
-Exit codes: 0 ok, 1 failure, 2 configuration problem (e.g. X_BEARER_TOKEN missing).
+Exit codes: 0 ok, 1 failure, 2 configuration problem (e.g. X_BEARER_TOKEN missing, a typo in a YAML
+file). When ``run`` cannot even load its configuration it sends one "ceoscan stopped: configuration
+problem" alert through whatever push channel has secrets, then exits 2, or - with
+``ops.config_error_action: wait`` / env ``CEOSCAN_CONFIG_ERROR_ACTION=wait`` (the Docker image) -
+stays up idle with /health answering 503 and state ``config_error``, so a container restart policy
+cannot loop.
 ALERTS ONLY: ceoscan never trades and never connects to a brokerage.
 """
 
@@ -22,6 +27,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import logging
+import signal
 import sqlite3
 import sys
 from collections.abc import Callable, Coroutine
@@ -30,21 +38,47 @@ from typing import Any
 
 import aiohttp
 
-from .http import new_session
 from . import __version__
 from .alerts.dispatcher import AlertDispatcher, build_dispatcher
 from .alerts.format import format_system_alert
 from .alerts.notifiers import Notifier
 from .app import EXIT_CONFIG, EXIT_ERROR, EXIT_OK, MISSING_X_TOKEN, Service
-from .config import AppConfig, RulesSettings, load_app_config, load_watchlist
-from .logging_setup import setup_logging
+from .config import (
+    AppConfig,
+    ConfigError,
+    RulesSettings,
+    fallback_settings,
+    load_app_config,
+    load_secrets,
+    load_settings,
+    load_watchlist,
+)
+from .http import new_session
+from .logging_setup import RedactingFilter, setup_logging
+from .models import IngestStatus, Watchlist
 from .ops.cost import estimate_monthly_cost, format_cost_estimate
+from .ops.health import HealthServer
+from .ops.scheduler import send_config_error_alert
 from .replay import run_replay
 from .store import Store
-from .xapi.access import check_access, format_access_report
+from .timeutil import now_utc
+from .xapi.access import AccessReport, check_access, format_access_report
 from .xapi.client import XApiError, XClient
-from .xapi.rules import RuleBuildResult, RuleSyncPlan, build_rules, plan_sync, rule_errors, sync_rules
-from .xapi.verify import format_verify_report, record_results, verify_accounts, write_user_ids
+from .xapi.rules import (
+    RuleBuildResult,
+    RuleSyncPlan,
+    build_rules,
+    plan_sync,
+    rule_errors,
+    sync_rules,
+)
+from .xapi.verify import (
+    batch_failure,
+    format_verify_report,
+    record_results,
+    verify_accounts,
+    write_user_ids,
+)
 
 DEFAULT_SETTINGS = "config/settings.yaml"
 DEFAULT_WATCHLIST = "config/watchlist.yaml"
@@ -60,6 +94,8 @@ TEST_ALERT_BODY = (
 )
 
 Handler = Callable[[AppConfig, argparse.Namespace], Coroutine[Any, Any, int]]
+
+logger = logging.getLogger("ceoscan")
 
 
 def _err(text: str) -> None:
@@ -207,6 +243,11 @@ async def cmd_verify(cfg: AppConfig, args: argparse.Namespace) -> int:
     async with new_session() as session:
         client = XClient(session, token, cfg.settings.x_api)
         results = await verify_accounts(client, cfg.watchlist)
+
+    failure = batch_failure(results)
+    if failure:  # e.g. HTTP 402 for every handle: one clear line instead of a table of identical errors
+        _err(f"error: {failure}")
+        return EXIT_ERROR
     print(format_verify_report(results))
 
     try:
@@ -224,8 +265,19 @@ async def cmd_verify(cfg: AppConfig, args: argparse.Namespace) -> int:
         except Exception as exc:  # file permissions, invalid result file ...: report, never half-write
             _err(f"error: could not update {cfg.watchlist_path}: {type(exc).__name__}: {exc}")
             return EXIT_ERROR
+        id_changes = [r for r in results if r.id_changed and r.status == "warning" and args.accept_warnings]
+        for r in id_changes:
+            print(
+                f"CHANGED user_id of @{r.handle}: {r.previous_user_id} -> {r.user_id} "
+                "(written because of --accept-warnings; the old account is no longer watched)"
+            )
+        not_written = [r for r in results if r.id_changed and not args.accept_warnings]
+        for r in not_written:
+            print(f"NOT changed: @{r.handle} keeps user_id {r.previous_user_id} (X now returns {r.user_id}).")
         if changed:
             print(f"Updated {changed} account(s) in {cfg.watchlist_path}.")
+        elif any(r.status == "error" for r in results):
+            print(f"{cfg.watchlist_path} was not changed (some lookups failed - see above).")
         else:
             print(f"{cfg.watchlist_path} is already up to date.")
         try:
@@ -309,7 +361,33 @@ async def cmd_check_access(cfg: AppConfig, args: argparse.Namespace) -> int:
     print(format_access_report(report))
     if n == 0:
         print("note: no account has a user_id yet - run `python -m ceoscan verify --write`.")
-    return EXIT_ERROR if report.credits_ok is False else EXIT_OK
+    return access_exit_code(report)
+
+
+def access_exit_code(report: AccessReport) -> int:
+    """2 when X rejected the bearer token, 1 when credits are depleted or no check got an answer, else 0."""
+    auth_ok = getattr(report, "auth_ok", None)
+    if auth_ok is None and any("rejected the bearer token" in m for m in report.messages):
+        auth_ok = False  # older AccessReport without auth_ok: the 401 is only in the notes
+    if auth_ok is False:
+        _err(
+            "error: X rejected the bearer token (HTTP 401). Copy the Bearer Token of your app at console.x.com "
+            "into X_BEARER_TOKEN in .env again (no quotes or spaces), then recreate/restart."
+        )
+        return EXIT_CONFIG
+    if report.credits_ok is False:
+        _err("error: X API credits are depleted (HTTP 402) - add credits at console.x.com.")
+        return EXIT_ERROR
+    answered = (
+        report.stream_available is not None
+        or report.credits_ok is not None
+        or report.usage is not None
+        or report.existing_rules is not None
+    )
+    if not answered:
+        _err("error: none of the access checks got an answer from X (network problem?); see the notes above.")
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 async def cmd_cost(cfg: AppConfig, args: argparse.Namespace) -> int:
@@ -366,6 +444,96 @@ async def cmd_test_alert(cfg: AppConfig, args: argparse.Namespace) -> int:
     return EXIT_OK if ok else EXIT_ERROR
 
 
+def _config_problem_text(exc: BaseException) -> str:
+    if isinstance(exc, ConfigError):
+        return str(exc)
+    return f"could not load the configuration: {type(exc).__name__}: {exc}"
+
+
+async def run_config_error(
+    args: argparse.Namespace,
+    message: str,
+    stop: asyncio.Event | None = None,
+    install_signal_handlers: bool = True,
+) -> int:
+    """``run`` could not load its configuration: alert once (deduped), then exit 2 or stay up idle.
+
+    ``ops.config_error_action`` comes from the settings file if that one loads, else from the
+    environment (``CEOSCAN_CONFIG_ERROR_ACTION``, set to ``wait`` by the Docker image). With "wait"
+    the health server answers 503 with state ``config_error`` until SIGTERM/SIGINT (or ``stop``).
+    """
+    try:
+        settings = load_settings(args.settings)
+        settings_ok = True
+    except Exception:  # the settings file is (part of) the problem: built-in defaults + env overrides
+        settings = fallback_settings()
+        settings.alerts.push = "both"  # the user's choice is unknown: every push channel whose secrets are set
+        settings_ok = False
+    secrets = load_secrets()  # .env was read before the failing step
+    setup_logging(settings.ops.log_level if settings_ok else "INFO", secrets.secret_values())
+    message = RedactingFilter(secrets.secret_values()).redact(message)
+    logger.error("configuration problem: %s", message)
+    action = settings.ops.config_error_action
+    cfg = AppConfig(settings, Watchlist((), (), (), {}), secrets, Path(args.settings), Path(args.watchlist))
+    store: Store | None = None
+    try:
+        store = Store(settings.ops.db_path)
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("could not open %s (%s); the alert is sent without dedupe", settings.ops.db_path, exc)
+    try:
+        try:
+            async with new_session() as session:
+                await send_config_error_alert(store, build_dispatcher(cfg, session), message, action)
+        except Exception:  # best effort: exiting / idling below must still happen
+            logger.exception("could not send the configuration-problem alert")
+        if action != "wait":
+            return EXIT_CONFIG
+        return await _idle_on_config_error(settings, store, message, stop, install_signal_handlers)
+    finally:
+        if store is not None:
+            store.close()
+
+
+async def _idle_on_config_error(
+    settings: Any,
+    store: Store | None,
+    message: str,
+    stop: asyncio.Event | None,
+    install_signal_handlers: bool,
+) -> int:
+    stop = stop or asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed: list[signal.Signals] = []
+    if install_signal_handlers:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, stop.set)
+                installed.append(sig)
+    status = IngestStatus(mode="idle", state="config_error", last_error=message[:300], down_since=now_utc())
+    health_store = store or Store(":memory:")
+    health = HealthServer(settings.ops.health_host, settings.ops.health_port, status, health_store, settings, now_utc())
+    try:
+        try:
+            await health.start()
+        except OSError as exc:
+            logger.error("health server could not listen on %s:%s (%s)", health.host, health.port, exc)
+        note = (
+            "ceoscan is idle because of this configuration problem (ops.config_error_action: wait); "
+            "/health reports state config_error. Fix the configuration and restart ceoscan."
+        )
+        print(note)
+        logger.error("%s", note)
+        await stop.wait()
+    finally:
+        await health.stop()
+        if health_store is not store:
+            health_store.close()
+        for sig in installed:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(sig)
+    return EXIT_CONFIG
+
+
 COMMANDS: dict[str, Handler] = {
     "run": cmd_run,
     "verify": cmd_verify,
@@ -390,6 +558,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args)
     except Exception as exc:  # YAML/validation/file errors: config problems the user must fix
         _err(f"error: could not load the configuration: {type(exc).__name__}: {exc}")
+        if args.command == "run":  # the service: alert once, then exit 2 or stay idle (Docker)
+            try:
+                return asyncio.run(run_config_error(args, _config_problem_text(exc)))
+            except KeyboardInterrupt:
+                return EXIT_CONFIG
         return EXIT_CONFIG
     if args.command != "run":  # `run` configures logging itself from ops.log_level
         setup_logging(CLI_LOG_LEVEL, cfg.secrets.secret_values())

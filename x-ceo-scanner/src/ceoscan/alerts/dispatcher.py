@@ -1,12 +1,16 @@
 """Fan an AlertMessage out to the configured channels.
 
 * Push (ntfy and/or Pushover) gets every message.
-* SMS: post alerts with score >= ``alerts.sms.min_score``, or any urgent message; never summaries.
+* SMS: post alerts with score >= ``alerts.sms.min_score``, or any urgent message; never summaries and
+  never late ("Missed during outage", tag ``late``) post alerts.
 * Email: score >= ``alerts.email.min_score``, system alerts, and the daily summary when
   ``alerts.email.send_daily_summary``.
 
-All selected channels run concurrently, each bounded by ``alerts.send_timeout_seconds``, so one slow or
-failing channel never delays or blocks another. ``send`` never raises.
+All selected channels run concurrently, so one slow or failing channel never delays or blocks another.
+Push and SMS are bounded by ``alerts.send_timeout_seconds`` (5 s); email has its own, longer budget
+``alerts.email.timeout_seconds`` (20 s), because a full SMTP exchange (connect, STARTTLS, AUTH, DATA)
+often takes several seconds. The alert latency counts from dispatch to the first successful channel,
+so a slow email never makes an alert look slow. ``send`` never raises.
 """
 
 from __future__ import annotations
@@ -54,6 +58,8 @@ class AlertDispatcher:
     def wants_sms(self, msg: AlertMessage, score: int | None) -> bool:
         if self.sms is None or msg.kind == "summary":
             return False
+        if msg.kind == "post" and "late" in msg.tags:  # old news: never wake anyone up by SMS
+            return False
         return (score is not None and score >= self.settings.sms.min_score) or msg.priority == "urgent"
 
     def wants_email(self, msg: AlertMessage, score: int | None) -> bool:
@@ -76,11 +82,18 @@ class AlertDispatcher:
             chosen.append(self.email)
         return chosen
 
+    def timeout_for(self, notifier: Notifier) -> float:
+        """The send budget of one channel (email has its own, longer one)."""
+        if notifier is self.email or isinstance(notifier, EmailNotifier):
+            return float(self.settings.email.timeout_seconds)
+        return float(self.settings.send_timeout_seconds)
+
     async def _send_one(
         self, notifier: Notifier, msg: AlertMessage, score: int | None, t0: float
     ) -> ChannelResult:
         name = _name(notifier)
-        timeout = float(self.settings.send_timeout_seconds)
+        timeout = self.timeout_for(notifier)
+        is_email = notifier is self.email or isinstance(notifier, EmailNotifier)
         try:
             if isinstance(notifier, PushoverNotifier):
                 coro = notifier.send(msg, score=score)  # honors pushover.high_priority_min_score
@@ -88,7 +101,9 @@ class AlertDispatcher:
                 coro = notifier.send(msg)
             result = await asyncio.wait_for(coro, timeout=timeout)
         except (asyncio.TimeoutError, TimeoutError):
-            result = ChannelResult(name, False, 0, error=f"timeout after {timeout:g}s")
+            # The SMTP worker thread cannot be cancelled: the email may still go out after this.
+            detail = " (may still be delivered)" if is_email else ""
+            result = ChannelResult(name, False, 0, error=f"timeout after {timeout:g}s{detail}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # a broken notifier must never take down the others
@@ -184,7 +199,7 @@ def build_dispatcher(cfg: AppConfig, session: aiohttp.ClientSession) -> AlertDis
                 logger.warning(
                     "only one of SMTP_USERNAME / SMTP_PASSWORD is set - sending email without SMTP login"
                 )
-            email = EmailNotifier(sec, a.email, timeout)
+            email = EmailNotifier(sec, a.email, float(a.email.timeout_seconds))
 
     dispatcher = AlertDispatcher(a, push, sms=sms, email=email)
     if dispatcher.channel_names:

@@ -16,6 +16,7 @@ from ceoscan.alerts.notifiers import CaptureNotifier
 from ceoscan.config import AppConfig, Secrets, Settings, load_settings, load_watchlist
 from ceoscan.models import AlertMessage
 from ceoscan.replay import (
+    AGE_KEY,
     REPLAY_TAG,
     ReplayDispatcher,
     TimeRebaser,
@@ -159,6 +160,18 @@ def test_time_rebaser_maps_ids_consistently() -> None:
     assert a["data"]["id"] == "1000"  # input not mutated
 
 
+def test_time_rebaser_back_dated_ids_keep_their_time() -> None:
+    rb = TimeRebaser()
+    now = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
+    fresh = rb.rebase({"data": {"id": "1"}}, now)
+    old = rb.rebase({"data": {"id": "2"}}, now - timedelta(hours=2), in_order=False)
+    twin = rb.rebase({"data": {"id": "3"}}, now - timedelta(hours=2), in_order=False)
+    after = rb.rebase({"data": {"id": "4"}}, now)
+    assert snowflake_to_datetime(old["data"]["id"]) == now - timedelta(hours=2)
+    assert old["data"]["id"] != twin["data"]["id"]  # same ms: still unique
+    assert int(after["data"]["id"]) > int(fresh["data"]["id"])  # in-order ids unaffected
+
+
 def test_time_rebaser_leaves_malformed_payloads_alone() -> None:
     rb = TimeRebaser()
     t0 = datetime(2026, 11, 19, tzinfo=UTC)
@@ -180,11 +193,16 @@ async def test_run_replay_produces_alerts_and_dedupes(cfg: AppConfig, tmp_path: 
     assert all(a.sent_ok for a in alerts)
     assert all(a.message.title.startswith(REPLAY_TAG) for a in alerts)
     titles = " ".join(a.message.title for a in alerts)
-    for handle in ("@elonmusk", "@vladtenev", "@saylor", "@satyanadella"):
+    for handle in ("@elonmusk", "@vladtenev", "@saylor"):
         assert handle in titles
+    # offline scores are rules-only: capped (never urgent) and labelled as such
+    assert all(a.score is not None and a.score <= cfg.settings.scoring.fallback_max_impact for a in alerts)
+    assert all("(rules-only)" in a.message.title for a in alerts)
 
     # latency is measured on rebased (fresh) ids: ~x_delay_seconds (3 s) post -> console
-    for a in alerts:
+    live = [a for a in alerts if not a.late]
+    assert len(live) >= 5
+    for a in live:
         assert a.x_delay_ms is not None and 2900 <= a.x_delay_ms <= 4000
         assert a.total_latency_ms is not None and 2900 <= a.total_latency_ms < 10_000
         assert a.scoring_ms is not None and a.push_ms is not None
@@ -218,19 +236,54 @@ async def test_run_replay_scenarios_offline(cfg: AppConfig, no_network: None) ->
     def line_for(handle: str, needle: str = "") -> str:
         return next(line for line in lines if f"@{handle} " in line and needle in line)
 
-    assert "no alert (not flagged)" in line_for("sama")  # chit-chat
+    # chit-chat from a watched account: not flagged, still scored (score_watchlist_unflagged), no alert
+    sama = line_for("sama")
+    assert " -       score " in sama and "no alert (below threshold" in sama
     assert "no alert" in line_for("sample_pumper")  # prompt injection gets no boost
     assert "ALERT" in line_for("sample_macro")  # keyword-rule post from a big non-watchlist account
-    assert "ALERT" in line_for("satyanadella")  # flagged only through the quoted post
+    # flagged only through the quoted post; a rules-only score is based on the post's own text, so
+    # offline it does not alert (Claude, which reads the quoted post, decides on the real run)
+    assert " flagged " in line_for("satyanadella") and "score" in line_for("satyanadella")
     assert any("edit of post" in line for line in lines)  # edited duplicate of an alerted post
     assert len({a.post_id for a in alerts}) == len(alerts)
+    # a watched account with no keyword hit at all is still scored
+    assert " -       score " in line_for("LisaSu")
 
 
 async def test_run_replay_keep_times_uses_original_ids(cfg: AppConfig, no_network: None) -> None:
-    alerts = await run_replay(cfg, SAMPLES, rebase_times=False, out=lambda _line: None)
+    out: list[str] = []
+    alerts = await run_replay(cfg, SAMPLES, rebase_times=False, out=out.append)
     assert alerts
     assert {a.post_id for a in alerts} <= set(sample_ids())
     assert all(a.total_latency_ms is not None and a.total_latency_ms > 10_000 for a in alerts)
+    # the original sample times are long past: every alert is a late (catch-up) alert
+    assert all(a.late and a.message.priority in ("low", "normal") for a in alerts)
+    assert all("Missed during outage - posted" in a.message.title for a in alerts)
+    assert not any(line.startswith("Latency post->phone") for line in out)  # late alerts are not latency
+    assert any(line.startswith("Late (catch-up) alerts:") for line in out)
+
+
+async def test_run_replay_back_dated_sample_is_a_late_alert(cfg: AppConfig, no_network: None) -> None:
+    """The sample with replay_age_seconds replays an outage catch-up: low-key, flagged late, no latency."""
+    samples = load_samples(SAMPLES)
+    late_samples = [s for s in samples if AGE_KEY in s]
+    assert late_samples, "needs a back-dated (outage catch-up) sample"
+    out: list[str] = []
+    alerts = await run_replay(cfg, SAMPLES, out=out.append)
+
+    late = [a for a in alerts if a.late]
+    assert len(late) == len(late_samples)
+    for a in late:
+        age_ms = late_samples[0][AGE_KEY] * 1000
+        assert a.x_delay_ms is not None and abs(a.x_delay_ms - age_ms) < 2000
+        assert a.message.title.startswith(f"{REPLAY_TAG} Missed during outage - posted 2h ago: ")
+        assert a.message.priority in ("low", "normal")
+        assert "late: posted 2h ago" in a.decision_reason
+    assert any(line.startswith("[") and "LATE ALERT" in line for line in out)
+    summary = next(line for line in out if line.startswith("Replay summary:"))
+    assert f"| {len(late)} late" in summary
+    latency = next(line for line in out if line.startswith("Latency post->phone"))
+    assert "max 3." in latency  # the 2 h catch-up is not in the latency figures
 
 
 async def test_run_replay_send_uses_real_dispatcher_and_marks_replay(
@@ -308,3 +361,18 @@ def test_sample_json_lines_are_single_line_objects() -> None:
     for line in SAMPLES.read_text(encoding="utf-8").splitlines():
         if line.strip() and not line.startswith("//"):
             assert isinstance(json.loads(line), dict)
+
+
+async def test_run_replay_explains_quiet_hours_with_rules_only_scores(
+    cfg: AppConfig, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    monkeypatch.setattr(replay_mod, "is_quiet_hours", lambda settings, now: True)
+    out: list[str] = []
+    await run_replay(cfg, SAMPLES, out=out.append)
+    assert any(line.startswith("Note: quiet hours are active now") for line in out)
+    assert any("capped at 7" in line and "--claude" in line for line in out)
+
+    out.clear()
+    await run_replay(cfg, SAMPLES, use_claude=True, out=out.append)  # no key: still notes quiet hours only
+    assert any(line.startswith("Note: quiet hours are active now") for line in out)
+    assert not any("capped at" in line for line in out)

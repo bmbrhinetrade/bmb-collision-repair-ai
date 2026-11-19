@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,7 +16,13 @@ from ceoscan import __version__
 from ceoscan.config import AppConfig, Secrets, Settings
 from ceoscan.models import AlertMessage, AlertRecord, ChannelResult, IngestStatus, Post, RuleResult, Score, Watchlist
 from ceoscan.ops.health import HealthServer, assess_health
-from ceoscan.ops.scheduler import KV_LAST_DAILY_SUMMARY, OpsScheduler, format_duration
+from ceoscan.ops.scheduler import (
+    KV_CONFIG_ERROR_ALERT,
+    KV_LAST_DAILY_SUMMARY,
+    OpsScheduler,
+    format_duration,
+    send_config_error_alert,
+)
 from ceoscan.store import Store
 from ceoscan.timeutil import datetime_to_snowflake, now_utc
 
@@ -250,6 +257,33 @@ async def test_health_http_routes_and_strict(store: Store, settings: Settings) -
         assert resp.status == 200 and (await resp.json())["status"] == "degraded"
 
 
+def test_config_error_state_is_down_and_503_without_strict(store: Store, settings: Settings) -> None:
+    status = IngestStatus(mode="idle", state="config_error", last_error="alerts.timezone: unknown time zone")
+    level, reasons = assess_health(status, settings, now_utc(), now_utc())
+    assert level == "down"
+    assert reasons == [
+        "configuration problem: alerts.timezone: unknown time zone - fix the configuration and restart ceoscan"
+    ]
+    prefixed = IngestStatus(mode="idle", state="config_error", last_error="configuration problem: no accounts")
+    assert assess_health(prefixed, settings, now_utc(), now_utc())[1] == [
+        "configuration problem: no accounts - fix the configuration and restart ceoscan"
+    ]
+    srv = HealthServer("127.0.0.1", 0, status, store, settings, now_utc())
+    snap = srv.snapshot()
+    assert snap["status"] == "down" and snap["state"] == "config_error"
+    assert {"alerts_late", "score_errors", "stream_errors"} <= set(snap["today"])
+
+
+async def test_health_http_config_error_answers_503(store: Store, settings: Settings) -> None:
+    status = IngestStatus(mode="idle", state="config_error", last_error="bad")
+    srv = HealthServer("127.0.0.1", 0, status, store, settings, now_utc())
+    async with TestClient(TestServer(srv.make_app())) as client:
+        resp = await client.get("/health")
+        assert resp.status == 503  # so the Docker healthcheck marks the container unhealthy
+        body = await resp.json()
+        assert body["state"] == "config_error" and body["status"] == "down"
+
+
 async def test_health_server_start_stop(store: Store, settings: Settings) -> None:
     now = now_utc()
     status = IngestStatus(mode="poll", state="polling", last_heartbeat_at=now)
@@ -383,7 +417,107 @@ async def test_custom_threshold_and_failed_delivery(cfg: AppConfig, store: Store
     rec = await sched.check_stream_down(t0 + timedelta(seconds=31))
     assert rec is not None and rec.sent_ok is False  # dispatcher failure is contained
     assert alert_rows(store, "system")[0]["sent_ok"] == 0
-    assert await sched.check_stream_down(t0 + timedelta(seconds=60)) is None  # still only once
+    assert await sched.check_stream_down(t0 + timedelta(seconds=60)) is None  # no resend on every tick
+    # retried 60 s after the failed attempt; once delivered it is latched
+    disp.raise_exc = None
+    rec2 = await sched.check_stream_down(t0 + timedelta(seconds=91))
+    assert rec2 is not None and rec2.sent_ok and rec2.message.title == "X stream down"
+    assert "retry 1" in rec2.decision_reason
+    assert await sched.check_stream_down(t0 + timedelta(seconds=2000)) is None
+    assert len(disp.sent) == 2
+
+
+class FlakyDispatcher(FakeDispatcher):
+    """Fails the first ``fail_first`` sends, then succeeds."""
+
+    def __init__(self, fail_first: int) -> None:
+        super().__init__()
+        self.fail_first = fail_first
+
+    async def send(self, msg: AlertMessage, score: int | None = None) -> list[ChannelResult]:
+        self.sent.append((msg, score))
+        ok = len(self.sent) > self.fail_first
+        return [ChannelResult(channel="capture", ok=ok, elapsed_ms=5, error=None if ok else "HTTP 502")]
+
+
+async def test_down_alert_retried_with_backoff_until_delivered(cfg: AppConfig, store: Store) -> None:
+    """REQ-2: a 502 on the single 'down' alert must not silence the whole outage."""
+    t0 = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
+    status = IngestStatus(mode="stream", state="backoff", down_since=t0)
+    disp = FlakyDispatcher(fail_first=3)
+    sched = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+    attempts_at: list[int] = []
+    for sec in range(121, 2000, 5):  # a tick every 5 s for ~31 minutes of outage
+        rec = await sched.check_stream_down(t0 + timedelta(seconds=sec))
+        if rec is not None:
+            attempts_at.append(sec)
+    # first try at 121 s, then +60 s, +120 s, +300 s; the 4th attempt is delivered and latched
+    assert attempts_at == [121, 181, 301, 601]
+    assert [r["sent_ok"] for r in alert_rows(store, "system")] == [0, 0, 0, 1]
+    events = store.recent_events(t0 - timedelta(days=1), limit=50)
+    failed = [e for e in events if e["kind"] == "stream_down_alert_failed"]
+    assert len(failed) == 3
+
+    # recovery alert goes out once; it does not mention a failed down alert (that one got through)
+    status.state, status.down_since, status.connected_since = "connected", None, t0 + timedelta(seconds=2000)
+    rec = await sched.check_stream_down(t0 + timedelta(seconds=2005))
+    assert rec is not None and rec.message.title.startswith("X stream recovered after")
+    assert "could not be delivered" not in rec.message.body
+
+
+async def test_recovery_alert_says_when_down_alert_never_arrived(cfg: AppConfig, store: Store) -> None:
+    t0 = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
+    status = IngestStatus(mode="stream", state="backoff", down_since=t0)
+    disp = FlakyDispatcher(fail_first=2)  # both down attempts fail, the recovery alert works
+    sched = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+    assert (await sched.check_stream_down(t0 + timedelta(seconds=121))) is not None
+    assert (await sched.check_stream_down(t0 + timedelta(seconds=181))) is not None
+    status.state, status.down_since, status.connected_since = "connected", None, t0 + timedelta(seconds=200)
+    rec = await sched.check_stream_down(t0 + timedelta(seconds=205))
+    assert rec is not None and rec.sent_ok
+    assert "could not be delivered (2 attempt(s))" in rec.message.body
+    assert await sched.check_stream_down(t0 + timedelta(seconds=400)) is None
+
+
+async def test_failed_recovery_alert_is_retried_a_few_times(cfg: AppConfig, store: Store) -> None:
+    t0 = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
+    status = IngestStatus(mode="stream", state="backoff", down_since=t0)
+    disp = FakeDispatcher()
+    sched = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+    assert (await sched.check_stream_down(t0 + timedelta(seconds=121))) is not None
+    disp.ok = False
+    status.state, status.down_since, status.connected_since = "connected", None, t0 + timedelta(seconds=200)
+    assert (await sched.check_stream_down(t0 + timedelta(seconds=205))) is not None  # attempt 1 fails
+    assert await sched.check_stream_down(t0 + timedelta(seconds=230)) is None  # waits 60 s
+    assert (await sched.check_stream_down(t0 + timedelta(seconds=265))) is not None  # attempt 2 fails
+    assert (await sched.check_stream_down(t0 + timedelta(seconds=330))) is not None  # attempt 3: give up
+    assert await sched.check_stream_down(t0 + timedelta(seconds=500)) is None
+    assert len(disp.sent) == 4
+
+
+async def test_no_channels_does_not_retry_forever(cfg: AppConfig, store: Store) -> None:
+    class NoChannels(FakeDispatcher):
+        async def send(self, msg: AlertMessage, score: int | None = None) -> list[ChannelResult]:
+            self.sent.append((msg, score))
+            return []
+
+    t0 = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
+    status = IngestStatus(mode="stream", state="backoff", down_since=t0)
+    disp = NoChannels()
+    sched = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+    assert (await sched.check_stream_down(t0 + timedelta(seconds=121))) is not None
+    for sec in (200, 500, 1500):
+        assert await sched.check_stream_down(t0 + timedelta(seconds=sec)) is None
+    assert len(disp.sent) == 1
+
+
+async def test_config_error_state_sends_no_stream_down_alert(cfg: AppConfig, store: Store) -> None:
+    t0 = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
+    status = IngestStatus(mode="idle", state="config_error", down_since=t0, last_error="bad settings")
+    disp = FakeDispatcher()
+    sched = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+    assert await sched.check_stream_down(t0 + timedelta(seconds=600)) is None
+    assert disp.sent == []
 
 
 # --------------------------------------------------------------------------- scheduler: daily summary
@@ -422,6 +556,43 @@ async def test_daily_summary_once_per_day_within_window(cfg: AppConfig, store: S
     assert store.kv_get(KV_LAST_DAILY_SUMMARY) == "2026-11-22"
 
 
+async def test_daily_summary_failed_send_is_retried_inside_window(cfg: AppConfig, store: Store) -> None:
+    """REQ-2: one failed send at 18:00 must not lose the day's summary."""
+    status = IngestStatus(mode="stream", state="connected")
+    disp = FlakyDispatcher(fail_first=2)
+    sched = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+
+    def at(hh: int, mm: int) -> datetime:
+        return datetime(2026, 11, 19, hh, mm, tzinfo=PT)
+
+    rec = await sched.maybe_send_daily_summary(at(18, 0))
+    assert rec is not None and not rec.sent_ok
+    assert store.kv_get(KV_LAST_DAILY_SUMMARY) is None  # not marked as sent
+    assert await sched.maybe_send_daily_summary(at(18, 2)) is None  # no resend on every tick
+    # a restarted scheduler (same store) honors the 5-minute retry spacing too
+    sched2 = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+    assert await sched2.maybe_send_daily_summary(at(18, 4)) is None
+    rec2 = await sched2.maybe_send_daily_summary(at(18, 5))
+    assert rec2 is not None and not rec2.sent_ok and "retry 1" in rec2.decision_reason
+    rec3 = await sched2.maybe_send_daily_summary(at(18, 10))
+    assert rec3 is not None and rec3.sent_ok
+    assert store.kv_get(KV_LAST_DAILY_SUMMARY) == "2026-11-19"
+    assert await sched2.maybe_send_daily_summary(at(18, 20)) is None
+    assert len(disp.sent) == 3
+    kinds = [e["kind"] for e in store.recent_events(now_utc() - timedelta(days=1), limit=50)]
+    assert kinds.count("daily_summary_failed") == 2 and "daily_summary" in kinds
+
+
+async def test_daily_summary_retry_stops_when_window_closes(cfg: AppConfig, store: Store) -> None:
+    disp = FakeDispatcher(ok=False)
+    sched = OpsScheduler(cfg, store, IngestStatus(), disp)  # type: ignore[arg-type]
+    for mm in range(0, 60, 5):
+        await sched.maybe_send_daily_summary(datetime(2026, 11, 19, 18, mm, tzinfo=PT))
+    assert len(disp.sent) == 12
+    assert await sched.maybe_send_daily_summary(datetime(2026, 11, 19, 19, 0, tzinfo=PT)) is None
+    assert len(disp.sent) == 12
+
+
 async def test_daily_summary_dst_and_disabled(cfg: AppConfig, store: Store) -> None:
     status = IngestStatus()
     disp = FakeDispatcher()
@@ -449,7 +620,9 @@ def test_build_summary_content(cfg: AppConfig, store: Store) -> None:
     store.log_event("stream_down_alert", "b", level="error")
     store.log_event("pipeline_error", "c", level="error")
     status = IngestStatus(mode="stream", state="connected", reconnects=4)
-    sched = OpsScheduler(cfg, store, status, FakeDispatcher())  # type: ignore[arg-type]
+    sched = OpsScheduler(
+        cfg, store, status, FakeDispatcher(), started_at=now - timedelta(hours=30)  # type: ignore[arg-type]
+    )
 
     msg = sched.build_summary(now)
     assert msg.kind == "summary" and msg.priority == "low"
@@ -459,8 +632,68 @@ def test_build_summary_content(cfg: AppConfig, store: Store) -> None:
     assert "Latency: avg 7.2s, max 8.4s" in body
     assert "Errors: 3 (latest: pipeline_error, stream_down_alert)" in body
     assert "4 reconnect(s)" in body
-    assert "Projected X cost at today's volume: $0.45/month (3 posts x $0.005 x 30)" in body
-    assert msg.sms_text and "3 posts" in msg.sms_text and len(msg.sms_text) <= 300
+    assert "Scoring errors: 0" in body and "Stream errors: 0" in body
+    assert "Projected X cost: $0.45/month (3 posts in the last 24 h x $0.005 x 30)" in body
+    assert msg.sms_text and "3 posts" in msg.sms_text and "4 reconnects" in msg.sms_text
+    assert len(msg.sms_text) <= 300
+
+
+def test_build_summary_shows_score_and_stream_errors_and_late(cfg: AppConfig, store: Store) -> None:
+    class StatsStore:
+        """Stands in for the store with the extended stats_since keys."""
+
+        def stats_since(self, since: datetime) -> dict:
+            return {
+                "posts": 10,
+                "flagged": 4,
+                "claude_scored": 3,
+                "alerts": 3,
+                "alerts_late": 1,
+                "alerts_failed": 0,
+                "avg_latency_ms": 5200,
+                "max_latency_ms": 7100,
+                "errors": 0,
+                "score_errors": 2,
+                "last_score_error": "timeout after 4.0s budget",
+                "stream_errors": 5,
+            }
+
+        def recent_events(self, *a: object, **k: object) -> list:
+            return []
+
+    status = IngestStatus(mode="stream", state="connected", reconnects=7)
+    now = now_utc()
+    sched = OpsScheduler(
+        cfg, StatsStore(), status, FakeDispatcher(), started_at=now - timedelta(hours=48)  # type: ignore[arg-type]
+    )
+    body = sched.build_summary(now).body
+    assert "Alerts sent: 3 (0 failed), 1 late (missed during an outage)" in body
+    assert "Latency: avg 5.2s, max 7.1s (live alerts; late catch-up alerts excluded)" in body
+    assert "Scoring errors: 2 (rules-only score used; latest: timeout after 4.0s budget)" in body
+    assert "Stream errors: 5" in body
+    assert "7 reconnect(s) since start" in body
+
+
+def test_build_summary_projection_uses_trailing_24h_of_this_run(cfg: AppConfig, store: Store) -> None:
+    """REQ-13: the projection must not use an 18-hour 'today' as if it were a full day."""
+    now = now_utc()
+    for i in range(12):  # 12 posts in the last 6 hours
+        add_post(store, now - timedelta(minutes=30 * i + 1), flagged=False, claude=False, n=i)
+    add_post(store, now - timedelta(hours=20), flagged=False, claude=False, n=99)  # before this run started
+    sched = OpsScheduler(
+        cfg, store, IngestStatus(), FakeDispatcher(), started_at=now - timedelta(hours=6)  # type: ignore[arg-type]
+    )
+    body = sched.build_summary(now).body
+    # 12 posts in 6 h -> 48/day -> 48 x 0.005 x 30 = $7.20
+    assert "Projected X cost: $7.20/month (12 posts in 6h 0m 0s since start, scaled to 48/day" in body
+
+    full = OpsScheduler(
+        cfg, store, IngestStatus(), FakeDispatcher(), started_at=now - timedelta(days=3)  # type: ignore[arg-type]
+    )
+    assert "Projected X cost: $1.95/month (13 posts in the last 24 h" in full.build_summary(now).body
+
+    fresh = OpsScheduler(cfg, store, IngestStatus(), FakeDispatcher(), started_at=now)  # type: ignore[arg-type]
+    assert "Projected X cost: n/a (running for 0s; needs 1 h of data)" in fresh.build_summary(now).body
 
 
 def test_build_summary_quiet_day(cfg: AppConfig, store: Store) -> None:
@@ -469,7 +702,7 @@ def test_build_summary_quiet_day(cfg: AppConfig, store: Store) -> None:
     assert "Posts seen: 0" in body
     assert "Latency: n/a (no alerts sent)" in body
     assert "Errors: none" in body
-    assert "$0.00/month" in body
+    assert "Projected X cost: n/a" in body
 
 
 # --------------------------------------------------------------------------- scheduler: run loop
@@ -514,3 +747,42 @@ async def test_run_loop_survives_check_errors(cfg: AppConfig, store: Store, monk
     assert calls["n"] >= 2
     errors = store.recent_events(now_utc() - timedelta(minutes=1), level="error")
     assert errors and errors[0]["kind"] == "ops_error"
+
+
+# --------------------------------------------------------------------------- configuration-problem alert
+
+
+async def test_config_error_alert_sent_once_per_problem(store: Store) -> None:
+    t0 = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
+    disp = FakeDispatcher()
+    problem = "alerts.timezone: unknown time zone 'America/LosAngeles'"
+    rec = await send_config_error_alert(store, disp, problem, now=t0)
+    assert rec is not None and rec.sent_ok
+    msg = rec.message
+    assert msg.title == f"ceoscan stopped: configuration problem: {problem}"
+    assert msg.priority == "high" and msg.kind == "system"
+    assert "exited (code 2)" in msg.body and "not watching X" in msg.body
+    # same problem again (a restart loop): suppressed for 24 h
+    assert await send_config_error_alert(store, disp, problem, now=t0 + timedelta(hours=1)) is None
+    assert len(disp.sent) == 1
+    # a different problem alerts; the wording follows ops.config_error_action
+    rec2 = await send_config_error_alert(store, disp, "no verified accounts", action="wait", now=t0)
+    assert rec2 is not None and "idle" in rec2.message.body and "config_error" in rec2.message.body
+    assert len(disp.sent) == 2
+    assert all(r["title"].startswith("ceoscan stopped: configuration problem") for r in alert_rows(store, "system"))
+    # the marker uses the same kv key/format as app.Service, which clears it once ingest is up
+    assert json.loads(store.kv_get(KV_CONFIG_ERROR_ALERT))["hash"]
+    store.kv_set(KV_CONFIG_ERROR_ALERT, "")
+    assert (await send_config_error_alert(store, disp, "no verified accounts", now=t0)) is not None
+    # after 24 h the same problem is alerted again
+    later = t0 + timedelta(hours=25)
+    assert (await send_config_error_alert(store, disp, "no verified accounts", now=later)) is not None
+
+
+async def test_config_error_alert_long_message_and_no_store() -> None:
+    long_problem = "x" * 400
+    raising = FakeDispatcher(raise_exc=RuntimeError("boom"))
+    rec = await send_config_error_alert(None, raising, long_problem)  # the database itself may be the problem
+    assert rec is not None and not rec.sent_ok  # contained, never raises
+    assert rec.message.title.endswith("...") and len(rec.message.title) < 200
+    assert long_problem in rec.message.body

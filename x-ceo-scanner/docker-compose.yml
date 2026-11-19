@@ -23,11 +23,17 @@ services:
         CEOSCAN_GID: ${CEOSCAN_GID:-1000}
     image: ceoscan:local
     env_file: .env                      # secrets; never baked into the image
+    # The image sets CEOSCAN_HEALTH_HOST=0.0.0.0 (listen on the container interface; the port is
+    # published on the host's 127.0.0.1 below) and CEOSCAN_CONFIG_ERROR_ACTION=wait: on a
+    # configuration problem ceoscan sends one alert and stays up idle (unhealthy, /health 503,
+    # state config_error) instead of exiting, so this restart policy cannot loop. Fix the problem,
+    # then `docker compose restart ceoscan`.
     restart: unless-stopped
     init: true                          # tiny init as PID 1: forwards SIGTERM, reaps zombies
     stop_grace_period: 20s              # time for a graceful shutdown before SIGKILL
     ports:
-      - "127.0.0.1:8080:8080"           # health endpoint, reachable from this host only
+      - "127.0.0.1:8080:8080"           # health endpoint, reachable from this host only. If you change
+                                        # ops.health_port, change the second number to match.
     volumes:
       - ./data:/app/data                # SQLite database (posts, alerts, since_ids, events)
       - ./config:/app/config            # read-write: `verify --write` updates watchlist.yaml.

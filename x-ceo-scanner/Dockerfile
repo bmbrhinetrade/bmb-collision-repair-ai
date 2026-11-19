@@ -23,6 +23,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_ROOT_USER_ACTION=ignore \
     PYTHONPATH=/app/src
 
+# Container-only overrides of config/settings.yaml (which keeps the safe values for systemd/laptops):
+# * the health server must listen on the container interface so the compose port mapping
+#   (published on the host's 127.0.0.1 only) can reach it;
+# * a configuration problem must not exit: `restart: unless-stopped` would restart it in a loop.
+#   ceoscan sends one "configuration problem" alert and stays up idle; /health answers 503
+#   (state config_error), so `docker compose ps` shows the container as unhealthy.
+ENV CEOSCAN_HEALTH_HOST=0.0.0.0 \
+    CEOSCAN_CONFIG_ERROR_ACTION=wait
+
 WORKDIR /app
 
 # Non-root runtime user (never root: refuse UID/GID 0). Reuse an existing group/user with the
@@ -55,11 +64,14 @@ USER ${CEOSCAN_UID}:${CEOSCAN_GID}
 VOLUME ["/app/data"]
 EXPOSE 8080
 
-# 200 from the built-in health server = process is up and serving. (Use /health?strict=1 from an
-# external monitor if you also want "X stream down / credits depleted" to count as unhealthy.)
-# The empty ProxyHandler makes sure a configured HTTP(S)_PROXY is never used for localhost.
+# 200 from the built-in health server = process is up and serving. A configuration problem
+# (state config_error) answers 503 -> unhealthy. (Use /health?strict=1 from an external monitor if
+# you also want "X stream down / credits depleted" to count as unhealthy.)
+# The port is read from config/settings.yaml (ops.health_port), so the check follows a changed port;
+# a settings file that does not load also counts as unhealthy. The empty ProxyHandler makes sure a
+# configured HTTP(S)_PROXY is never used for localhost.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["python", "-c", "import sys, urllib.request as u; r = u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8080/health', timeout=4); sys.exit(0 if r.status == 200 else 1)"]
+    CMD ["python", "-c", "import sys, urllib.request as u; from ceoscan.config import load_settings; p = load_settings('/app/config/settings.yaml').ops.health_port; r = u.build_opener(u.ProxyHandler({})).open(f'http://127.0.0.1:{p}/health', timeout=4); sys.exit(0 if r.status == 200 else 1)"]
 
 STOPSIGNAL SIGTERM
 

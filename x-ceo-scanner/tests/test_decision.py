@@ -1,15 +1,24 @@
-"""decide(): threshold, quiet hours (overnight window), always-alert accounts, jokes, my-ticker filter."""
+"""decide(): threshold, quiet hours (overnight window), always-alert accounts, jokes, my-ticker filter,
+late (catch-up) posts; post-age helpers."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from ceoscan.alerts.decision import decide, priority_for
-from ceoscan.config import Settings
-from ceoscan.models import Account, RuleResult, Score
+from ceoscan.alerts.decision import (
+    decide,
+    format_age,
+    is_late,
+    is_late_post,
+    late_priority_for,
+    post_age_seconds,
+    priority_for,
+)
+from ceoscan.config import AlertSettings, Settings
+from ceoscan.models import Account, Post, RuleResult, Score
 
 PT = ZoneInfo("America/Los_Angeles")
 MY = ("TSLA", "SPCX", "NVDA")
@@ -231,3 +240,70 @@ def test_require_my_ticker_disabled(settings: Settings) -> None:
     settings.scoring.require_my_ticker = False
     assert decide(score(8, tickers=["XYZ"]), FLAGGED, ELON, settings, DAY, MY).should_alert
     assert decide(score(8, tickers=[]), FLAGGED, ELON, settings, DAY, MY).should_alert
+
+
+# --------------------------------------------------------------------------- late posts
+
+LATE = 7200.0  # a post 2 h old when received (outage catch-up); default max_post_age_seconds is 900
+
+
+@pytest.mark.parametrize(("impact", "priority"), [(7, "low"), (8, "low"), (9, "normal"), (10, "normal")])
+def test_late_post_alerts_at_most_normal(settings: Settings, impact: int, priority: str) -> None:
+    d = decide(score(impact), FLAGGED, ELON, settings, DAY, MY, age_seconds=LATE)
+    assert d.should_alert and d.priority == priority
+    assert d.reason == f"score {impact} >= 7 (late: posted 2h ago)"
+
+
+def test_late_priority_for() -> None:
+    assert [late_priority_for(i) for i in (1, 7, 8, 9, 10)] == ["low", "low", "low", "normal", "normal"]
+
+
+def test_fresh_post_is_not_late(settings: Settings) -> None:
+    d = decide(score(9), FLAGGED, ELON, settings, DAY, MY, age_seconds=3.0)
+    assert d.priority == "urgent" and d.reason == "score 9 >= 7"
+    assert decide(score(9), FLAGGED, ELON, settings, DAY, MY, age_seconds=900.0).priority == "urgent"  # boundary
+    assert decide(score(9), FLAGGED, ELON, settings, DAY, MY).priority == "urgent"  # age unknown
+
+
+def test_late_post_still_needs_threshold_and_quiet_hours(settings: Settings) -> None:
+    assert not decide(score(6), FLAGGED, ELON, settings, DAY, MY, age_seconds=LATE).should_alert
+    d = decide(score(8), FLAGGED, ELON, settings, NIGHT, MY, age_seconds=LATE)
+    assert not d.should_alert and d.reason == "quiet hours: 8 < 9"
+    d = decide(score(9), FLAGGED, ELON, settings, NIGHT, MY, age_seconds=LATE)
+    assert d.should_alert and d.quiet_hours and d.priority == "normal"
+
+
+def test_late_always_alert_post(settings: Settings) -> None:
+    d = decide(score(10, tickers=["MSTR"]), FLAGGED, VIP, settings, DAY, MY, age_seconds=3 * 86400)
+    assert d.should_alert and d.priority == "normal"
+    assert d.reason == "always-alert account @saylor (late: posted 3d ago)"
+    d = decide(score(3, tickers=["MSTR"]), FLAGGED, VIP, settings, DAY, MY, age_seconds=LATE)
+    assert d.should_alert and d.priority == "low"
+
+
+def test_max_post_age_is_configurable(settings: Settings) -> None:
+    settings.alerts.max_post_age_seconds = 60
+    assert decide(score(9), FLAGGED, ELON, settings, DAY, MY, age_seconds=120).priority == "normal"
+
+
+def test_post_age_helpers() -> None:
+    created = datetime(2026, 11, 19, 18, 0, tzinfo=UTC)
+    post = Post(id="1", text="x", author_id="2", created_at=created, received_at=created + timedelta(hours=2),
+                source="recovery")
+    assert post_age_seconds(post) == 7200.0
+    assert is_late_post(post, AlertSettings())
+    assert not is_late_post(post, AlertSettings(max_post_age_seconds=8000))
+    skewed = Post(id="1", text="x", author_id="2", created_at=created, received_at=created - timedelta(seconds=2),
+                  source="stream")
+    assert post_age_seconds(skewed) == 0.0  # clock skew never makes an age negative
+    assert not is_late(None, AlertSettings())
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [(0, "0s"), (45.9, "45s"), (60, "1m"), (16 * 60 + 5, "16m"), (3600, "1h"), (2 * 3600 + 5 * 60, "2h 5m"),
+     (13 * 3600 + 5 * 60, "13h"), (86400, "1d"), (3 * 86400 + 4 * 3600, "3d 4h"), (12 * 86400 + 3600, "12d"),
+     (-5, "0s")],
+)
+def test_format_age(seconds: float, text: str) -> None:
+    assert format_age(seconds) == text

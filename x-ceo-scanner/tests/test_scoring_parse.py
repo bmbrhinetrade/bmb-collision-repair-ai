@@ -7,10 +7,13 @@ from typing import Any
 
 import pytest
 
+from ceoscan.config import ScoringSettings
 from ceoscan.models import Account, RuleResult
 from ceoscan.scoring.claude import (
+    DEFAULT_FALLBACK_MAX_IMPACT,
     MAX_REASON_CHARS,
     ScoreParseError,
+    fallback_impact,
     fallback_score,
     parse_score_response,
 )
@@ -251,6 +254,9 @@ def test_fallback_uses_rule_tickers_and_score() -> None:
         categories=["ticker", "guidance"],
         tickers=["NVDA"],
         rule_score=6,
+        own_flagged=True,
+        own_categories=["ticker", "guidance"],
+        own_rule_score=6,
     )
     score = fallback_score(rules, ACCOUNT, "timeout after 4s")
     assert score.tickers == ["NVDA"]
@@ -278,9 +284,13 @@ def test_fallback_minimum_impact_and_no_account() -> None:
 
 
 def test_fallback_caps_impact_and_reason_length() -> None:
-    rules = RuleResult(flagged=True, reasons=["number: " + "9" * 100] * 5, rule_score=42)
+    rules = RuleResult(
+        flagged=True, reasons=["number: " + "9" * 100] * 5, rule_score=42, own_flagged=True, own_rule_score=42
+    )
     score = fallback_score(rules, None, None)
-    assert score.impact == 10
+    assert score.impact == DEFAULT_FALLBACK_MAX_IMPACT == ScoringSettings().fallback_max_impact == 7
+    assert fallback_score(rules, None, None, max_impact=10).impact == 10
+    assert fallback_score(rules, None, None, max_impact=99).impact == 10  # never above 10
     assert len(score.reason) <= MAX_REASON_CHARS
 
 
@@ -289,3 +299,74 @@ def test_fallback_does_not_alias_rule_lists() -> None:
     score = fallback_score(rules, None, None)
     score.tickers.append("X")
     assert rules.tickers == ["TSLA"]
+
+
+# --------------------------------------------------------------------------- rules-only calibration (SCOR-1)
+
+
+def rr(own: int, context: int, *, own_flagged: bool | None = None, **kw: Any) -> RuleResult:
+    flagged_own = own > 0 if own_flagged is None else own_flagged
+    return RuleResult(
+        flagged=context > 0 or flagged_own,
+        rule_score=context,
+        own_flagged=flagged_own,
+        own_rule_score=own,
+        **kw,
+    )
+
+
+@pytest.mark.parametrize(
+    ("own", "context", "cap", "expected"),
+    [
+        (0, 10, 7, 5),  # "lol" quoting an earnings recap: context counts half
+        (0, 6, 7, 3),  # "Yes" replying to "Will Tesla raise guidance?"
+        (0, 8, 7, 4),  # "On track. No change." under a Cybercab / Q2 / guidance question
+        (0, 1, 7, 1),
+        (0, 0, 7, 1),  # unflagged: minimum
+        (4, 10, 7, 7),  # own words + strong context: lifted, but only up to the cap
+        (4, 6, 7, 5),
+        (6, 6, 7, 6),  # no context: own score as is
+        (9, 9, 7, 7),  # cap
+        (9, 9, 10, 9),
+        (10, 10, 10, 10),
+        (5, 3, 7, 5),  # context can never lower the own score
+    ],
+)
+def test_fallback_impact_is_own_text_based_and_capped(own: int, context: int, cap: int, expected: int) -> None:
+    assert fallback_impact(rr(own, context), cap) == expected
+    assert fallback_score(rr(own, context), None, None, max_impact=cap).impact == expected
+
+
+def test_unflagged_own_score_is_ignored() -> None:
+    # own_rule_score only counts when own_flagged (defensive for hand-built RuleResults)
+    assert fallback_impact(rr(5, 6, own_flagged=False), 7) == 3
+
+
+@pytest.mark.parametrize("source", ["rules_fallback", "offline", "skipped"])
+def test_every_rules_only_source_is_capped(source: str) -> None:
+    score = fallback_score(rr(10, 10), ACCOUNT, None, source=source)  # type: ignore[arg-type]
+    assert score.impact == 7
+    assert score.source == source
+
+
+def test_context_only_reason_is_labelled() -> None:
+    rules = rr(0, 6, reasons=["company: Tesla", "keyword: guidance"], categories=["company", "guidance"])
+    assert fallback_score(rules, ACCOUNT, None).reason.startswith("Fast rules (quoted/parent post only): ")
+    own = rr(6, 6, reasons=["company: Tesla"], categories=["company"])
+    assert fallback_score(own, ACCOUNT, None).reason.startswith("Fast rules: company: Tesla")
+
+
+def test_fallback_tickers_prefer_account_when_rules_only_matched_aliases() -> None:
+    # "Gemini" (alias of GOOGL) in an @elonmusk post: the author's mapped tickers come first
+    alias_only = RuleResult(flagged=True, categories=["company"], tickers=["GOOGL"], rule_score=4)
+    assert fallback_score(alias_only, ACCOUNT, None).tickers == ["TSLA", "SPCX", "GOOGL"]
+    # an alias that IS one of the account's tickers keeps its place first
+    starship = RuleResult(flagged=True, categories=["company"], tickers=["SPCX"], rule_score=4)
+    assert fallback_score(starship, ACCOUNT, None).tickers == ["SPCX"]  # not "SPCX,TSLA"
+    mixed = RuleResult(flagged=True, categories=["company"], tickers=["NVDA", "TSLA"], rule_score=4)
+    assert fallback_score(mixed, ACCOUNT, None).tickers == ["TSLA", "NVDA"]
+    # an explicit $cashtag / ticker mention wins as before
+    explicit = RuleResult(flagged=True, categories=["ticker", "company"], tickers=["NVDA"], rule_score=4)
+    assert fallback_score(explicit, ACCOUNT, None).tickers == ["NVDA"]
+    # no account: whatever the rules found
+    assert fallback_score(alias_only, None, None).tickers == ["GOOGL"]

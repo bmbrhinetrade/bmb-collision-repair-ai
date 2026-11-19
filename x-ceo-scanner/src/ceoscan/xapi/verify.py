@@ -3,14 +3,23 @@
 Flow (``python -m ceoscan verify [--write] [--accept-warnings]``):
 
 1. :func:`verify_accounts` looks every handle up with ``GET /2/users/by`` (one call per 100 handles).
-2. :func:`assess_user` (pure) flags anything that looks wrong: unverified, a company account
-   without the business (gold) badge, parody, protected, few followers, a display name that does
-   not match ``expect_name`` (catches look-alikes), or no posts in 90 days.
-3. :func:`format_verify_report` prints the result; :func:`write_user_ids` writes the user ids back
-   into config/watchlist.yaml with a ruamel.yaml round-trip, so comments and layout survive.
-   :func:`record_results` mirrors the results into the SQLite ``accounts`` table.
+   A handle that is not found / suspended but has a pinned ``user_id`` is looked up by that id, so
+   a renamed account is reported ("now uses @new") instead of being dropped from the watchlist.
+2. :func:`assess_user` (pure) flags anything that looks wrong: a handle that now returns a
+   different user id than the one pinned in the watchlist (renamed or re-registered handle),
+   unverified, a company account without the business (gold) badge, parody, protected, few
+   followers, an account created less than a year ago, a display name that does not contain every
+   word of ``expect_name`` or that contains words like "parody", "fan" or "news", or no posts in
+   90 days. The name check is a weak extra signal (anyone can copy a display name); the badge,
+   follower count, account age and pinned id matter more.
+3. :func:`format_verify_report` prints the result (user id changes in their own section);
+   :func:`write_user_ids` writes the user ids back into config/watchlist.yaml with a ruamel.yaml
+   round-trip, so comments and layout survive. :func:`record_results` mirrors the results into the
+   SQLite ``accounts`` table. :func:`batch_failure` turns "every lookup failed for the same reason"
+   (e.g. HTTP 402 credits depleted) into one message for the CLI.
 
 Accounts without a user id are never streamed, so an unverified handle can never trigger alerts.
+A changed user id is a warning, so it is only written with ``--accept-warnings``.
 """
 
 from __future__ import annotations
@@ -20,6 +29,7 @@ import logging
 import os
 import re
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -34,7 +44,13 @@ from ruamel.yaml.tokens import CommentToken
 from ..config import load_watchlist
 from ..models import Account, Watchlist
 from ..timeutil import now_utc, snowflake_to_datetime
-from .client import XApiError
+from .client import (
+    CreditsDepleted,
+    NotAuthorized,
+    RateLimited,
+    TooManyConnections,
+    XApiError,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..store import Store
@@ -53,14 +69,41 @@ VERIFY_USER_FIELDS: list[str] = [
     "most_recent_tweet_id",
 ]
 
-LOOKUP_BATCH = 100  # GET /2/users/by accepts at most 100 usernames
+LOOKUP_BATCH = 100  # GET /2/users/by (and GET /2/users?ids=) accept at most 100 per call
 MIN_FOLLOWERS = 10_000
 INACTIVE_DAYS = 90
+RECENT_ACCOUNT_DAYS = 365  # a CEO account younger than this is suspicious (re-registered handle?)
 STATUSES = ("ok", "warning", "not_found", "suspended", "error")
 
 # Words that never count as a name match on their own ("The Official X" vs "The Real Y").
 _NAME_STOPWORDS = frozenset({"the", "official", "real", "inc", "co", "corp", "llc", "ltd", "of", "and"})
+# Display-name words that mark fan, parody and news accounts ("Elon Musk Parody Fan").
+_SUSPICIOUS_NAME_WORDS = frozenset(
+    {
+        "parody",
+        "fan",
+        "fans",
+        "fanclub",
+        "fake",
+        "satire",
+        "unofficial",
+        "news",
+        "updates",
+        "update",
+        "alerts",
+        "alert",
+        "tracker",
+        "daily",
+        "archive",
+        "quotes",
+        "clips",
+        "bot",
+    }
+)
 _NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
+
+#: VerifyResult.error_kind values for a failed lookup request (see :func:`batch_failure`).
+ERROR_KINDS = ("credits", "auth", "forbidden", "rate_limit", "network", "api")
 
 
 @dataclass
@@ -77,23 +120,40 @@ class VerifyResult:
     parody: bool | None = None
     last_post_at: datetime | None = None
     problems: list[str] = field(default_factory=list)
+    #: the user_id pinned in the watchlist when X now returns a *different* id for the handle
+    previous_user_id: str | None = None
+    created_at: datetime | None = None
+    #: why the lookup request failed (status "error"): one of ERROR_KINDS, None otherwise
+    error_kind: str | None = None
+    #: X's error text for a failed lookup request
+    error_detail: str | None = None
 
     @property
     def ok(self) -> bool:
         return self.status == "ok"
+
+    @property
+    def id_changed(self) -> bool:
+        """X returned a different user id than the one pinned in the watchlist."""
+        return self.previous_user_id is not None and self.user_id is not None and self.user_id != self.previous_user_id
 
 
 # --------------------------------------------------------------------------- assessment (pure)
 
 
 def _name_tokens(text: str) -> list[str]:
-    return [t for t in _NON_WORD.split(text.casefold()) if t]
+    # NFKD + dropping combining marks: "José" ~ "Jose"; emoji and punctuation split into nothing.
+    folded = "".join(c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c))
+    return [t for t in _NON_WORD.split(folded) if t]
 
 
 def name_matches(expected: str, actual: str) -> bool:
-    """Case-insensitive, punctuation-insensitive comparison; any shared word is a match.
+    """Case-, accent- and punctuation-insensitive: every word of ``expected`` must be in ``actual``.
 
-    "Elon Musk" ~ "Elon Musk", "Michael Saylor⚡️" ~ "Michael Saylor", "OpenAI" ~ "Open AI".
+    "Elon Musk" ~ "Elon Musk ⚡️", "Michael Saylor⚡️" ~ "Michael Saylor", "OpenAI" ~ "Open AI";
+    but "Matt Schultz" !~ "Howard Schultz" and "Sam Altman" !~ "Sam Bankman-Fried". Stopwords
+    ("the", "official", "inc" ...) are ignored. Extra words in ``actual`` are allowed here; see
+    :func:`suspicious_name_words` for "parody" / "fan" / "news" style additions.
     """
     exp_tokens, act_tokens = _name_tokens(expected), _name_tokens(actual)
     if not exp_tokens:
@@ -102,9 +162,37 @@ def name_matches(expected: str, actual: str) -> bool:
         return False
     if "".join(exp_tokens) == "".join(act_tokens):  # "OpenAI" vs "Open AI"
         return True
-    exp_set = {t for t in exp_tokens if t not in _NAME_STOPWORDS} or set(exp_tokens)
-    act_set = {t for t in act_tokens if t not in _NAME_STOPWORDS} or set(act_tokens)
-    return bool(exp_set & act_set)
+    exp_set = {t for t in exp_tokens if t not in _NAME_STOPWORDS}
+    act_set = {t for t in act_tokens if t not in _NAME_STOPWORDS}
+    if not exp_set:  # only stopwords expected ("The Real"): require the same words
+        return set(exp_tokens) <= set(act_tokens)
+    if exp_set <= act_set:
+        return True
+    # Spacing differences: "Open AI" expected, "OpenAI" shown, or "Supermicro" vs "Super Micro Computer".
+    # Whole words only: "Intel" never matches inside "Pintel".
+    joined = "".join(t for t in exp_tokens if t not in _NAME_STOPWORDS)
+    return any(
+        "".join(act_tokens[i:j]) == joined for i in range(len(act_tokens)) for j in range(i + 1, len(act_tokens) + 1)
+    )
+
+
+def suspicious_name_words(expected: str, actual: str) -> list[str]:
+    """Words like "parody", "fan" or "news" in ``actual`` that ``expected`` does not have."""
+    exp = set(_name_tokens(expected))
+    found = [t for t in _name_tokens(actual) if t in _SUSPICIOUS_NAME_WORDS and t not in exp]
+    if "affiliated" in _name_tokens(actual) and "affiliated" not in exp:  # "not affiliated with ..."
+        found.append("affiliated")
+    return list(dict.fromkeys(found))
+
+
+def _parse_created_at(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))  # Python 3.11+ accepts the trailing "Z"
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else None
 
 
 def _as_int(value: Any) -> int | None:
@@ -136,7 +224,17 @@ def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
     if recent_id is not None and str(recent_id).isdigit():
         last_post_at = snowflake_to_datetime(str(recent_id))
 
+    user_id = str(user["id"]) if user.get("id") is not None else None
+    created_at = _parse_created_at(user.get("created_at"))
+
     problems: list[str] = []
+    previous_user_id: str | None = None
+    if account.user_id and user_id and user_id != account.user_id:
+        previous_user_id = account.user_id
+        problems.append(
+            f"user id changed from {account.user_id} to {user_id}: @{account.handle} now belongs to a different "
+            f"account (handle renamed or re-registered?). Check https://x.com/i/user/{account.user_id}"
+        )
     if username and str(username).lower() != account.handle_lower:
         problems.append(f"handle resolves to @{username}, not @{account.handle}")
 
@@ -154,8 +252,23 @@ def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
         problems.append("protected account (posts are private)")
     if followers is not None and followers < MIN_FOLLOWERS:
         problems.append(f"low followers: {followers:,} (< {MIN_FOLLOWERS:,})")
-    if account.expect_name and name is not None and not name_matches(account.expect_name, str(name)):
-        problems.append(f"display name {str(name)!r} does not match expected {account.expect_name!r}")
+    if created_at is not None:
+        account_age = now - created_at
+        if account_age < timedelta(days=RECENT_ACCOUNT_DAYS):
+            problems.append(
+                f"new account: created {created_at:%Y-%m-%d} ({max(account_age.days, 0)} days ago); "
+                "a real CEO/company account is usually years old (re-registered handle?)"
+            )
+    if account.expect_name and name is not None:
+        if not name_matches(account.expect_name, str(name)):
+            problems.append(f"display name {str(name)!r} does not match expected {account.expect_name!r}")
+        else:
+            odd = suspicious_name_words(account.expect_name, str(name))
+            if odd:
+                problems.append(
+                    f"display name {str(name)!r} contains {', '.join(repr(w) for w in odd)} "
+                    "(fan, parody or news account?)"
+                )
     if last_post_at is not None:
         age = now - last_post_at
         if age > timedelta(days=INACTIVE_DAYS):
@@ -166,7 +279,7 @@ def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
     return VerifyResult(
         handle=account.handle,
         status="warning" if problems else "ok",
-        user_id=str(user["id"]) if user.get("id") is not None else None,
+        user_id=user_id,
         username=str(username) if username is not None else None,
         name=str(name) if name is not None else None,
         verified=verified,
@@ -176,6 +289,8 @@ def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
         parody=parody,
         last_post_at=last_post_at,
         problems=problems,
+        previous_user_id=previous_user_id,
+        created_at=created_at,
     )
 
 
@@ -191,12 +306,105 @@ def _error_result(account: Account, error: dict) -> VerifyResult:
 # --------------------------------------------------------------------------- lookup
 
 
+def _error_kind(exc: BaseException) -> str:
+    if isinstance(exc, CreditsDepleted) or getattr(exc, "status", None) == 402:
+        return "credits"
+    if isinstance(exc, NotAuthorized) or getattr(exc, "status", None) in (401, 403):
+        return "forbidden" if getattr(exc, "status", None) == 403 else "auth"
+    if isinstance(exc, (RateLimited, TooManyConnections)) or getattr(exc, "status", None) == 429:
+        return "rate_limit"
+    if isinstance(exc, XApiError):
+        return "api"
+    return "network"
+
+
+def _describe_lookup_error(exc: BaseException) -> str:
+    if isinstance(exc, XApiError):
+        return str(exc)
+    text = " ".join(str(exc).split())
+    return f"{type(exc).__name__}: {text}"[:300] if text else type(exc).__name__
+
+
+_LOOKUP_ERRORS = (XApiError, aiohttp.ClientError, TimeoutError, OSError)
+
+
+async def _lookup_ids(client: Any, ids: list[str]) -> tuple[list[dict], list[dict]] | None:
+    """GET /2/users?ids=... (None when the client cannot do it). Raises the client's errors."""
+    by_ids = getattr(client, "lookup_users_by_ids", None)
+    if by_ids is not None:
+        users, errors = await by_ids(ids, VERIFY_USER_FIELDS)
+        return list(users), list(errors)
+    request = getattr(client, "_request", None)
+    if request is None:
+        return None
+    data = await request(
+        "GET",
+        "/2/users",
+        "/2/users",
+        params={"ids": ",".join(ids), "user.fields": ",".join(VERIFY_USER_FIELDS)},
+    )
+    users = data.get("data") if isinstance(data, dict) else None
+    errors = data.get("errors") if isinstance(data, dict) else None
+    return (users if isinstance(users, list) else []), (errors if isinstance(errors, list) else [])
+
+
+async def _check_pinned_ids(client: Any, watchlist: Watchlist, results: list[VerifyResult], now: datetime) -> None:
+    """For not-found / suspended handles with a pinned user_id, look the id up before it is dropped.
+
+    A renamed account keeps its id: report it as a warning naming the new handle (the pinned id is
+    kept and still streamed). Only when X confirms the id itself is gone does the result stay
+    ``not_found`` / ``suspended`` (and ``write_user_ids`` removes the id). If the id lookup fails,
+    the id is kept as well.
+    """
+    by_handle = watchlist.by_handle()
+    todo = [
+        (i, by_handle[r.handle.lower()])
+        for i, r in enumerate(results)
+        if r.status in ("not_found", "suspended")
+        and r.handle.lower() in by_handle
+        and by_handle[r.handle.lower()].user_id
+    ]
+    for start in range(0, len(todo), LOOKUP_BATCH):
+        batch = todo[start : start + LOOKUP_BATCH]
+        ids = [str(acct.user_id) for _, acct in batch]
+        try:
+            found = await _lookup_ids(client, ids)
+        except _LOOKUP_ERRORS as exc:
+            found = None
+            failure: str | None = _describe_lookup_error(exc)
+        else:
+            failure = None if found is not None else "this client cannot look users up by id"
+        users = {str(u.get("id")): u for u in (found[0] if found else []) if u.get("id") is not None}
+        for i, acct in batch:
+            old = results[i]
+            user = users.get(str(acct.user_id))
+            if user is not None:
+                assessed = assess_user(acct, user, now)
+                new_handle = assessed.username or "?"
+                assessed.problems.insert(
+                    0,
+                    f"handle @{acct.handle} is {old.status.replace('_', ' ')}, but its pinned user_id {acct.user_id} "
+                    f"now uses @{new_handle} (renamed): set handle: {new_handle} in the watchlist. "
+                    "The pinned id is kept and still streamed",
+                )
+                assessed.problems = [p for p in assessed.problems if not p.startswith("handle resolves to @")]
+                assessed.handle = old.handle
+                assessed.status = "warning"
+                results[i] = assessed
+            elif failure is not None:
+                old.problems.append(f"could not check the pinned user_id {acct.user_id} ({failure}); it is kept")
+                old.status = "warning"
+                old.user_id = acct.user_id
+
+
 async def verify_accounts(client: XClient, watchlist: Watchlist, now: datetime | None = None) -> list[VerifyResult]:
     """Look every watchlist handle up on X and assess it. Results are in watchlist order.
 
     One ``/2/users/by`` call per 100 handles. Handles X reports in ``errors`` (``"value": handle``)
-    become ``not_found`` or ``suspended``; a failed request marks its batch ``error`` (never raises
-    for X/network errors, so the report can still be printed).
+    become ``not_found`` or ``suspended`` (after checking a pinned user_id, see
+    :func:`_check_pinned_ids`); a failed request marks its batch ``error`` with an ``error_kind``
+    (never raises for X/network errors, so the report can still be printed; see
+    :func:`batch_failure`).
     """
     now = now or now_utc()
     accounts = list(watchlist.accounts)
@@ -205,11 +413,20 @@ async def verify_accounts(client: XClient, watchlist: Watchlist, now: datetime |
         batch = accounts[start : start + LOOKUP_BATCH]
         try:
             users, errors = await client.lookup_users([a.handle for a in batch], VERIFY_USER_FIELDS)
-        except (XApiError, aiohttp.ClientError, TimeoutError, OSError) as exc:
-            msg = str(exc) if isinstance(exc, XApiError) else f"{type(exc).__name__}: {exc}"
-            logger.error("verify: user lookup failed for %d handle(s): %s", len(batch), msg)
+        except _LOOKUP_ERRORS as exc:
+            msg = _describe_lookup_error(exc)
+            kind = _error_kind(exc)
+            # The CLI reports this once (batch_failure); keep the log quiet at its WARNING level.
+            logger.info("verify: user lookup failed for %d handle(s): %s", len(batch), msg)
             results.extend(
-                VerifyResult(handle=a.handle, status="error", problems=[f"X API lookup failed: {msg}"]) for a in batch
+                VerifyResult(
+                    handle=a.handle,
+                    status="error",
+                    problems=[f"X API lookup failed: {msg}"],
+                    error_kind=kind,
+                    error_detail=msg,
+                )
+                for a in batch
             )
             continue
 
@@ -230,6 +447,7 @@ async def verify_accounts(client: XClient, watchlist: Watchlist, now: datetime |
                 results.append(
                     VerifyResult(handle=account.handle, status="error", problems=["X returned no data for this handle"])
                 )
+    await _check_pinned_ids(client, watchlist, results, now)
     counts = {s: sum(1 for r in results if r.status == s) for s in STATUSES}
     logger.info("verify: %d handles checked: %s", len(results), ", ".join(f"{k}={v}" for k, v in counts.items() if v))
     return results
@@ -249,6 +467,40 @@ def record_results(store: Store, results: list[VerifyResult]) -> int:
             problems=list(r.problems),
         )
     return len(results)
+
+
+# --------------------------------------------------------------------------- batch failures
+
+_FAILURE_TEXT = {
+    "credits": "X API credits depleted (HTTP 402): add credits at console.x.com (billing).",
+    "auth": "X rejected the bearer token (HTTP 401): check X_BEARER_TOKEN in .env (regenerated? stray quotes?).",
+    "forbidden": "X refused the user lookup (HTTP 403): this X app may not have access to GET /2/users/by.",
+    "rate_limit": "X rate limit hit on GET /2/users/by (300 requests per 15 min): wait up to 15 minutes and retry.",
+    "network": "could not reach the X API",
+    "api": "the X API user lookup failed",
+}
+
+
+def batch_failure(results: list[VerifyResult]) -> str | None:
+    """One message when every lookup failed for the same reason (e.g. 402 credits), else None.
+
+    "No handles were checked" is then true for the whole run: X bills neither failed requests nor
+    anything else, and nothing should be written.
+    """
+    if not results or any(r.status != "error" or r.error_kind is None for r in results):
+        return None
+    kinds = {r.error_kind for r in results}
+    if len(kinds) != 1:
+        return None
+    kind = kinds.pop()
+    assert kind is not None
+    detail = next((r.error_detail for r in results if r.error_detail), "")
+    head = _FAILURE_TEXT.get(kind, _FAILURE_TEXT["api"])
+    if kind in ("network", "api") and detail:
+        head = f"{head} ({detail})."
+    elif not head.endswith("."):
+        head += "."
+    return f"{head} No handles were checked, nothing was billed and nothing was written."
 
 
 # --------------------------------------------------------------------------- report
@@ -306,9 +558,30 @@ def format_verify_report(results: list[VerifyResult]) -> str:
     if not bad:
         lines.append("All handles look like the real, verified accounts.")
         return "\n".join(lines)
+    changed = [r for r in results if r.id_changed]
+    if changed:
+        lines.append("USER ID CHANGES - the handle now belongs to a different account than the pinned user_id:")
+        for r in changed:
+            lines.append(
+                f"  CHANGED @{r.handle}: pinned {r.previous_user_id} -> X now returns {r.user_id} ({r.name or '-'})"
+            )
+        lines.append(
+            "  Do not accept these unless you checked on x.com that the new account is the real one "
+            "(--accept-warnings would write the new id)."
+        )
+        lines.append("")
     lines.append("Handles not found or that look wrong:")
+    groups: dict[tuple[str, tuple[str, ...]], list[VerifyResult]] = {}
     for r in bad:
-        lines.append(f"  @{r.handle} [{_STATUS_LABEL.get(r.status, r.status)}]: {'; '.join(r.problems) or r.status}")
+        groups.setdefault((r.status, tuple(r.problems)), []).append(r)
+    for (status, problems), members in groups.items():
+        label = _STATUS_LABEL.get(status, status)
+        text = "; ".join(problems) or status
+        if len(members) > 1 and status == "error":  # one line for "the same request failed for all of them"
+            names = ", ".join(f"@{m.handle}" for m in members[:5]) + (", ..." if len(members) > 5 else "")
+            lines.append(f"  {len(members)} handles [{label}]: {text} ({names})")
+        else:
+            lines.extend(f"  @{m.handle} [{label}]: {text}" for m in members)
     if counts["warning"]:
         lines.append(
             "Warnings are not written to the watchlist unless you pass --accept-warnings "
@@ -396,6 +669,8 @@ def write_user_ids(watchlist_path: Path, results: list[VerifyResult], accept_war
     """Write verified user ids into the watchlist YAML, preserving comments and layout.
 
     * ``ok`` (and ``warning`` when ``accept_warnings``): set ``user_id`` (inserted right after ``handle``).
+      A *different* pinned id is only replaced for an accepted warning, because a changed id is
+      always a warning (see :func:`assess_user`).
     * ``not_found`` / ``suspended``: remove ``user_id`` so the handle is no longer streamed.
     * ``warning`` (not accepted) / ``error``: left unchanged.
 
@@ -429,7 +704,12 @@ def write_user_ids(watchlist_path: Path, results: list[VerifyResult], accept_war
                 pos = keys.index("handle") + 1 if "handle" in keys else len(keys)
                 _insert_key(item, pos, "user_id", new_value)
             changed += 1
-            logger.info("verify: @%s user_id=%s", r.handle, r.user_id)
+            if current_s and current_s != r.user_id:
+                logger.warning(
+                    "verify: @%s user_id CHANGED %s -> %s (accepted warning)", r.handle, current_s, r.user_id
+                )
+            else:
+                logger.info("verify: @%s user_id=%s", r.handle, r.user_id)
         elif r.status in ("not_found", "suspended") and "user_id" in item:
             _delete_key(item, "user_id")
             changed += 1
@@ -463,9 +743,11 @@ __all__ = [
     "VERIFY_USER_FIELDS",
     "VerifyResult",
     "assess_user",
+    "batch_failure",
     "format_verify_report",
     "name_matches",
     "record_results",
+    "suspicious_name_words",
     "verify_accounts",
     "write_user_ids",
 ]

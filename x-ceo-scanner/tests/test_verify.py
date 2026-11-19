@@ -14,11 +14,12 @@ from ceoscan.config import load_watchlist
 from ceoscan.models import Account, Watchlist
 from ceoscan.store import Store
 from ceoscan.timeutil import datetime_to_snowflake
-from ceoscan.xapi.client import CreditsDepleted
+from ceoscan.xapi.client import CreditsDepleted, NotAuthorized, RateLimited
 from ceoscan.xapi.verify import (
     VERIFY_USER_FIELDS,
     VerifyResult,
     assess_user,
+    batch_failure,
     format_verify_report,
     name_matches,
     record_results,
@@ -121,9 +122,80 @@ def test_assess_user_name_mismatch() -> None:
     r = assess_user(ELON, make_user("elonmusk", "Tesla Owners Club"), NOW)
     assert r.status == "warning"
     assert len(r.problems) == 1 and "does not match expected 'Elon Musk'" in r.problems[0]
-    # case, punctuation and emoji are ignored; any shared word is enough
-    for ok_name in ("ELON MUSK", "Elon Musk ⚡️", "Musk", "elon.musk!!"):
+    # case, punctuation, accents and emoji are ignored; every expected word must be there
+    for ok_name in ("ELON MUSK", "Elon Musk ⚡️", "elon.musk!!", "Elon R. Musk", "Musk, Elon"):
         assert assess_user(ELON, make_user("elonmusk", ok_name), NOW).status == "ok", ok_name
+    # one shared word is no longer enough (REQ-6): a different person with the same last name
+    for bad_name in ("Musk", "Elon", "Kimbal Musk"):
+        r = assess_user(ELON, make_user("elonmusk", bad_name), NOW)
+        assert r.status == "warning" and "does not match expected" in r.problems[0], bad_name
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [
+        ("Matt Schultz", "Howard Schultz"),
+        ("Sam Altman", "Sam Bankman-Fried"),
+        ("Lisa Su", "Lisa Smith"),
+        ("Intel", "Pintel Lover"),
+        ("AMD", "AMDfan"),
+    ],
+)
+def test_name_matches_requires_every_expected_word(expected: str, actual: str) -> None:
+    assert not name_matches(expected, actual)
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [
+        ("Lip-Bu Tan", "Lip-Bu Tan"),
+        ("Supermicro", "Super Micro Computer"),
+        ("Open AI", "OpenAI"),
+        ("Jose Perez", "José Pérez 🚀"),
+        ("Micron Technology", "Micron Technology, Inc."),
+    ],
+)
+def test_name_matches_tolerates_spacing_accents_and_suffixes(expected: str, actual: str) -> None:
+    assert name_matches(expected, actual)
+
+
+def test_fan_parody_and_news_words_are_flagged() -> None:
+    for name in ("Elon Musk Parody Fan", "Elon Musk News", "Elon Musk (not affiliated)", "Elon Musk Updates"):
+        r = assess_user(ELON, make_user("elonmusk", name), NOW)
+        assert r.status == "warning", name
+        assert any("fan, parody or news account?" in p for p in r.problems), name
+    # an expected word is not suspicious ("Fox News" expecting "Fox News")
+    news = Account("FoxNews", ("FOX",), kind="company", expect_name="Fox News")
+    assert assess_user(news, make_user("FoxNews", "Fox News", verified_type="business"), NOW).status == "ok"
+
+
+def test_changed_user_id_is_a_warning() -> None:
+    """REQ-4 / SEC-6: a handle that now returns a different id than the pinned one is never 'ok'."""
+    pinned = Account("elonmusk", ("TSLA",), kind="person", expect_name="Elon Musk", user_id="44196397")
+    r = assess_user(pinned, make_user("elonmusk", "Elon Musk", uid="1999999999999999999"), NOW)
+    assert r.status == "warning"
+    assert r.id_changed and r.previous_user_id == "44196397" and r.user_id == "1999999999999999999"
+    assert r.problems[0].startswith("user id changed from 44196397 to 1999999999999999999")
+    same = assess_user(pinned, make_user("elonmusk", "Elon Musk", uid="44196397"), NOW)
+    assert same.status == "ok" and not same.id_changed and same.previous_user_id is None
+
+
+def test_recently_created_account_is_a_warning() -> None:
+    user = make_user("elonmusk", "Elon Musk")
+    user["created_at"] = (NOW - timedelta(days=18)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    r = assess_user(ELON, user, NOW)
+    assert r.status == "warning"
+    assert r.problems == [
+        (
+            f"new account: created {(NOW - timedelta(days=18)):%Y-%m-%d} (18 days ago); "
+            "a real CEO/company account is usually years old (re-registered handle?)"
+        )
+    ]
+    assert r.created_at is not None
+    user["created_at"] = (NOW - timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    assert assess_user(ELON, user, NOW).status == "ok"
+    user["created_at"] = "garbage"
+    assert assess_user(ELON, user, NOW).status == "ok"  # unparseable dates are ignored
 
 
 def test_name_matches_helper() -> None:
@@ -250,6 +322,100 @@ async def test_verify_accounts_api_error_marks_batch_error() -> None:
     results = await verify_accounts(client, _wl(ELON, NVIDIA), now=NOW)  # type: ignore[arg-type]
     assert [r.status for r in results] == ["error", "error"]
     assert "402" in results[0].problems[0] and "CreditsDepleted" in results[0].problems[0]
+    assert {r.error_kind for r in results} == {"credits"}
+
+
+@pytest.mark.parametrize(
+    ("exc", "needle"),
+    [
+        (CreditsDepleted(status=402, title="CreditsDepleted", detail="no credits"), "add credits at console.x.com"),
+        (NotAuthorized(status=401, title="Unauthorized"), "check X_BEARER_TOKEN"),
+        (NotAuthorized(status=403, title="Forbidden"), "HTTP 403"),
+        (RateLimited(status=429, title="Too Many Requests"), "wait up to 15 minutes"),
+        (TimeoutError(), "could not reach the X API (TimeoutError)"),
+    ],
+)
+async def test_batch_failure_collapses_global_errors_into_one_message(exc: Exception, needle: str) -> None:
+    """REQ-7: one clear line instead of 31 identical errors."""
+    accounts = tuple(Account(f"ceo{i}", ("TSLA",)) for i in range(31))
+    results = await verify_accounts(FakeClient(users=[], errors=[], exc=exc), _wl(*accounts), now=NOW)  # type: ignore[arg-type]
+    msg = batch_failure(results)
+    assert msg is not None and needle in msg
+    assert msg.endswith("No handles were checked, nothing was billed and nothing was written.")
+    # the report (if printed at all) lists the shared error once, not 31 times
+    report = format_verify_report(results)
+    assert report.count("X API lookup failed") == 1 and "31 handles [ERROR]" in report
+
+
+async def test_batch_failure_none_when_some_lookups_worked() -> None:
+    assert batch_failure([]) is None
+    mixed = [
+        VerifyResult("a", "ok", user_id="1"),
+        VerifyResult("b", "error", problems=["X API lookup failed: x"], error_kind="credits"),
+    ]
+    assert batch_failure(mixed) is None
+    assert batch_failure([VerifyResult("silent", "error", problems=["X returned no data for this handle"])]) is None
+
+
+class ByIdClient(FakeClient):
+    """FakeClient that can also look users up by id (GET /2/users?ids=)."""
+
+    def __init__(self, users: list[dict], errors: list[dict], by_id: list[dict], fail_by_id: bool = False) -> None:
+        super().__init__(users, errors)
+        self.by_id = by_id
+        self.fail_by_id = fail_by_id
+        self.id_calls: list[list[str]] = []
+
+    async def lookup_users_by_ids(self, ids: list[str], user_fields: list[str]) -> tuple[list[dict], list[dict]]:
+        self.id_calls.append(list(ids))
+        if self.fail_by_id:
+            raise CreditsDepleted(status=402, title="CreditsDepleted")
+        return [u for u in self.by_id if u["id"] in ids], []
+
+
+async def test_not_found_handle_with_pinned_id_reports_rename_and_keeps_id() -> None:
+    """REQ-4: a renamed account keeps its pinned user_id instead of being dropped."""
+    pinned = Account("smatthewschultz", ("SBUX",), kind="person", expect_name="Matt Schultz", user_id="111")
+    gone = Account("ghost_ceo", ("TSLA",), user_id="222")
+    renamed = make_user("mattschultz_new", "Matt Schultz", uid="111")
+    not_found = [
+        {**NOT_FOUND, "value": "smatthewschultz", "detail": "Could not find user with usernames: [smatthewschultz]."},
+        NOT_FOUND,
+    ]
+    client = ByIdClient(users=[], errors=not_found, by_id=[renamed])
+    results = await verify_accounts(client, _wl(pinned, gone), now=NOW)  # type: ignore[arg-type]
+    by = {r.handle: r for r in results}
+    r = by["smatthewschultz"]
+    assert r.status == "warning" and r.user_id == "111" and not r.id_changed
+    assert "now uses @mattschultz_new (renamed)" in r.problems[0]
+    assert not any(p.startswith("handle resolves to") for p in r.problems)
+    assert by["ghost_ceo"].status == "not_found"  # the id itself is gone too -> removed as before
+    assert client.id_calls == [["111", "222"]]
+
+
+async def test_pinned_id_kept_when_id_lookup_fails() -> None:
+    pinned = Account("ghost_ceo", ("TSLA",), user_id="222")
+    client = ByIdClient(users=[], errors=[NOT_FOUND], by_id=[], fail_by_id=True)
+    [r] = await verify_accounts(client, _wl(pinned), now=NOW)  # type: ignore[arg-type]
+    assert r.status == "warning" and r.user_id == "222"
+    assert "could not check the pinned user_id 222" in r.problems[-1]
+
+
+async def test_changed_id_is_reported_separately_and_not_written_without_accept(watchlist_file: Path) -> None:
+    """SEC-6: verify --write must never silently swap a pinned user_id."""
+    wl = load_watchlist(watchlist_file)
+    impostor = make_user("nvidia", "NVIDIA", uid="1999999999999999999", verified_type="business")
+    client = FakeClient(users=[impostor, make_user("elonmusk", "Elon Musk")], errors=[])
+    results = await verify_accounts(client, wl, now=NOW)  # type: ignore[arg-type]
+    nv = next(r for r in results if r.handle == "nvidia")
+    assert nv.status == "warning" and nv.id_changed
+    report = format_verify_report(results)
+    assert "USER ID CHANGES" in report
+    assert "CHANGED @nvidia: pinned 61559439 -> X now returns 1999999999999999999" in report
+    write_user_ids(watchlist_file, results)
+    assert 'user_id: "61559439"' in watchlist_file.read_text(encoding="utf-8")
+    write_user_ids(watchlist_file, results, accept_warnings=True)  # explicit acceptance writes it
+    assert 'user_id: "1999999999999999999"' in watchlist_file.read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- report

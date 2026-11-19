@@ -458,6 +458,17 @@ async def test_channel_selection_by_score(score: int | None, priority: str, expe
     assert chans(await d.send(post_msg(priority=priority), score)) == expected
 
 
+async def test_late_post_alerts_never_go_to_sms_or_pushover_high_priority(session) -> None:
+    """Late (catch-up) alerts are old news: no SMS and no Pushover priority 1, whatever the score."""
+    d, push, sms, email = dispatcher()
+    late = AlertMessage(title="Missed during outage - posted 2h ago: x", body="b", priority="urgent", tags=["late"])
+    assert chans(await d.send(late, 10)) == ["push", "email"]
+    assert sms.sent == []
+    po = PushoverNotifier(session, PO_APP, PO_USER, PushoverSettings(high_priority_min_score=8), timeout=4)
+    assert po.priority(late, 10) == 0
+    assert po.priority(AlertMessage(title="t", body="b", priority="low", tags=["late"]), 10) == -1
+
+
 async def test_channel_selection_system_and_summary() -> None:
     d, *_ = dispatcher()
     assert chans(await d.send(post_msg(kind="system", priority="high"))) == ["push", "email"]
@@ -509,6 +520,23 @@ async def test_slow_channel_times_out_without_delaying_others() -> None:
     assert by["fast"].ok and by["fast"].elapsed_ms < 150
     assert not by["slow"].ok and by["slow"].error == "timeout after 0.2s"
     assert by["slow"].elapsed_ms >= 150
+
+
+async def test_email_gets_its_own_longer_timeout() -> None:
+    """SEC-11: a slow but successful SMTP send is not reported as failed after the push timeout."""
+    settings = AlertSettings(send_timeout_seconds=0.1)
+    settings.email.timeout_seconds = 1.0
+    push = SlowNotifier("ntfy", 0.0)
+    email = SlowNotifier("email", 0.3)  # slower than the push timeout, within the email budget
+    d = AlertDispatcher(settings, [push], email=email)  # type: ignore[list-item,arg-type]
+    by = {r.channel: r for r in await d.send(post_msg(), 8)}
+    assert by["ntfy"].ok and by["ntfy"].elapsed_ms < 100
+    assert by["email"].ok and by["email"].elapsed_ms >= 250
+    assert d.timeout_for(email) == 1.0 and d.timeout_for(push) == 0.1  # type: ignore[arg-type]
+
+    settings.email.timeout_seconds = 0.1
+    by = {r.channel: r for r in await d.send(post_msg(), 8)}
+    assert not by["email"].ok and by["email"].error == "timeout after 0.1s (may still be delivered)"
 
 
 async def test_channels_run_concurrently() -> None:
@@ -574,6 +602,16 @@ async def test_build_dispatcher_all_channels(session) -> None:
     assert isinstance(d.sms, TwilioSmsNotifier) and isinstance(d.email, EmailNotifier)
 
 
+async def test_build_dispatcher_email_uses_email_timeout(session) -> None:
+    s = Settings()
+    s.alerts.email.enabled = True
+    s.alerts.email.timeout_seconds = 25.0
+    d = build_dispatcher(app_config(s, FULL_SECRETS), session)
+    assert isinstance(d.email, EmailNotifier) and d.email.timeout == 25.0  # smtplib per-operation timeout
+    assert d.push[0].timeout == s.alerts.send_timeout_seconds  # type: ignore[attr-defined]
+    assert d.timeout_for(d.email) == 25.0
+
+
 async def test_build_dispatcher_default_is_ntfy_only(session) -> None:
     d = build_dispatcher(app_config(Settings(), FULL_SECRETS), session)
     assert d.channel_names == ["ntfy"]  # sms/email disabled by default
@@ -618,3 +656,76 @@ async def test_build_dispatcher_keeps_working_channels(session, caplog: pytest.L
     assert d.channel_names == ["ntfy"]
     assert "Pushover push disabled" in caplog.text
     assert_no_secrets(caplog.text)
+
+
+# =========================================================================== log redaction (REQ-11 / SEC-7)
+
+
+def _log_to_buffer(secrets: list[str]) -> tuple[logging.Logger, Any, Any]:
+    import io
+
+    from ceoscan.logging_setup import RedactingFilter, RedactingFormatter
+
+    buf = io.StringIO()
+    flt = RedactingFilter(secrets)
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(RedactingFormatter(flt))
+    handler.addFilter(flt)
+    log = logging.getLogger("ceoscan.test.redaction")
+    log.handlers[:] = [handler]
+    log.propagate = False
+    log.setLevel(logging.DEBUG)
+    return log, buf, handler
+
+
+def test_tracebacks_and_exception_text_are_redacted() -> None:
+    log, buf, _ = _log_to_buffer([TW_SID, NTFY_TOPIC])
+    try:
+        raise RuntimeError(f"failed calling https://api.twilio.com/2010-04-01/Accounts/{TW_SID}/Messages.json")
+    except RuntimeError:
+        log.exception("send failed for %s", NTFY_TOPIC)
+    log.error("wrapped", exc_info=ValueError("Authorization: Bearer tk_supersecretvalue123"))
+    log.warning("key sk-ant-api03-abcdefghijklmnop leaked", stack_info=True)
+    text = buf.getvalue()
+    assert TW_SID not in text and NTFY_TOPIC not in text
+    assert "tk_supersecretvalue123" not in text and "abcdefghijklmnop" not in text
+    assert "RuntimeError: failed calling https://api.twilio.com/2010-04-01/Accounts/***/Messages.json" in text
+    assert "Traceback (most recent call last)" in text and "Bearer ***" in text and "sk-ant-***" in text
+    assert "send failed for ***" in text
+
+
+def test_redacting_formatter_does_not_leave_an_unredacted_cache_on_the_record() -> None:
+    log, buf, handler = _log_to_buffer([SMTP_PASS])
+    try:
+        raise OSError(f"login failed with {SMTP_PASS}")
+    except OSError:
+        record = log.makeRecord(log.name, logging.ERROR, __file__, 1, "boom", None, sys_exc_info())
+    handler.handle(record)
+    assert SMTP_PASS not in buf.getvalue()
+    assert record.exc_text is None or SMTP_PASS not in record.exc_text
+
+
+def sys_exc_info() -> Any:
+    import sys
+
+    return sys.exc_info()
+
+
+def test_setup_logging_installs_the_redacting_formatter(capsys: pytest.CaptureFixture[str]) -> None:
+    from ceoscan.logging_setup import RedactingFormatter, setup_logging
+
+    root = logging.getLogger()
+    before, level = list(root.handlers), root.level
+    try:
+        setup_logging("INFO", [PO_APP])
+        (handler,) = root.handlers
+        assert isinstance(handler.formatter, RedactingFormatter)
+        try:
+            raise KeyError(PO_APP)
+        except KeyError:
+            logging.getLogger("ceoscan.test").exception("pushover failed")
+        out = capsys.readouterr().out
+        assert "pushover failed" in out and "KeyError: '***'" in out and PO_APP not in out
+    finally:
+        root.handlers[:] = before
+        root.setLevel(level)

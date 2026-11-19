@@ -14,8 +14,14 @@ Robustness features (all required for an always-on alerting service):
   large lines are fine (no ``readline`` size limits);
 * detection of "this plan has no filtered-stream access" (HTTP 403) via
   :class:`StreamUnavailable`, so the app can fall back to timeline polling;
-* gap recovery: after reconnecting from an outage of at least ``recovery.min_gap_seconds`` the
+* gap recovery: after reconnecting from an outage of at least ``recovery.min_gap_seconds`` (default 0,
+  i.e. every reconnect; the gap is measured from the last bytes received minus X's ~5 s delivery lag) the
   ``on_reconnect_gap`` callback (timeline polling with ``since_id``) runs in the background.
+  ``on_gap_start`` fires once when an outage begins, so the caller can snapshot its cursors before
+  live posts move them. With ``catch_up_on_first_connect`` the first connection of the process is
+  treated as the end of a gap too (posts made while ceoscan was restarting or deployed);
+* ingest errors (disconnects, HTTP errors) are written to the store's events table through
+  :class:`IngestEventLog`, at most one per kind per minute, so the daily summary counts them.
 
 The bearer token is only ever placed in the request headers; nothing here logs headers,
 tokens or URLs.
@@ -27,6 +33,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,6 +70,14 @@ TOO_MANY_CONNECTIONS_FAST_RETRIES = 3
 MAX_CONSECUTIVE_FORBIDDEN = 3
 #: Error bodies are tiny; never wait long for one.
 ERROR_BODY_TIMEOUT_SECONDS = 5.0
+#: X delivers filtered-stream posts up to ~4-5 s (P99) after they were created, so posts created
+#: shortly before the last bytes we saw may never have arrived. Added to the measured gap.
+STREAM_DELIVERY_MARGIN_SECONDS = 5.0
+#: The heartbeat watchdog re-evaluates its deadline at least this often (the idle limit shrinks
+#: from connect_timeout + heartbeat to heartbeat once the response headers arrive).
+WATCHDOG_MAX_SLEEP_SECONDS = 1.0
+#: Ingest error events (store.events) are written at most once per kind per this many seconds.
+ERROR_EVENT_INTERVAL_SECONDS = 60.0
 _MAX_ERROR_TEXT = 300
 
 BackoffKind = Literal["network", "http", "rate_limit"]
@@ -70,6 +85,52 @@ BackoffKind = Literal["network", "http", "rate_limit"]
 
 class StreamUnavailable(Exception):
     """The app/plan has no filtered-stream access (e.g. HTTP 403 client-not-enrolled)."""
+
+
+# --------------------------------------------------------------------------- error events
+
+
+class IngestEventLog:
+    """Write ingest errors to ``store.log_event`` (the daily summary counts them), throttled.
+
+    At most one event per ``kind`` per ``interval`` seconds is written; repeats in between are
+    counted and mentioned in the next event of that kind ("+N more"). Never raises: bookkeeping
+    must not break ingest. ``detail`` must not contain secrets (callers pass X problem titles /
+    exception summaries only).
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        interval: float = ERROR_EVENT_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.store = store
+        self.interval = float(interval)
+        self._clock = clock
+        self._last: dict[str, float] = {}
+        self._suppressed: dict[str, int] = {}
+
+    def error(self, kind: str, detail: str, level: str = "error") -> bool:
+        """Record one error of ``kind``. Returns True if an event row was written."""
+        if self.store is None:
+            return False
+        now = self._clock()
+        last = self._last.get(kind)
+        if last is not None and now - last < self.interval:
+            self._suppressed[kind] = self._suppressed.get(kind, 0) + 1
+            return False
+        self._last[kind] = now
+        more = self._suppressed.pop(kind, 0)
+        text = " ".join(str(detail).split())[:_MAX_ERROR_TEXT]
+        if more:
+            text += f" (+{more} more since the previous {kind} event)"
+        try:
+            self.store.log_event(kind=kind, detail=text, level=level)
+        except Exception:  # never let bookkeeping break ingest
+            log.debug("could not record a %s event", kind, exc_info=True)
+            return False
+        return True
 
 
 # --------------------------------------------------------------------------- backoff
@@ -335,7 +396,21 @@ class FilteredStream:
         client: XClient | None = None,
         on_reconnect_gap: Callable[[float], Awaitable[None]] | None = None,
         backoff: Backoff | None = None,
+        *,
+        on_gap_start: Callable[[], None] | None = None,
+        on_connected: Callable[[], None] | None = None,
+        catch_up_on_first_connect: bool = False,
+        gap_started_at: datetime | None = None,
+        events: IngestEventLog | None = None,
     ) -> None:
+        """``on_gap_start``: called (synchronously) once when an outage begins - snapshot cursors here.
+        ``on_connected``: called on every successful (HTTP 200) connection.
+        ``catch_up_on_first_connect``: run ``on_reconnect_gap`` after the first connection too
+        (whatever the gap), so posts made while the process was not running are fetched.
+        ``gap_started_at``: when coverage ended before this process started (e.g. a persisted
+        last-alive time); only used to report the startup gap.
+        ``events``: where disconnects / HTTP errors are recorded (``stream_error`` events).
+        """
         if not bearer_token:
             raise ValueError("an X bearer token is required")
         self._session = session
@@ -345,6 +420,10 @@ class FilteredStream:
         self.status = status
         self.client = client
         self.on_reconnect_gap = on_reconnect_gap
+        self.on_gap_start = on_gap_start
+        self.on_connected = on_connected
+        self.catch_up_on_first_connect = catch_up_on_first_connect
+        self.events = events
         self.backoff = backoff or Backoff()
         self.url = stream_url(settings)
         self.params = stream_params(settings)
@@ -360,7 +439,7 @@ class FilteredStream:
         self.posts_received = 0
         # cross-attempt state
         self._ever_connected = False
-        self._gap_started_at: datetime | None = None
+        self._gap_started_at: datetime | None = gap_started_at
         self._forbidden_streak = 0
         self._tmc_streak = 0
         self._background: set[asyncio.Task[None]] = set()
@@ -455,7 +534,9 @@ class FilteredStream:
                 await asyncio.sleep(0.25)
                 continue
             if now < deadline:
-                await asyncio.sleep(max(deadline - now, 0.01))
+                # Capped: _connect_and_read shrinks _idle_limit once the headers arrive, and a
+                # long sleep toward the old (connect + heartbeat) deadline would miss that.
+                await asyncio.sleep(min(max(deadline - now, 0.01), WATCHDOG_MAX_SLEEP_SECONDS))
                 continue
             self._watchdog_fired = True
             reader.cancel()
@@ -564,6 +645,7 @@ class FilteredStream:
     def _on_connected(self) -> None:
         now = now_utc()
         st = self.status
+        first = not self._ever_connected
         if self._ever_connected:
             st.reconnects += 1
         self._ever_connected = True
@@ -578,14 +660,28 @@ class FilteredStream:
         st.connected_since = now
         st.last_heartbeat_at = now
         st.down_since = None
+        if self.on_connected is not None:
+            try:
+                self.on_connected()
+            except Exception:  # a callback bug must not drop the connection
+                log.exception("stream: on_connected callback failed")
         gap_start, self._gap_started_at = self._gap_started_at, None
-        if gap_start is None:
+        startup = first and self.catch_up_on_first_connect
+        if gap_start is None and not startup:
             log.info("stream: connected")
             return
-        gap = max(0.0, (now - gap_start).total_seconds())
-        log.info("stream: connected after %.1fs without coverage", gap)
+        gap = max(0.0, (now - gap_start).total_seconds()) if gap_start is not None else 0.0
+        if startup:
+            log.info(
+                "stream: connected; catching up on posts made while ceoscan was not connected%s",
+                f" ({gap:.0f}s)" if gap_start is not None else "",
+            )
+        else:
+            log.info("stream: connected after %.1fs without coverage", gap)
         rec = self.settings.recovery
-        if self.on_reconnect_gap is not None and rec.enabled and gap >= rec.min_gap_seconds:
+        # Posts created up to X's delivery lag before the last bytes may never have arrived.
+        effective_gap = gap + STREAM_DELIVERY_MARGIN_SECONDS
+        if self.on_reconnect_gap is not None and rec.enabled and (startup or effective_gap >= rec.min_gap_seconds):
             task = asyncio.create_task(self._run_gap_recovery(gap), name="ceoscan-gap-recovery")
             self._background.add(task)
             task.add_done_callback(self._background.discard)
@@ -614,11 +710,18 @@ class FilteredStream:
             st.down_since = now
         if self._gap_started_at is None:
             self._gap_started_at = gap_start
+            if self.on_gap_start is not None:
+                try:  # e.g. snapshot the since_id cursors before live posts can move them
+                    self.on_gap_start()
+                except Exception:
+                    log.exception("stream: on_gap_start callback failed")
         st.connected_since = None
         if st.state == "connected":
             st.state = "reconnecting"
         if error:
             st.last_error = error[:_MAX_ERROR_TEXT]
+            if self.events is not None:
+                self.events.error("stream_error", error)
 
     def _on_network_error(self, exc: BaseException) -> _Retry:
         msg = _describe_exc(exc)
@@ -658,7 +761,10 @@ class FilteredStream:
 
     async def _too_many_connections(self, rate_limit: RateLimitInfo | None) -> _Retry:
         self._tmc_streak += 1
-        reset_at = rate_limit.reset_at if rate_limit else None
+        # Wait for the connect window's reset only when the connect budget is really used up;
+        # with connects left, a stale connection on X's side is the cause - plain backoff.
+        exhausted = rate_limit is not None and rate_limit.remaining is not None and rate_limit.remaining <= 0
+        reset_at = rate_limit.reset_at if exhausted and rate_limit is not None else None
         if self.settings.stream.terminate_stale_connections and self.client is not None:
             log.warning("stream: TooManyConnections; terminating our stale connection(s)")
             self._touch()

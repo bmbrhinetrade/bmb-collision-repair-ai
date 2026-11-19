@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 import anthropic
@@ -25,7 +25,7 @@ from ceoscan.scoring.prompt import (
     build_user_message,
 )
 
-NOW = datetime(2026, 11, 19, 17, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 19, 17, 0, tzinfo=UTC)
 TZ = "America/Los_Angeles"
 MY = ("TSLA", "SPCX", "NVDA")
 ACCOUNT = Account(handle="elonmusk", tickers=("TSLA", "SPCX"), kind="person", expect_name="Elon Musk", user_id="44196397")
@@ -35,6 +35,9 @@ RULES = RuleResult(
     categories=["company", "guidance"],
     tickers=["TSLA"],
     rule_score=5,
+    own_flagged=True,
+    own_categories=["company", "guidance"],
+    own_rule_score=5,
 )
 GOOD_JSON = json.dumps(
     {
@@ -122,7 +125,6 @@ def make_scorer(*steps: Step, **settings: Any) -> tuple[ClaudeScorer, FakeClient
     client = FakeClient(*steps)
     scorer = ClaudeScorer(make_settings(**settings), api_key=None, client=client)  # type: ignore[arg-type]
     scorer.retry_base_delay = 0.0
-    scorer.hard_timeout_slack = 0.0
     return scorer, client
 
 
@@ -142,8 +144,12 @@ def make_post(text: str = "Raising 2026 delivery guidance", **kw: Any) -> Post:
     )
 
 
-async def run(scorer: ClaudeScorer | OfflineScorer, post: Post | None = None):
-    return await scorer.score(post or make_post(), ACCOUNT, RULES, MY, TZ)
+async def run(scorer: ClaudeScorer | OfflineScorer, post: Post | None = None, **kw: Any):
+    return await scorer.score(post or make_post(), ACCOUNT, RULES, MY, TZ, **kw)
+
+
+def without_timeout(call: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in call.items() if k != "timeout"}
 
 
 # --------------------------------------------------------------------------- success
@@ -170,7 +176,7 @@ async def test_request_shape() -> None:
     assert kwargs["model"] == "claude-haiku-5-5"
     assert kwargs["max_tokens"] == 1024
     assert kwargs["system"] == SYSTEM_PROMPT
-    assert kwargs["timeout"] == 4.0
+    assert 3.5 < kwargs["timeout"] <= 4.0  # per-attempt timeout = what is left of the budget
     assert kwargs["output_config"] == {
         "effort": "low",
         "format": {"type": "json_schema", "schema": SCORE_JSON_SCHEMA},
@@ -210,7 +216,7 @@ async def test_refusal_falls_back_without_retry() -> None:
     score = await run(scorer)
     assert score.source == "rules_fallback"
     assert score.error is not None and "refus" in score.error and "general_harms" in score.error
-    assert score.impact == RULES.rule_score
+    assert score.impact == RULES.own_rule_score
     assert score.tickers == ["TSLA"]
     assert score.direction == "unclear"
     assert score.input_tokens == 812  # still billed: tracked for cost
@@ -240,17 +246,18 @@ async def test_no_text_block_falls_back() -> None:
 # --------------------------------------------------------------------------- timeouts and retries
 
 
-async def test_sdk_timeout_retries_then_falls_back() -> None:
+async def test_sdk_timeout_is_never_retried() -> None:
     scorer, client = make_scorer(
         anthropic.APITimeoutError(request=REQUEST),
-        anthropic.APITimeoutError(request=REQUEST),
-        max_retries=1,
+        make_message(),
+        max_retries=3,
         timeout_seconds=4.0,
     )
     score = await run(scorer)
     assert score.source == "rules_fallback"
-    assert score.error == "timeout after 4s"
-    assert len(client.messages.calls) == 2
+    assert score.error is not None and score.error.startswith("timeout after ")
+    assert "budget 4s" in score.error
+    assert len(client.messages.calls) == 1
 
 
 async def test_wall_clock_timeout_guard() -> None:
@@ -258,7 +265,7 @@ async def test_wall_clock_timeout_guard() -> None:
         await asyncio.sleep(10)
         return make_message()
 
-    scorer, client = make_scorer(hang, max_retries=0, timeout_seconds=0.05)
+    scorer, client = make_scorer(hang, max_retries=0, timeout_seconds=0.05, total_budget_seconds=0.05)
     loop = asyncio.get_running_loop()
     t0 = loop.time()
     score = await run(scorer)
@@ -274,19 +281,21 @@ async def test_wall_clock_timeout_guard() -> None:
         status_error(anthropic.RateLimitError, 429),
         status_error(anthropic.InternalServerError, 500),
         status_error(anthropic.InternalServerError, 529),
+        status_error(anthropic.OverloadedError, 529),
         anthropic.APIConnectionError(request=REQUEST),
-        anthropic.APITimeoutError(request=REQUEST),
     ],
-    ids=["429", "500", "529", "connection", "timeout"],
+    ids=["429", "500", "529", "529-overloaded", "connection"],
 )
-async def test_retry_then_success(first_error: BaseException) -> None:
+async def test_fast_failure_is_retried_then_success(first_error: BaseException) -> None:
     scorer, client = make_scorer(first_error, make_message(), max_retries=1)
     score = await run(scorer)
     assert score.source == "claude"
     assert score.error is None
     assert score.impact == 9
     assert len(client.messages.calls) == 2
-    assert client.messages.calls[0] == client.messages.calls[1]  # identical request retried
+    first, second = client.messages.calls
+    assert without_timeout(first) == without_timeout(second)  # identical request retried
+    assert second["timeout"] <= first["timeout"]  # ... with only the time that is left
 
 
 async def test_retries_are_bounded_by_max_retries() -> None:
@@ -398,9 +407,25 @@ async def test_offline_scorer() -> None:
     score = await run(OfflineScorer())
     assert score.source == "offline"
     assert score.error is None
-    assert score.impact == RULES.rule_score
+    assert score.impact == RULES.own_rule_score
     assert score.tickers == ["TSLA"]
+    assert await OfflineScorer().warmup() is None
     await OfflineScorer().aclose()
+
+
+async def test_offline_scorer_applies_the_configured_cap() -> None:
+    big = replace(RULES, rule_score=10, own_rule_score=10)
+    post = make_post()
+    assert (await OfflineScorer().score(post, ACCOUNT, big, MY, TZ)).impact == 7  # default cap
+    assert (await OfflineScorer(make_settings(fallback_max_impact=5)).score(post, ACCOUNT, big, MY, TZ)).impact == 5
+    assert (await OfflineScorer(make_settings(fallback_max_impact=10)).score(post, ACCOUNT, big, MY, TZ)).impact == 10
+
+
+async def test_claude_fallback_applies_the_configured_cap() -> None:
+    big = replace(RULES, rule_score=10, own_rule_score=10)
+    scorer, _ = make_scorer(status_error(anthropic.BadRequestError, 400), fallback_max_impact=6)
+    score = await scorer.score(make_post(), ACCOUNT, big, MY, TZ)
+    assert score.source == "rules_fallback" and score.impact == 6
 
 
 # --------------------------------------------------------------------------- prompt-injection safety
@@ -475,7 +500,11 @@ def test_user_message_context_contents() -> None:
     assert context["account"]["handle"] == "elonmusk"
     assert context["account"]["mapped_tickers"] == ["TSLA", "SPCX"]
     assert context["operator_tickers"] == list(MY)
-    assert context["fast_rule_hints"] == {"categories": ["company", "guidance"], "tickers_detected": ["TSLA"]}
+    assert context["fast_rule_hints"] == {
+        "categories": ["company", "guidance"],
+        "own_text_categories": ["company", "guidance"],
+        "tickers_detected": ["TSLA"],
+    }
     assert context["post_meta"]["kind"] == "quote"
     assert context["post_meta"]["created_at_local"] == "Nov 19, 9:00:00 AM PT"
     # fast-rule reasons can contain post snippets: they must not appear in the trusted context
@@ -512,3 +541,277 @@ def test_system_prompt_security_and_task_requirements() -> None:
         assert f'"{field}"' in SYSTEM_PROMPT
     # constant prompt: no per-request values that would defeat prompt caching
     assert "{" not in SYSTEM_PROMPT and "}" not in SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------------------- total scoring budget (SCOR-2)
+
+
+def hang_for(seconds: float, result: Message | BaseException | None = None) -> Callable[[], Any]:
+    async def step() -> Message:
+        await asyncio.sleep(seconds)
+        if isinstance(result, BaseException):
+            raise result
+        return result if result is not None else make_message()
+
+    return step
+
+
+async def elapsed(coro: Any) -> tuple[Any, float]:
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    result = await coro
+    return result, loop.time() - t0
+
+
+async def test_hanging_api_costs_one_budget_not_one_per_attempt() -> None:
+    # before: 2 attempts x 4 s + backoff = 8.3 s; now one shared budget, no retry after a timeout
+    scorer, client = make_scorer(hang_for(30), hang_for(30), max_retries=3, timeout_seconds=0.3, total_budget_seconds=0.3)
+    score, took = await elapsed(run(scorer))
+    assert score.source == "rules_fallback"
+    assert score.error is not None and score.error.startswith("timeout")
+    assert took < 0.6
+    assert len(client.messages.calls) == 1
+
+
+async def test_budget_caps_total_time_even_with_a_larger_request_timeout() -> None:
+    scorer, client = make_scorer(hang_for(30), timeout_seconds=10.0, total_budget_seconds=0.2)
+    score, took = await elapsed(run(scorer))
+    assert score.source == "rules_fallback" and took < 0.5
+    assert client.messages.calls[0]["timeout"] <= 0.2
+
+
+async def test_fast_failure_retry_gets_only_the_remaining_budget() -> None:
+    scorer, client = make_scorer(
+        status_error(anthropic.InternalServerError, 529), hang_for(30), max_retries=1, total_budget_seconds=0.4
+    )
+    scorer.min_retry_seconds = 0.15
+    score, took = await elapsed(run(scorer))
+    assert len(client.messages.calls) == 2  # 529 came back fast: retried
+    assert score.source == "rules_fallback" and (score.error or "").startswith("timeout")
+    assert took < 0.7  # the retry did not get a fresh budget
+    assert client.messages.calls[1]["timeout"] <= 0.4
+
+
+async def test_no_retry_when_too_little_budget_remains() -> None:
+    # a 529 after 0.2 s of a 0.4 s budget leaves 0.2 s < min_retry_seconds (0.3): fall back now
+    scorer, client = make_scorer(
+        hang_for(0.2, status_error(anthropic.InternalServerError, 529)), make_message(), max_retries=3, total_budget_seconds=0.4
+    )
+    scorer.min_retry_seconds = 0.3
+    score, took = await elapsed(run(scorer))
+    assert len(client.messages.calls) == 1
+    assert score.source == "rules_fallback" and (score.error or "").startswith("HTTP 529")
+    assert took < 0.35
+
+
+async def test_default_min_retry_margin_is_1_5_seconds() -> None:
+    assert ClaudeScorer.min_retry_seconds == 1.5
+
+
+async def test_retry_after_that_fits_is_honored() -> None:
+    scorer, client = make_scorer(
+        status_error(anthropic.RateLimitError, 429, {"retry-after": "0.2"}), make_message(), max_retries=1
+    )
+    score, took = await elapsed(run(scorer))
+    assert score.source == "claude"
+    assert len(client.messages.calls) == 2
+    assert took >= 0.2
+
+
+async def test_retry_after_that_does_not_fit_the_budget_is_not_waited_for() -> None:
+    # 4 s budget - 3 s retry-after = 1 s < 1.5 s: no retry, no waiting
+    scorer, client = make_scorer(
+        status_error(anthropic.RateLimitError, 429, {"retry-after": "3"}), make_message(), max_retries=1
+    )
+    score, took = await elapsed(run(scorer))
+    assert score.source == "rules_fallback"
+    assert "retry-after 3s" in (score.error or "")
+    assert len(client.messages.calls) == 1
+    assert took < 0.5
+
+
+async def test_budget_timeout_is_not_reported_as_a_bug() -> None:
+    scorer, _ = make_scorer(hang_for(30), total_budget_seconds=0.1)
+    score = await run(scorer)
+    assert score.error is not None and "scoring budget 0.1s" in score.error
+
+
+async def test_cancellation_during_budgeted_call_propagates() -> None:
+    started = asyncio.Event()
+
+    async def hang() -> Message:
+        started.set()
+        await asyncio.sleep(10)
+        return make_message()
+
+    scorer, _ = make_scorer(hang, total_budget_seconds=30, timeout_seconds=30)
+    task = asyncio.create_task(run(scorer))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_sdk_client_retries_stay_off() -> None:
+    scorer = ClaudeScorer(make_settings(), api_key="sk-ant-test-key-not-real")
+    assert scorer._client is not None and scorer._client.max_retries == 0
+    await scorer.aclose()
+
+
+# --------------------------------------------------------------------------- rejection tracking (SCOR-8)
+
+
+@pytest.mark.parametrize("status,cls", [(401, anthropic.AuthenticationError), (400, anthropic.BadRequestError), (404, anthropic.NotFoundError)])
+async def test_rejections_are_recorded_and_cleared_on_success(status: int, cls: type[anthropic.APIStatusError]) -> None:
+    scorer, _ = make_scorer(status_error(cls, status), make_message())
+    await run(scorer)
+    assert scorer.last_rejection is not None and scorer.last_rejection.startswith(f"HTTP {status}")
+    assert scorer.last_rejection_at is not None
+    assert (await run(scorer)).source == "claude"
+    assert scorer.last_rejection is None
+
+
+async def test_transient_errors_are_not_rejections() -> None:
+    scorer, _ = make_scorer(status_error(anthropic.InternalServerError, 503), max_retries=0)
+    await run(scorer)
+    assert scorer.last_rejection is None
+
+
+async def test_repeated_rejection_is_logged_once(caplog: pytest.LogCaptureFixture) -> None:
+    errors = [status_error(anthropic.AuthenticationError, 401) for _ in range(3)]
+    scorer, _ = make_scorer(*errors)
+    with caplog.at_level("ERROR", logger="ceoscan.scoring.claude"):
+        for _ in range(3):
+            await run(scorer)
+    assert sum("rejected" in r.getMessage() for r in caplog.records if r.levelname == "ERROR") == 1
+
+
+# --------------------------------------------------------------------------- warm-up (SCOR-8)
+
+
+async def test_warmup_success_sends_a_tiny_real_request() -> None:
+    scorer, client = make_scorer(make_message(stop_reason="max_tokens", text=None), effort="medium", thinking="disabled")
+    assert await scorer.warmup() is None
+    assert scorer.warmup_transient is None
+    (kwargs,) = client.messages.calls
+    assert kwargs["system"] == SYSTEM_PROMPT  # same prompt and schema as real requests
+    assert kwargs["output_config"] == {"effort": "low", "format": {"type": "json_schema", "schema": SCORE_JSON_SCHEMA}}
+    assert kwargs["thinking"] == {"type": "disabled"}  # validated exactly as configured
+    assert kwargs["max_tokens"] == scorer.warmup_max_tokens <= 32
+    assert kwargs["model"] == "claude-haiku-5-5"
+    assert kwargs["timeout"] == scorer.warmup_timeout_seconds
+    assert OPEN_TAG in kwargs["messages"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        status_error(anthropic.AuthenticationError, 401),
+        status_error(anthropic.BadRequestError, 400),
+        status_error(anthropic.NotFoundError, 404),
+        status_error(anthropic.PermissionDeniedError, 403),
+    ],
+    ids=["401", "400", "404", "403"],
+)
+async def test_warmup_reports_configuration_problems(error: anthropic.APIStatusError) -> None:
+    scorer, _ = make_scorer(error, model="claude-opus-5-5", thinking="disabled")
+    message = await scorer.warmup()
+    assert message is not None and message.startswith("Claude rejected the warm-up request")
+    assert f"HTTP {error.status_code}" in message and "claude-opus-5-5" in message
+    assert scorer.warmup_transient is False
+    assert scorer.last_rejection is not None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        status_error(anthropic.InternalServerError, 529),
+        status_error(anthropic.RateLimitError, 429),
+        anthropic.APIConnectionError(request=REQUEST),
+        anthropic.APITimeoutError(request=REQUEST),
+        RuntimeError("boom"),
+    ],
+    ids=["529", "429", "connection", "timeout", "unexpected"],
+)
+async def test_warmup_reports_transient_problems_without_raising(error: BaseException) -> None:
+    scorer, _ = make_scorer(error)
+    message = await scorer.warmup()
+    assert message is not None and message.startswith("Claude warm-up")
+    assert scorer.warmup_transient is True
+
+
+async def test_warmup_hang_is_bounded() -> None:
+    scorer, _ = make_scorer(hang_for(30))
+    scorer.warmup_timeout_seconds = 0.1
+    message, took = await elapsed(scorer.warmup())
+    assert message is not None and "timed out" in message
+    assert took < 0.6
+
+
+async def test_warmup_error_never_contains_the_api_key() -> None:
+    key = "sk-ant-api03-SECRETSECRETSECRET"
+    scorer = ClaudeScorer(make_settings(), api_key=key, client=FakeClient(status_error(anthropic.AuthenticationError, 401)))  # type: ignore[arg-type]
+    message = await scorer.warmup()
+    assert message is not None and key not in message
+
+
+async def test_warmup_without_client_or_disabled() -> None:
+    assert await ClaudeScorer(make_settings(enabled=False), api_key=None).warmup() is None
+    message = await ClaudeScorer(make_settings(), api_key=None).warmup()
+    assert message is not None and "ANTHROPIC_API_KEY" in message
+
+
+async def test_warmup_cancellation_propagates() -> None:
+    started = asyncio.Event()
+
+    async def hang() -> Message:
+        started.set()
+        await asyncio.sleep(10)
+        return make_message()
+
+    scorer, _ = make_scorer(hang)
+    task = asyncio.create_task(scorer.warmup())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+# --------------------------------------------------------------------------- current time in the context
+
+
+def test_context_has_current_time_and_age() -> None:
+    later = datetime(2026, 11, 19, 19, 0, 30, tzinfo=UTC)  # 2 h after the post
+    msg = build_user_message(make_post(), ACCOUNT, RULES, MY, TZ, now=later)
+    meta = json.loads(extract_blocks(msg)[0])["post_meta"]
+    assert meta["created_at_utc"] == "2026-11-19T17:00:00+00:00"
+    assert meta["now_utc"] == "2026-11-19T19:00:30+00:00"
+    assert meta["age_seconds"] == 7230
+
+
+def test_context_time_defaults_to_now() -> None:
+    meta = json.loads(extract_blocks(build_user_message(make_post(), ACCOUNT, RULES, MY, TZ))[0])["post_meta"]
+    now = datetime.fromisoformat(meta["now_utc"])
+    assert abs((datetime.now(UTC) - now).total_seconds()) < 5
+    assert meta["age_seconds"] >= 0
+
+
+def test_context_age_is_never_negative() -> None:
+    earlier = datetime(2026, 11, 19, 16, 59, 0, tzinfo=UTC)  # clock skew
+    meta = json.loads(extract_blocks(build_user_message(make_post(), ACCOUNT, RULES, MY, TZ, now=earlier))[0])["post_meta"]
+    assert meta["age_seconds"] == 0
+
+
+async def test_scorer_passes_now_into_the_prompt() -> None:
+    scorer, client = make_scorer(make_message())
+    later = datetime(2026, 11, 19, 17, 5, tzinfo=UTC)
+    await run(scorer, now=later)
+    meta = json.loads(extract_blocks(client.messages.calls[0]["messages"][0]["content"])[0])["post_meta"]
+    assert meta["now_utc"] == "2026-11-19T17:05:00+00:00" and meta["age_seconds"] == 300
+
+
+def test_system_prompt_explains_time_and_hints() -> None:
+    p = SYSTEM_PROMPT.lower()
+    assert "current time" in p and "relative dates" in p
+    assert "do not lower the score" in p  # late catch-up posts keep their score
+    assert "keyword hints are crude" in p

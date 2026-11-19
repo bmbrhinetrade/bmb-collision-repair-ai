@@ -8,7 +8,14 @@ X pay-per-use pricing (``settings.x_api.pricing``, from docs.x.com, see ``pricin
 
 Post volume comes from ``est_posts_per_day`` in the watchlist (per account and per keyword rule),
 so the estimate is only as good as those numbers. The "worst case" adds charges for expanded
-objects (referenced posts, author users) because X does not document whether those are billed.
+objects because X does not document whether those are billed: the referenced (quoted / replied-to)
+posts, the authors of the watched accounts and keyword-rule matches, and - through the
+``referenced_tweets.id.author_id`` expansion - the author of every referenced post (counted as a
+distinct user each time, which is the conservative assumption).
+
+Claude: every post from a watched account is scored when ``scoring.score_watchlist_unflagged`` is
+true (the default); otherwise only the share the fast rules flag (``flag_rate``). Keyword-rule posts
+always carry one of your cashtags, so the fast rules flag them and they are all scored.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ DAYS_PER_MONTH = 30
 # Worst-case assumptions (X does not document whether expansions are billed).
 REFERENCED_POST_SHARE = 0.5  # share of posts that quote/reply to/repost another post
 KEYWORD_AUTHORS_PER_DAY = 30  # distinct non-watchlist authors per keyword rule per day
+# Every referenced post's author (expansion referenced_tweets.id.author_id) is counted as a distinct user.
 TOP_LINES_SHOWN = 12
 
 
@@ -83,13 +91,22 @@ def estimate_monthly_cost(
     x_monthly = posts_per_month * pricing.post_read
 
     referenced_posts = posts_per_month * REFERENCED_POST_SHARE
-    authors_per_day = len(watchlist.accounts) + KEYWORD_AUTHORS_PER_DAY * len(keyword_rules)
+    referenced_authors_per_day = referenced_posts / DAYS_PER_MONTH
+    authors_per_day = (
+        len(watchlist.accounts) + KEYWORD_AUTHORS_PER_DAY * len(keyword_rules) + referenced_authors_per_day
+    )
     x_worst = x_monthly + referenced_posts * pricing.post_read + authors_per_day * pricing.user_read * DAYS_PER_MONTH
     worst_posts = posts_per_month + referenced_posts
 
     sc = settings.scoring
     per_scored = (avg_input_tokens * sc.pricing.input_per_mtok + avg_output_tokens * sc.pricing.output_per_mtok) / 1e6
-    claude_monthly = posts_per_month * flag_rate * per_scored if sc.enabled else 0.0
+    scored_per_month = 0.0
+    for a in watchlist.accounts:
+        ppm = max(a.est_posts_per_day, 0.0) * DAYS_PER_MONTH
+        everything = sc.score_watchlist_unflagged or (a.always_alert and sc.score_always_alert_unflagged)
+        scored_per_month += ppm if everything else ppm * flag_rate
+    scored_per_month += sum(max(k.est_posts_per_day, 0.0) * DAYS_PER_MONTH for k in keyword_rules)
+    claude_monthly = scored_per_month * per_scored if sc.enabled else 0.0
 
     one_time_verify = len(watchlist.accounts) * pricing.user_read
     cap = int(pricing.monthly_post_cap)
@@ -103,7 +120,8 @@ def estimate_monthly_cost(
         "Streamed and polled posts are billed once per post per UTC day; failed or empty responses are not billed.",
         (
             f"Worst case also bills expanded objects (not documented by X): {REFERENCED_POST_SHARE:.0%} of posts "
-            f"reference another post, plus ~{authors_per_day} author user reads per day."
+            f"reference another post (each one's author counted as a distinct user), "
+            f"~{authors_per_day:,.0f} user reads per day in all."
         ),
     ]
     if poll:
@@ -111,10 +129,15 @@ def estimate_monthly_cost(
             f"Poll mode: {len(watchlist.keyword_rules)} keyword rule(s) need the filtered stream and are not counted."
         )
     if sc.enabled:
+        policy = (
+            "every watched-account post is scored (scoring.score_watchlist_unflagged)"
+            if sc.score_watchlist_unflagged
+            else f"{flag_rate:.0%} of watched-account posts pass the fast rules and are scored"
+        )
         notes.append(
-            f"Claude estimate assumes {flag_rate:.0%} of posts pass the fast rules and are scored by {sc.model} "
-            f"(~{avg_input_tokens} input / {avg_output_tokens} output tokens at ${sc.pricing.input_per_mtok:.2f} / "
-            f"${sc.pricing.output_per_mtok:.2f} per million tokens)."
+            f"Claude estimate: {policy}, keyword-rule posts are all scored; {scored_per_month:,.0f} posts/month "
+            f"by {sc.model} (~{avg_input_tokens} input / {avg_output_tokens} output tokens at "
+            f"${sc.pricing.input_per_mtok:.2f} / ${sc.pricing.output_per_mtok:.2f} per million tokens)."
         )
     else:
         notes.append("Claude scoring is disabled (scoring.enabled=false): no Claude cost.")

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -177,7 +177,7 @@ def test_tag_lines() -> None:
     assert "💬 Quotes @Tesla" in body
     assert "🌙 Quiet hours" in body
     assert "📌 Always-alert account" in body
-    assert "Rules-only score" in body
+    assert "Rules-only score (Claude unavailable)" in body
     assert lines(body)[-1] == post.url  # url stays last
     assert "joke" in msg.tags and "quiet-hours" in msg.tags
 
@@ -226,3 +226,84 @@ def test_format_system_alert_priority() -> None:
     assert format_system_alert("ceoscan started", "mode stream", priority="normal").priority == "normal"
     long = format_system_alert("t", "b" * 1000)
     assert long.sms_text is not None and len(long.sms_text) <= 300
+
+
+# --------------------------------------------------------------------------- rules-only label
+
+
+@pytest.mark.parametrize(
+    ("source", "why"),
+    [("rules_fallback", "Claude unavailable"), ("offline", "Claude scoring not configured"),
+     ("skipped", "not sent to Claude")],
+)
+def test_rules_only_scores_are_labelled(source: str, why: str) -> None:
+    sc = make_score(direction="unclear", impact=7, tickers=["TSLA"], source=source, reason="Fast rules: q3")
+    msg = format_post_alert(make_post(), ELON, sc, DEC, AlertSettings())
+    assert msg.title == "⚪ TSLA 7/10 @elonmusk (rules-only)"
+    assert f"ℹ️ Rules-only score ({why}) - keyword heuristics, not an AI judgment" in lines(msg.body)
+    assert msg.sms_text is not None and msg.sms_text.startswith("@elonmusk TSLA UNCLEAR 7/10 (rules-only): Fast rules")
+    assert "rules-only" in msg.tags
+
+
+def test_claude_score_has_no_rules_only_label() -> None:
+    msg = format_post_alert(make_post(), ELON, make_score(), DEC, AlertSettings())
+    assert "rules-only" not in msg.title and "Rules-only" not in msg.body
+    assert "rules-only" not in (msg.sms_text or "") and "rules-only" not in msg.tags
+
+
+# --------------------------------------------------------------------------- late posts
+
+
+def test_late_post_title_sms_and_body() -> None:
+    post = make_post(received_at=CREATED + timedelta(hours=2, minutes=5))
+    dec = Decision(True, "score 8 >= 7 (late: posted 2h 5m ago)", priority="low")
+    msg = format_post_alert(post, ELON, make_score(tickers=["TSLA"]), dec, AlertSettings())
+    assert msg.title == "Missed during outage - posted 2h 5m ago: 🟢 TSLA +8/10 @elonmusk"
+    assert msg.priority == "low"
+    assert msg.sms_text is not None
+    assert msg.sms_text.startswith("[Missed during outage - posted 2h 5m ago] @elonmusk TSLA BULLISH 8/10: ")
+    assert msg.sms_text.endswith(post.url) and len(msg.sms_text) <= 300
+    body = lines(msg.body)
+    assert "Posted Nov 19, 8:41:07 PM PT" in body
+    assert "⏪ Late: received Nov 19, 10:46:07 PM PT, 2h 5m after it was posted (catch-up)" in body
+    assert body[-1] == post.url
+    assert "late" in msg.tags
+
+
+def test_post_just_within_max_age_is_not_marked_late() -> None:
+    post = make_post(received_at=CREATED + timedelta(seconds=900))
+    msg = format_post_alert(post, ELON, make_score(), DEC, AlertSettings())
+    assert not msg.title.startswith("Missed") and "late" not in msg.tags
+    assert format_post_alert(post, ELON, make_score(), DEC, AlertSettings(max_post_age_seconds=60)).title.startswith(
+        "Missed during outage - posted 15m ago: ")
+
+
+def test_late_rules_only_edited_title_has_every_marker() -> None:
+    post = make_post(received_at=CREATED + timedelta(days=2), edit_history_ids=["1", "1991234567890123456"])
+    sc = make_score(direction="bearish", impact=7, tickers=["TSLA"], source="rules_fallback")
+    msg = format_post_alert(post, ELON, sc, DEC, AlertSettings(), edit_note="was BULLISH, now BEARISH")
+    assert msg.title == "Missed during outage - posted 2d ago: 🔴 TSLA -7/10 @elonmusk (edited, rules-only)"
+    assert (msg.sms_text or "").startswith(
+        "[Missed during outage - posted 2d ago] @elonmusk TSLA BEARISH 7/10 (edited, rules-only): ")
+    assert len(msg.sms_text or "") <= 300
+
+
+# --------------------------------------------------------------------------- edits
+
+
+def test_edit_note_replaces_generic_edited_line() -> None:
+    post = make_post(edit_history_ids=["1991234567890000000", "1991234567890123456"])
+    msg = format_post_alert(post, ELON, make_score(direction="bearish"), DEC, AlertSettings(),
+                            edit_note="was BULLISH, now BEARISH")
+    body = lines(msg.body)
+    assert "✏️ Edited: was BULLISH, now BEARISH" in body
+    assert "✏️ Edited post" not in body
+    assert msg.title.endswith("@elonmusk (edited)") and "edited" in msg.tags
+    assert "(edited)" in (msg.sms_text or "")
+
+
+def test_plain_edit_without_note_keeps_generic_line_and_title() -> None:
+    post = make_post(edit_history_ids=["1991234567890000000", "1991234567890123456"])
+    msg = format_post_alert(post, ELON, make_score(tickers=["TSLA"]), DEC, AlertSettings())
+    assert "✏️ Edited post" in lines(msg.body)
+    assert msg.title == "🟢 TSLA +8/10 @elonmusk"

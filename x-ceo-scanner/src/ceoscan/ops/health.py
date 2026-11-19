@@ -1,12 +1,14 @@
 """HTTP health endpoint: stream status, last post received, today's posts/alerts/latency.
 
 ``GET /health`` (and ``GET /``) return a JSON snapshot. ``GET /health?strict=1`` returns HTTP 503
-when the overall status is "down", so an uptime monitor can page on it.
+when the overall status is "down", so an uptime monitor can page on it. A configuration problem
+(state ``config_error``: the service is idle and sends no post alerts) answers 503 even without
+``strict``, so the Docker healthcheck marks the container unhealthy.
 
 Overall status:
 
-* ``down``     - credits depleted, ingest stopped, or not connected for longer than
-                 ``ops.stream_down_alert_seconds`` (the same threshold as the stream-down alert);
+* ``down``     - configuration problem, credits depleted, ingest stopped, or not connected for longer
+                 than ``ops.stream_down_alert_seconds`` (the same threshold as the stream-down alert);
 * ``degraded`` - reconnecting / backing off / starting, heartbeat stale, or the queue almost full;
 * ``ok``       - connected (stream) or polling, with fresh heartbeats.
 """
@@ -32,6 +34,7 @@ from ..timeutil import format_local, from_ms, local_day_start, now_utc
 logger = logging.getLogger(__name__)
 
 HEALTHY_STATES = frozenset({"connected", "polling"})
+CONFIG_ERROR_STATE = "config_error"
 QUEUE_DEGRADED_FRACTION = 0.9
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -57,6 +60,12 @@ def assess_health(
     state = status.state
     level = "ok"
 
+    if state == CONFIG_ERROR_STATE:
+        detail = status.last_error or "see the log"
+        prefix = "configuration problem: "
+        if detail.lower().startswith(prefix):
+            detail = detail[len(prefix) :]
+        return "down", [f"{prefix}{detail} - fix the configuration and restart ceoscan"]
     if state == "credits_depleted":
         return "down", ["X API credits depleted - add credits at console.x.com"]
     if state == "stopped":
@@ -159,9 +168,13 @@ class HealthServer:
             "flagged": stats.get("flagged", 0),
             "claude_scored": stats.get("claude_scored", 0),
             "alerts": stats.get("alerts", 0),
+            "alerts_late": stats.get("alerts_late", 0),
             "alerts_failed": stats.get("alerts_failed", 0),
+            # live alerts only: late catch-up alerts (missed during an outage) are left out
             "avg_latency_ms": stats.get("avg_latency_ms"),
             "max_latency_ms": stats.get("max_latency_ms"),
+            "score_errors": stats.get("score_errors", 0),
+            "stream_errors": stats.get("stream_errors", 0),
             "errors": stats.get("errors", 0),
         }
 
@@ -173,6 +186,7 @@ class HealthServer:
         overall, reasons = assess_health(st, self.settings, now, self.started_at, queue_size)
         return {
             "status": overall,
+            "state": st.state,  # e.g. "config_error" when the service is idle because of a configuration problem
             "reasons": reasons,
             "mode": st.mode,
             "stream": {
@@ -207,7 +221,8 @@ class HealthServer:
                 {"status": "down", "reasons": ["health snapshot failed"], "version": __version__},
                 status=503 if strict else 500,
             )
-        http_status = 503 if strict and snap["status"] == "down" else 200
+        down = snap["status"] == "down"
+        http_status = 503 if down and (strict or snap.get("state") == CONFIG_ERROR_STATE) else 200
         return web.json_response(
             snap,
             status=http_status,

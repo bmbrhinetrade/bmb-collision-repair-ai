@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     total_latency_ms INTEGER,
     x_delay_ms       INTEGER,
     scoring_ms       INTEGER,
-    push_ms          INTEGER
+    push_ms          INTEGER,
+    late             INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_alerts_post ON alerts(post_id);
@@ -99,6 +100,21 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 """
 
+#: Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` does not touch an existing
+#: table, so databases created by an older version get these with ``ALTER TABLE ... ADD COLUMN`` on open.
+#: Only additive, constant-default columns belong here (safe for SQLite and for older code reading the DB).
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    # (table, column, column definition)
+    ("alerts", "late", "INTEGER NOT NULL DEFAULT 0"),  # post older than alerts.max_post_age_seconds
+)
+
+#: events.kind values written by the X ingest (stream / poller) for connection and API problems
+INGEST_ERROR_KINDS: tuple[str, ...] = ("stream_error", "poll_error")
+
+#: posts.source of posts fetched by gap / restart catch-up: their alerts measure the catch-up, not the
+#: live post -> phone path, so they are left out of the latency statistics
+CATCH_UP_SOURCE = "recovery"
+
 
 class Store:
     """Thin synchronous wrapper around sqlite3.
@@ -121,6 +137,22 @@ class Store:
                 self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.executescript(SCHEMA)
+            self._migrate()
+
+    def _columns(self, table: str) -> set[str]:
+        return {str(r["name"]) for r in self._db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _migrate(self) -> None:
+        """Add columns missing from a database created by an older version (idempotent)."""
+        for table, column, ddl in MIGRATIONS:
+            if column in self._columns(table):
+                continue
+            try:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            except sqlite3.OperationalError:
+                # another process (e.g. a CLI command on the same DB) may have added it meanwhile
+                if column not in self._columns(table):
+                    raise
 
     def close(self) -> None:
         with self._lock:
@@ -209,7 +241,7 @@ class Store:
             cur = self._db.execute(
                 """INSERT INTO alerts (post_id, kind, created_at_ms, decision_reason, score, direction,
                    tickers, title, body, channels, sent_ok, quiet_hours, total_latency_ms, x_delay_ms,
-                   scoring_ms, push_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   scoring_ms, push_ms, late) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rec.post_id,
                     rec.kind,
@@ -227,6 +259,7 @@ class Store:
                     rec.x_delay_ms,
                     rec.scoring_ms,
                     rec.push_ms,
+                    int(bool(rec.late)),
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -237,6 +270,24 @@ class Store:
                 "SELECT 1 FROM alerts WHERE post_id=? AND kind='post' AND sent_ok=1", (post_id,)
             ).fetchone()
         return row is not None
+
+    def last_alert_for_post(self, post_id: str) -> dict[str, Any] | None:
+        """The newest delivered post alert for ``post_id``: score, direction, tickers (list), created_at_ms."""
+        with self._lock:
+            row = self._db.execute(
+                """SELECT score, direction, tickers, created_at_ms, late FROM alerts
+                   WHERE post_id=? AND kind='post' AND sent_ok=1 ORDER BY id DESC LIMIT 1""",
+                (post_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        try:
+            tickers = json.loads(out.get("tickers") or "[]")
+        except ValueError:
+            tickers = []
+        out["tickers"] = [str(t) for t in tickers] if isinstance(tickers, list) else []
+        return out
 
     # ------------------------------------------------------------------ since ids
 
@@ -326,8 +377,19 @@ class Store:
     # ------------------------------------------------------------------ stats
 
     def stats_since(self, since: datetime) -> dict[str, Any]:
-        """Counts for /health and the daily summary. `since` is usually local midnight."""
+        """Counts for /health and the daily summary. `since` is usually local midnight.
+
+        * ``alerts`` counts every delivered post alert; ``alerts_late`` how many of those were late
+          (catch-up after an outage). Late alerts, and alerts for posts fetched by gap / restart catch-up
+          (source ``recovery``), are left out of ``avg_latency_ms`` / ``max_latency_ms``, which measure the
+          live post -> phone path only.
+        * ``score_errors``: posts whose Claude scoring failed (rules-only fallback used), with the newest
+          error text in ``last_score_error``.
+        * ``stream_errors``: X ingest problems (``events.kind`` in :data:`INGEST_ERROR_KINDS`, any level).
+        * ``errors``: events with level 'error'.
+        """
         ms = to_ms(since)
+        kinds = ",".join("?" for _ in INGEST_ERROR_KINDS)
         with self._lock:
             posts = self._db.execute("SELECT COUNT(*) FROM posts WHERE received_at_ms >= ?", (ms,)).fetchone()[0]
             flagged = self._db.execute(
@@ -336,10 +398,16 @@ class Store:
             scored = self._db.execute(
                 "SELECT COUNT(*) FROM posts WHERE received_at_ms >= ? AND score_source='claude'", (ms,)
             ).fetchone()[0]
-            row = self._db.execute(
-                """SELECT COUNT(*), AVG(total_latency_ms), MAX(total_latency_ms) FROM alerts
+            sent, late = self._db.execute(
+                """SELECT COUNT(*), COALESCE(SUM(late), 0) FROM alerts
                    WHERE created_at_ms >= ? AND kind='post' AND sent_ok=1""",
                 (ms,),
+            ).fetchone()
+            latency = self._db.execute(
+                """SELECT AVG(total_latency_ms), MAX(total_latency_ms) FROM alerts
+                   WHERE created_at_ms >= ? AND kind='post' AND sent_ok=1 AND late=0
+                     AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.id = alerts.post_id AND p.source = ?)""",
+                (ms, CATCH_UP_SOURCE),
             ).fetchone()
             failed = self._db.execute(
                 "SELECT COUNT(*) FROM alerts WHERE created_at_ms >= ? AND kind='post' AND sent_ok=0", (ms,)
@@ -347,13 +415,29 @@ class Store:
             errors = self._db.execute(
                 "SELECT COUNT(*) FROM events WHERE ts_ms >= ? AND level='error'", (ms,)
             ).fetchone()[0]
+            score_errors = self._db.execute(
+                "SELECT COUNT(*) FROM posts WHERE received_at_ms >= ? AND score_error IS NOT NULL", (ms,)
+            ).fetchone()[0]
+            last_score_error = self._db.execute(
+                """SELECT score_error FROM posts WHERE received_at_ms >= ? AND score_error IS NOT NULL
+                   ORDER BY scored_at_ms DESC, received_at_ms DESC LIMIT 1""",
+                (ms,),
+            ).fetchone()
+            stream_errors = self._db.execute(
+                f"SELECT COUNT(*) FROM events WHERE ts_ms >= ? AND kind IN ({kinds})",
+                (ms, *INGEST_ERROR_KINDS),
+            ).fetchone()[0]
         return {
             "posts": posts,
             "flagged": flagged,
             "claude_scored": scored,
-            "alerts": row[0],
+            "alerts": sent,
+            "alerts_late": int(late),
             "alerts_failed": failed,
-            "avg_latency_ms": int(row[1]) if row[1] is not None else None,
-            "max_latency_ms": int(row[2]) if row[2] is not None else None,
+            "avg_latency_ms": int(latency[0]) if latency[0] is not None else None,
+            "max_latency_ms": int(latency[1]) if latency[1] is not None else None,
             "errors": errors,
+            "score_errors": score_errors,
+            "last_score_error": last_score_error[0] if last_score_error else None,
+            "stream_errors": stream_errors,
         }

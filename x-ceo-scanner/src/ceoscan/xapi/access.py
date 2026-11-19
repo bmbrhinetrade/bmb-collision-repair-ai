@@ -40,6 +40,9 @@ class AccessReport:
     poll_interval_s: float | None
     est_latency_s: tuple[float, float]
     messages: list[str] = field(default_factory=list)
+    # False when X answered any check with HTTP 401 (bad / revoked bearer token), True when a check got an
+    # authenticated answer, None when nothing answered (network problem)
+    auth_ok: bool | None = None
 
 
 @dataclass
@@ -100,18 +103,21 @@ async def check_access(
     existing_rules: int | None = None
     credits_ok: bool | None = None
     usage: dict | None = None
+    auth_ok: bool | None = None
 
     # 1. stream rules endpoint
     try:
         rules = await client.get_rules()
-        rules_allowed = True
+        rules_allowed = auth_ok = True
         existing_rules = len(rules)
         messages.append(f"stream rules endpoint OK ({existing_rules} existing rules)")
     except NotAuthorized as exc:
         if exc.status == 403:
             rules_allowed = False
+            auth_ok = True if auth_ok is None else auth_ok
             messages.append(f"stream rules endpoint forbidden ({exc})")
         else:
+            auth_ok = False
             messages.append(f"X rejected the bearer token ({exc}); check X_BEARER_TOKEN")
     except XApiError as exc:
         if exc.status == 402:
@@ -123,6 +129,7 @@ async def check_access(
     # 2. usage
     try:
         usage = await client.get_usage()
+        auth_ok = True if auth_ok is None else auth_ok
         used = _as_int(usage.get("project_usage"))
         cap = _as_int(usage.get("project_cap"))
         if used is not None and cap:
@@ -135,6 +142,8 @@ async def check_access(
     except XApiError as exc:
         if exc.status == 402:
             credits_ok = False
+        elif exc.status == 401:
+            auth_ok = False
         messages.append(f"usage check failed: {exc}")
     except (aiohttp.ClientError, OSError, TimeoutError) as exc:
         messages.append(f"usage check failed: {_describe_exc(exc)}")
@@ -162,11 +171,14 @@ async def check_access(
             "connect limit (50 per 15 min) was hit; it will be retried"
         )
     elif probe.status == 401:
+        auth_ok = False
         messages.append(f"filtered stream: X rejected the bearer token ({probe.error})")
     elif probe.status is not None:
         messages.append(f"filtered stream probe: {probe.error}")
     else:
         messages.append(f"filtered stream probe failed: {probe.network_error}")
+    if auth_ok is None and probe.status is not None and probe.status != 401:
+        auth_ok = True  # any other HTTP answer to the probe means X accepted the token
     if stream_available is None and rules_allowed is not None:
         stream_available = rules_allowed
 
@@ -200,6 +212,7 @@ async def check_access(
         poll_interval_s=poll_interval,
         est_latency_s=est_latency,
         messages=messages,
+        auth_ok=auth_ok,
     )
     log.debug("access check: mode=%s stream=%s credits=%s", mode, stream_available, credits_ok)
     return report
@@ -213,6 +226,7 @@ def _yes_no(value: bool | None, yes: str, no: str) -> str:
 
 def format_access_report(r: AccessReport) -> str:
     lines = ["X API access check", f"  mode:             {r.mode}"]
+    lines.append(f"  bearer token:     {_yes_no(r.auth_ok, 'accepted', 'REJECTED (HTTP 401) - check X_BEARER_TOKEN')}")
     lines.append(f"  filtered stream:  {_yes_no(r.stream_available, 'available', 'NOT available')}")
     lines.append(f"  credits:          {_yes_no(r.credits_ok, 'ok', 'DEPLETED - add credits at console.x.com')}")
     if r.usage:

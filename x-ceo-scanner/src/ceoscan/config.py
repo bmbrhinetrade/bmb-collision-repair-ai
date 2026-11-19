@@ -6,15 +6,25 @@
 
 Secrets are exposed only through `Secrets`, whose repr() masks values, so an
 accidental log line of the config never leaks a key.
+
+Both YAML files are validated strictly at load time (unknown keys, wrong types, bad time zones or
+HH:MM times, out-of-range numbers), so a typo fails at startup with a clear ``ConfigError`` naming
+the setting instead of silently breaking alerts later.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
+import difflib
 import os
 import re
-from dataclasses import dataclass, field, fields, is_dataclass
+import sys
+import types
+import typing
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ruamel.yaml import YAML
 
@@ -22,6 +32,8 @@ from .models import Account, KeywordRule, Watchlist
 
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 class ConfigError(ValueError):
@@ -53,7 +65,9 @@ class PollSettings:
 @dataclass
 class RecoverySettings:
     enabled: bool = True  # after a stream gap, poll each account's timeline with since_id
-    min_gap_seconds: float = 20.0
+    # 0 = catch up after every reconnect: a pass is ~1 mostly empty (unbilled) request per account, and
+    # posts in flight on a dropped connection are otherwise lost. The gap includes a 5 s delivery margin.
+    min_gap_seconds: float = 0.0
     max_results: int = 20
     max_pages: int = 5  # follow pagination up to this many pages per account during catch-up
     max_age_seconds: float = 3600.0  # never catch up on posts older than this (cost + noise bound)
@@ -167,6 +181,9 @@ class EmailSettings:
     min_score: int = 7
     send_daily_summary: bool = True
     use_ssl: bool = False  # true -> SMTPS (465); false -> STARTTLS
+    # A full SMTP exchange (connect, STARTTLS, AUTH, DATA) can take several seconds; email has its own,
+    # longer budget so a slow but successful send is not reported as failed. Push latency is unaffected.
+    timeout_seconds: float = 20.0
 
 
 @dataclass
@@ -215,23 +232,79 @@ class Settings:
     ops: OpsSettings = field(default_factory=OpsSettings)
 
 
+def _did_you_mean(key: Any, allowed: typing.Iterable[str]) -> str:
+    match = difflib.get_close_matches(str(key).replace("-", "_"), list(allowed), n=1, cutoff=0.6)
+    return f" (did you mean {match[0]}?)" if match else ""
+
+
+def _type_name(value: Any) -> str:
+    return "nothing" if value is None else type(value).__name__
+
+
+def _coerce(value: Any, hint: Any, path: str) -> Any:
+    """Check a YAML scalar against a dataclass field's type; ints are accepted for floats."""
+    origin = typing.get_origin(hint)
+    if origin in (typing.Union, types.UnionType):
+        args = typing.get_args(hint)
+        if value is None and type(None) in args:
+            return None
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return _coerce(value, non_none[0], path)
+        return value
+    if origin is list:
+        (item_hint,) = typing.get_args(hint) or (Any,)
+        if not isinstance(value, list):
+            raise ConfigError(f"{path} must be a list, e.g. [a, b] (got {value!r})")
+        return [_coerce(v, item_hint, f"{path}[{i}]") for i, v in enumerate(value)]
+    if hint is bool:
+        if not isinstance(value, bool):
+            raise ConfigError(f"{path} must be true or false (got {value!r})")
+        return value
+    if hint is int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"{path} must be a whole number (got {_type_name(value)} {value!r})")
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ConfigError(f"{path} must be a whole number (got {value!r})")
+            return int(value)
+        return value
+    if hint is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"{path} must be a number (got {_type_name(value)} {value!r})")
+        return float(value)
+    if hint is str:
+        if isinstance(value, _dt.date):  # an unquoted date such as checked: 2026-11-19
+            return value.isoformat()
+        if not isinstance(value, str):
+            raise ConfigError(f"{path} must be a text value; put it in quotes (got {_type_name(value)} {value!r})")
+        return value
+    return value
+
+
 def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
-    """Build a (nested) dataclass from a dict, rejecting unknown keys with a clear error."""
-    data = dict(data or {})
+    """Build a (nested) dataclass from a dict, rejecting unknown keys and wrong types with a clear error."""
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} must be a mapping of settings (got {_type_name(data)} {data!r})")
+    data = dict(data)
     kwargs: dict[str, Any] = {}
     known = {f.name: f for f in fields(cls)}
-    unknown = set(data) - set(known)
+    hints = typing.get_type_hints(cls)
+    unknown = [k for k in data if k not in known]
     if unknown:
-        raise ConfigError(f"unknown setting(s) at {path}: {', '.join(sorted(unknown))}")
+        details = ", ".join(f"{k}{_did_you_mean(k, known)}" for k in sorted(map(str, unknown)))
+        raise ConfigError(f"unknown setting(s) at {path}: {details}")
     for name, f in known.items():
         if name not in data:
             continue
         value = data[name]
-        default_obj = f.default_factory() if callable(f.default_factory) else None  # type: ignore[misc]
+        default_obj = f.default_factory() if f.default_factory is not MISSING else None
         if default_obj is not None and is_dataclass(default_obj):
             kwargs[name] = _build(type(default_obj), value, f"{path}.{name}")
         else:
-            kwargs[name] = value
+            kwargs[name] = _coerce(value, hints.get(name, Any), f"{path}.{name}")
     return cls(**kwargs)
 
 
@@ -249,6 +322,15 @@ def _apply_env_overrides(settings: Settings) -> None:
             setattr(getattr(settings, section), attr, value.strip())
 
 
+def fallback_settings() -> Settings:
+    """Built-in defaults plus the environment overrides (used when settings.yaml itself is broken)."""
+    settings = Settings()
+    _apply_env_overrides(settings)
+    if settings.ops.config_error_action not in ("exit", "wait"):
+        settings.ops.config_error_action = "exit"
+    return settings
+
+
 def load_settings(path: str | Path) -> Settings:
     p = Path(path)
     if p.exists():
@@ -261,69 +343,248 @@ def load_settings(path: str | Path) -> Settings:
     return settings
 
 
+# Models on which thinking cannot be turned off: {"type": "disabled"} is a 400 at every effort level
+# (Claude Opus 5.5, Claude Sonnet 5.5, every Fable / Mythos model). Others (e.g. claude-haiku-5-5,
+# claude-opus-5) accept it at effort low/medium/high only, which the effort check covers.
+_THINKING_ALWAYS_ON_PREFIXES = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-", "claude-mythos-")
+
+
+def _thinking_always_on(model: str | None) -> bool:
+    name = (model or "").strip().lower()
+    return any(name.startswith(prefix) for prefix in _THINKING_ALWAYS_ON_PREFIXES)
+
+
+def _check_hhmm(value: Any, path: str, problems: list[str]) -> None:
+    if not isinstance(value, str) or not HHMM_RE.match(value.strip()):
+        problems.append(f'{path} must be a 24-hour time "HH:MM" in quotes, e.g. "22:00" (got {value!r})')
+
+
+def _check_timezone(value: Any, path: str, problems: list[str]) -> None:
+    if not isinstance(value, str) or not value.strip():
+        problems.append(f"{path} must be an IANA time zone name such as America/Los_Angeles (got {value!r})")
+        return
+    try:
+        ZoneInfo(value.strip())
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        problems.append(f"{path}: unknown time zone {value!r} (use an IANA name such as America/Los_Angeles)")
+
+
+def _settings_problems(s: Settings) -> list[str]:
+    """Every problem in the (already type-checked) settings, as human-readable lines."""
+    p: list[str] = []
+
+    def one_of(value: Any, allowed: tuple[str, ...], path: str, env: str | None = None) -> None:
+        if value not in allowed:
+            src = f" (from the environment variable {env})" if env and os.environ.get(env, "").strip() else ""
+            p.append(f"{path} must be {', '.join(allowed[:-1])} or {allowed[-1]} (got {value!r}){src}")
+
+    def at_least(value: float, low: float, path: str) -> None:
+        if value < low:
+            p.append(f"{path} must be >= {low:g} (got {value!r})")
+
+    def positive(value: float, path: str) -> None:
+        if not value > 0:
+            p.append(f"{path} must be > 0 (got {value!r})")
+
+    def between(value: float, low: float, high: float, path: str) -> None:
+        if not low <= value <= high:
+            p.append(f"{path} must be {low:g}-{high:g} (got {value!r})")
+
+    x, sc, al, ops = s.x_api, s.scoring, s.alerts, s.ops
+    one_of(x.mode, ("auto", "stream", "poll"), "x_api.mode")
+    if not re.match(r"^https?://\S+$", x.base_url or ""):
+        p.append(f"x_api.base_url must start with https:// (got {x.base_url!r})")
+    positive(x.stream.heartbeat_timeout_seconds, "x_api.stream.heartbeat_timeout_seconds")
+    between(x.stream.backfill_minutes, 0, 5, "x_api.stream.backfill_minutes")
+    positive(x.stream.connect_timeout_seconds, "x_api.stream.connect_timeout_seconds")
+    positive(x.stream.credits_depleted_retry_seconds, "x_api.stream.credits_depleted_retry_seconds")
+    at_least(x.poll.max_requests_per_15min, 1, "x_api.poll.max_requests_per_15min")
+    if not 0 < x.poll.utilization <= 1:
+        p.append(f"x_api.poll.utilization must be > 0 and <= 1 (got {x.poll.utilization!r})")
+    positive(x.poll.min_interval_seconds, "x_api.poll.min_interval_seconds")
+    at_least(x.poll.concurrency, 1, "x_api.poll.concurrency")
+    between(x.poll.max_results, 5, 100, "x_api.poll.max_results")
+    at_least(x.recovery.min_gap_seconds, 0, "x_api.recovery.min_gap_seconds")
+    between(x.recovery.max_results, 5, 100, "x_api.recovery.max_results")
+    at_least(x.recovery.max_pages, 1, "x_api.recovery.max_pages")
+    positive(x.recovery.max_age_seconds, "x_api.recovery.max_age_seconds")
+    at_least(x.rules.max_rules, 1, "x_api.rules.max_rules")
+    at_least(x.rules.max_rule_length, 64, "x_api.rules.max_rule_length")
+    if not re.match(r"^[A-Za-z0-9_-]{1,32}$", x.rules.tag_prefix or ""):
+        p.append(f"x_api.rules.tag_prefix must be 1-32 letters, digits, '_' or '-' (got {x.rules.tag_prefix!r})")
+    for name in ("post_read", "user_read"):
+        at_least(getattr(x.pricing, name), 0, f"x_api.pricing.{name}")
+    at_least(x.pricing.monthly_post_cap, 0, "x_api.pricing.monthly_post_cap")
+    for name, items in (("tweet_fields", x.tweet_fields), ("expansions", x.expansions), ("user_fields", x.user_fields)):
+        if any(not item.strip() or "," in item for item in items):
+            p.append(f"x_api.{name} must be a list of single field names (no empty entries or commas)")
+
+    if not (sc.model or "").strip():
+        p.append("scoring.model must not be empty")
+    one_of(sc.effort, ("low", "medium", "high", "xhigh", "max"), "scoring.effort")
+    one_of(sc.thinking, ("adaptive", "disabled"), "scoring.thinking")
+    if sc.thinking == "disabled" and _thinking_always_on(sc.model):
+        p.append(
+            f"scoring.thinking=disabled is rejected by {sc.model.strip()} at every effort (HTTP 400); "
+            "use thinking: adaptive with effort: low"
+        )
+    elif sc.thinking == "disabled" and sc.effort in ("xhigh", "max"):
+        p.append("scoring.thinking=disabled requires effort low/medium/high")
+    for name in ("threshold", "quiet_hours_threshold", "joke_threshold", "fallback_max_impact"):
+        between(getattr(sc, name), 1, 10, f"scoring.{name}")
+    positive(sc.timeout_seconds, "scoring.timeout_seconds")
+    positive(sc.total_budget_seconds, "scoring.total_budget_seconds")
+    at_least(sc.max_retries, 0, "scoring.max_retries")
+    at_least(sc.max_tokens, 16, "scoring.max_tokens")
+    at_least(sc.pricing.input_per_mtok, 0, "scoring.pricing.input_per_mtok")
+    at_least(sc.pricing.output_per_mtok, 0, "scoring.pricing.output_per_mtok")
+
+    _check_timezone(al.timezone, "alerts.timezone", p)
+    at_least(al.snippet_chars, 20, "alerts.snippet_chars")
+    one_of(al.push, ("ntfy", "pushover", "both", "none"), "alerts.push")
+    _check_hhmm(al.quiet_hours.start, "alerts.quiet_hours.start", p)
+    _check_hhmm(al.quiet_hours.end, "alerts.quiet_hours.end", p)
+    if not re.match(r"^https?://\S+$", al.ntfy.server or ""):
+        p.append(f"alerts.ntfy.server must start with https:// (got {al.ntfy.server!r})")
+    between(al.pushover.high_priority_min_score, 1, 11, "alerts.pushover.high_priority_min_score")
+    between(al.sms.min_score, 1, 11, "alerts.sms.min_score")
+    between(al.email.min_score, 1, 11, "alerts.email.min_score")
+    positive(al.email.timeout_seconds, "alerts.email.timeout_seconds")
+    positive(al.send_timeout_seconds, "alerts.send_timeout_seconds")
+    positive(al.max_post_age_seconds, "alerts.max_post_age_seconds")
+
+    if not (ops.health_host or "").strip():
+        p.append("ops.health_host must not be empty (127.0.0.1 = this machine only, 0.0.0.0 = every interface)")
+    between(ops.health_port, 0, 65535, "ops.health_port")
+    if not (ops.db_path or "").strip():
+        p.append("ops.db_path must not be empty")
+    if str(ops.log_level).upper() not in LOG_LEVELS:
+        p.append(f"ops.log_level must be one of {', '.join(LOG_LEVELS)} (got {ops.log_level!r})")
+    positive(ops.stream_down_alert_seconds, "ops.stream_down_alert_seconds")
+    _check_hhmm(ops.daily_summary.time, "ops.daily_summary.time", p)
+    at_least(ops.pipeline_workers, 1, "ops.pipeline_workers")
+    at_least(ops.queue_max, 0, "ops.queue_max")
+    one_of(ops.config_error_action, ("exit", "wait"), "ops.config_error_action", env="CEOSCAN_CONFIG_ERROR_ACTION")
+    return p
+
+
 def _validate_settings(s: Settings) -> None:
-    if s.x_api.mode not in ("auto", "stream", "poll"):
-        raise ConfigError("x_api.mode must be auto, stream or poll")
-    if s.alerts.push not in ("ntfy", "pushover", "both", "none"):
-        raise ConfigError("alerts.push must be ntfy, pushover, both or none")
-    if s.scoring.effort not in ("low", "medium", "high", "xhigh", "max"):
-        raise ConfigError("scoring.effort must be low, medium, high, xhigh or max")
-    if s.scoring.thinking not in ("adaptive", "disabled"):
-        raise ConfigError("scoring.thinking must be adaptive or disabled")
-    if s.scoring.thinking == "disabled" and s.scoring.effort in ("xhigh", "max"):
-        raise ConfigError("scoring.thinking=disabled requires effort low/medium/high")
-    for name in ("threshold", "quiet_hours_threshold", "joke_threshold"):
-        v = getattr(s.scoring, name)
-        if not 1 <= int(v) <= 10:
-            raise ConfigError(f"scoring.{name} must be 1-10")
-    if not 5 <= s.x_api.poll.max_results <= 100:
-        raise ConfigError("x_api.poll.max_results must be 5-100")
-    if not 0 <= s.x_api.stream.backfill_minutes <= 5:
-        raise ConfigError("x_api.stream.backfill_minutes must be 0-5")
-    if s.ops.config_error_action not in ("exit", "wait"):
-        raise ConfigError("ops.config_error_action must be exit or wait")
-    if not 1 <= int(s.scoring.fallback_max_impact) <= 10:
-        raise ConfigError("scoring.fallback_max_impact must be 1-10")
-    if s.scoring.total_budget_seconds <= 0:
-        raise ConfigError("scoring.total_budget_seconds must be > 0")
+    problems = _settings_problems(s)
+    if len(problems) == 1:
+        raise ConfigError(problems[0])
+    if problems:
+        raise ConfigError("invalid settings:\n  - " + "\n  - ".join(problems))
 
 
 # --------------------------------------------------------------------------- watchlist
 
 
-def _norm_ticker(t: Any) -> str:
+def _norm_ticker(t: Any, path: str = "ticker") -> str:
+    if isinstance(t, bool) or not isinstance(t, (str, int)):
+        raise ConfigError(f"{path}: invalid ticker {t!r}")
     t = str(t).strip().upper().lstrip("$")
     if not TICKER_RE.match(t):
-        raise ConfigError(f"invalid ticker {t!r}")
+        raise ConfigError(f"{path}: invalid ticker {t!r}")
     return t
 
 
+WATCHLIST_KEYS = ("ticker_groups", "my_tickers", "accounts", "keyword_rules", "company_names")
+ACCOUNT_KEYS = (
+    "handle",
+    "kind",
+    "expect_name",
+    "tickers",
+    "always_alert",
+    "include_replies",
+    "include_retweets",
+    "est_posts_per_day",
+    "user_id",
+    "notes",
+)
+KEYWORD_RULE_KEYS = ("name", "tickers", "min_followers", "extra_operators", "est_posts_per_day")
+
+
+def _check_keys(item: Any, allowed: tuple[str, ...], path: str) -> dict[str, Any]:
+    """``item`` must be a mapping whose keys are all in ``allowed``."""
+    if not isinstance(item, dict):
+        raise ConfigError(f"{path} must be a mapping (key: value lines), got {_type_name(item)} {item!r}")
+    unknown = [k for k in item if k not in allowed]
+    if unknown:
+        details = ", ".join(f"{k}{_did_you_mean(k, allowed)}" for k in map(str, unknown))
+        raise ConfigError(f"unknown key(s) at {path}: {details}. Allowed keys: {', '.join(allowed)}")
+    return item
+
+
+def _as_list(value: Any, path: str, example: str) -> list[Any]:
+    """A YAML list (None -> []). A scalar is refused: iterating "TSLA" would give T, S, L, A."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise ConfigError(f"{path} must be a list, e.g. {example} (got {_type_name(value)} {value!r})")
+
+
+def _wl_bool(item: dict[str, Any], key: str, default: bool, path: str) -> bool:
+    value = item.get(key, default)
+    if not isinstance(value, bool):  # bool("false") would be True
+        raise ConfigError(f"{path}.{key} must be true or false (got {value!r})")
+    return value
+
+
+def _wl_number(item: dict[str, Any], key: str, default: float, path: str) -> float:
+    value = item.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ConfigError(f"{path}.{key} must be a number >= 0 (got {value!r})")
+    return float(value)
+
+
+def _wl_text(item: dict[str, Any], key: str, path: str) -> str | None:
+    value = item.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ConfigError(f"{path}.{key} must be text (got {_type_name(value)} {value!r})")
+    return str(value)
+
+
 def load_watchlist(path: str | Path) -> Watchlist:
-    raw = YAML(typ="safe").load(Path(path).read_text(encoding="utf-8")) or {}
+    raw = YAML(typ="safe").load(Path(path).read_text(encoding="utf-8"))
+    if raw is None:
+        raw = {}
+    _check_keys(raw, WATCHLIST_KEYS, "the watchlist (top level)")
 
     # Named ticker groups, e.g. big_tech: [AAPL, MSFT, ...]; referenced as "@big_tech".
+    raw_groups = raw.get("ticker_groups") or {}
+    if not isinstance(raw_groups, dict):
+        raise ConfigError(f"ticker_groups must be a mapping, e.g. big_tech: [AAPL, MSFT] (got {raw_groups!r})")
     groups: dict[str, list[str]] = {
-        str(k): [_norm_ticker(t) for t in v or []] for k, v in (raw.get("ticker_groups") or {}).items()
+        str(k): [_norm_ticker(t, f"ticker_groups.{k}") for t in _as_list(v, f"ticker_groups.{k}", "[AAPL, MSFT]")]
+        for k, v in raw_groups.items()
     }
 
-    def expand(items: list[Any] | None) -> tuple[str, ...]:
+    def expand(items: Any, where: str) -> tuple[str, ...]:
         out: list[str] = []
-        for it in items or []:
-            s = str(it).strip()
-            if s.startswith("@"):
+        for it in _as_list(items, where, "[TSLA] or [TSLA, \"@big_tech\"]"):
+            s = str(it).strip() if isinstance(it, str) else it
+            if isinstance(s, str) and s.startswith("@"):
                 if s[1:] not in groups:
-                    raise ConfigError(f"unknown ticker group {s!r}")
+                    known = ", ".join(f"@{g}" for g in groups) or "none defined"
+                    raise ConfigError(f"{where}: unknown ticker group {s!r} (ticker_groups: {known})")
                 out.extend(groups[s[1:]])
             else:
-                out.append(_norm_ticker(s))
+                out.append(_norm_ticker(s, where))
         return tuple(dict.fromkeys(out))
 
     accounts: list[Account] = []
     seen: set[str] = set()
-    for i, a in enumerate(raw.get("accounts") or []):
-        handle = str(a.get("handle", "")).strip().lstrip("@")
+    for i, a in enumerate(_as_list(raw.get("accounts"), "accounts", "[{handle: elonmusk, tickers: [TSLA]}]")):
+        where = f"accounts[{i}]"
+        if isinstance(a, dict) and a.get("handle") is not None:
+            where = f"accounts[{i}] (@{str(a.get('handle')).strip().lstrip('@')})"
+        a = _check_keys(a, ACCOUNT_KEYS, where)
+        handle = str(a.get("handle", "") or "").strip().lstrip("@")
         if not HANDLE_RE.match(handle):
-            raise ConfigError(f"accounts[{i}]: invalid handle {handle!r}")
+            raise ConfigError(f"{where}: invalid or missing handle {handle!r}")
         if handle.lower() in seen:
             raise ConfigError(f"duplicate handle {handle!r} in watchlist")
         seen.add(handle.lower())
@@ -338,33 +599,43 @@ def load_watchlist(path: str | Path) -> Watchlist:
         accounts.append(
             Account(
                 handle=handle,
-                tickers=expand(a.get("tickers")),
+                tickers=expand(a.get("tickers"), f"{where}.tickers"),
                 kind=kind,
-                expect_name=a.get("expect_name"),
+                expect_name=_wl_text(a, "expect_name", where),
                 user_id=user_id or None,
-                always_alert=bool(a.get("always_alert", False)),
-                include_replies=bool(a.get("include_replies", True)),
-                include_retweets=bool(a.get("include_retweets", False)),
-                est_posts_per_day=float(a.get("est_posts_per_day", 3.0)),
-                notes=str(a.get("notes", "") or ""),
+                always_alert=_wl_bool(a, "always_alert", False, where),
+                include_replies=_wl_bool(a, "include_replies", True, where),
+                include_retweets=_wl_bool(a, "include_retweets", False, where),
+                est_posts_per_day=_wl_number(a, "est_posts_per_day", 3.0, where),
+                notes=_wl_text(a, "notes", where) or "",
             )
         )
     resolved_accounts = accounts
 
     kw_rules: list[KeywordRule] = []
-    for i, k in enumerate(raw.get("keyword_rules") or []):
+    for i, k in enumerate(_as_list(raw.get("keyword_rules"), "keyword_rules", "[{name: big-accounts, tickers: all}]")):
+        where = f"keyword_rules[{i}]"
+        k = _check_keys(k, KEYWORD_RULE_KEYS, where)
         tickers_cfg = k.get("tickers", "all")
+        min_followers = k.get("min_followers", 1_000_000)
+        if isinstance(min_followers, bool) or not isinstance(min_followers, int) or min_followers < 0:
+            raise ConfigError(f"{where}.min_followers must be a whole number >= 0 (got {min_followers!r})")
+        extra = k.get("extra_operators", "-is:retweet -is:reply")
+        if extra is None:
+            extra = ""
+        if not isinstance(extra, str):
+            raise ConfigError(f"{where}.extra_operators must be text (got {extra!r})")
         kw_rules.append(
             KeywordRule(
                 name=str(k.get("name") or f"keywords-{i}"),
-                tickers=("__ALL__",) if tickers_cfg == "all" else expand(tickers_cfg),
-                min_followers=int(k.get("min_followers", 1_000_000)),
-                extra_operators=str(k.get("extra_operators", "-is:retweet -is:reply")),
-                est_posts_per_day=float(k.get("est_posts_per_day", 50.0)),
+                tickers=("__ALL__",) if tickers_cfg == "all" else expand(tickers_cfg, f"{where}.tickers"),
+                min_followers=min_followers,
+                extra_operators=extra,
+                est_posts_per_day=_wl_number(k, "est_posts_per_day", 50.0, where),
             )
         )
 
-    my = list(expand(raw.get("my_tickers") or []))
+    my = list(expand(raw.get("my_tickers"), "my_tickers"))
     for a in resolved_accounts:
         my.extend(a.tickers)
     for k in kw_rules:
@@ -379,10 +650,16 @@ def load_watchlist(path: str | Path) -> Watchlist:
         for k in kw_rules
     ]
 
-    company_names = {
-        _norm_ticker(t): tuple(str(n) for n in names or [])
-        for t, names in (raw.get("company_names") or {}).items()
-    }
+    raw_names = raw.get("company_names") or {}
+    if not isinstance(raw_names, dict):
+        raise ConfigError(f"company_names must be a mapping, e.g. TSLA: [Tesla] (got {raw_names!r})")
+    company_names: dict[str, tuple[str, ...]] = {}
+    for t, names in raw_names.items():
+        where = f"company_names.{t}"
+        items = _as_list(names, where, "[Tesla, \"Model Y\"]")
+        if any(not isinstance(n, (str, int)) or isinstance(n, bool) or not str(n).strip() for n in items):
+            raise ConfigError(f"{where} must be a list of names (text)")
+        company_names[_norm_ticker(t, where)] = tuple(str(n) for n in items)
     return Watchlist(
         accounts=tuple(resolved_accounts),
         keyword_rules=tuple(kw_rules),
@@ -395,13 +672,25 @@ def load_watchlist(path: str | Path) -> Watchlist:
 
 
 def load_dotenv_if_present(path: str | Path = ".env") -> None:
-    """Load KEY=VALUE pairs from .env without overriding real environment variables."""
+    """Load KEY=VALUE pairs from .env without overriding real environment variables.
+
+    An unreadable .env is not fatal: under systemd, ``EnvironmentFile=`` (read by PID 1 as root)
+    has usually provided the variables already. A one-line warning naming only the path goes to
+    stderr (logging is not set up yet); if a required secret really is missing, the normal
+    "X_BEARER_TOKEN is not set" check reports it.
+    """
     try:
         from dotenv import load_dotenv
     except ImportError:  # pragma: no cover - dependency is in requirements
         return
-    if Path(path).exists():
-        load_dotenv(path, override=False)
+    p = Path(path)
+    try:
+        if not p.exists():
+            return
+        load_dotenv(p, override=False)
+    except (OSError, UnicodeDecodeError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+        print(f"warning: cannot read {p} ({reason}); using the existing environment", file=sys.stderr)
 
 
 SECRET_ENV_VARS = (

@@ -35,6 +35,7 @@ USERS_BY_BATCH = 100  # GET /2/users/by accepts at most 100 usernames per reques
 _MAX_DETAIL_CHARS = 500
 
 # Endpoint path templates (also the keys of XClient.last_rate_limits).
+EP_USERS = "/2/users"
 EP_USERS_BY = "/2/users/by"
 EP_USER_TWEETS = "/2/users/:id/tweets"
 EP_STREAM_RULES = "/2/tweets/search/stream/rules"
@@ -355,6 +356,25 @@ class XClient:
             errors.extend(e for e in body.get("errors") or [] if isinstance(e, dict))
         return users, errors
 
+    async def lookup_users_by_ids(self, ids: list[str], user_fields: list[str]) -> tuple[list[dict], list[dict]]:
+        """GET /2/users?ids=... in batches of 100. Returns (users, errors).
+
+        Used by ``verify`` to follow a pinned user_id whose handle no longer resolves (renamed account).
+        Ids that are gone or suspended come back in ``errors``. Non-numeric ids are skipped.
+        """
+        unique = list(dict.fromkeys(str(i).strip() for i in ids if str(i).strip().isdigit()))
+        users: list[dict] = []
+        errors: list[dict] = []
+        fields = _csv(user_fields)
+        for i in range(0, len(unique), USERS_BY_BATCH):
+            params = {"ids": ",".join(unique[i : i + USERS_BY_BATCH])}
+            if fields:
+                params["user.fields"] = fields
+            body = await self._request("GET", EP_USERS, EP_USERS, params=params)
+            users.extend(d for d in body.get("data") or [] if isinstance(d, dict))
+            errors.extend(e for e in body.get("errors") or [] if isinstance(e, dict))
+        return users, errors
+
     # ------------------------------------------------------------------ stream rules
 
     async def get_rules(self) -> list[dict]:
@@ -427,9 +447,12 @@ class XClient:
         tweet_fields: list[str],
         expansions: list[str],
         user_fields: list[str],
+        pagination_token: str | None = None,
     ) -> dict:
         """GET /2/users/:id/tweets. Returns the full JSON (data newest-first, includes, meta).
 
+        ``meta.next_token`` is set when more posts match than ``max_results``; pass it back as
+        ``pagination_token`` (with the same ``since_id``) to get the next, older page.
         Updates ``last_rate_limits["/2/users/:id/tweets"]``.
         """
         uid = str(user_id).strip()
@@ -438,6 +461,8 @@ class XClient:
         params: dict[str, str] = {"max_results": str(max(5, min(100, int(max_results))))}
         if since_id:
             params["since_id"] = str(since_id)
+        if pagination_token:
+            params["pagination_token"] = str(pagination_token)
         for key, values in (
             ("exclude", exclude),
             ("tweet.fields", tweet_fields),

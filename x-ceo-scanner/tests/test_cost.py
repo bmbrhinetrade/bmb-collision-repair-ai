@@ -28,10 +28,11 @@ def test_stream_cost_math(wl: Watchlist) -> None:
     # 30 days * (10 + 2 + 60) posts/day
     assert est.posts_per_month == pytest.approx(2160)
     assert est.x_monthly == pytest.approx(2160 * 0.005)  # $10.80
-    # worst case: + 50% referenced posts * post_read + (2 accounts + 30 keyword authors) * user_read * 30
-    assert est.x_worst_case_monthly == pytest.approx(10.80 + 1080 * 0.005 + 32 * 0.010 * 30)  # $25.80
-    # Claude: posts * flag_rate * (900 * $0.10 + 300 * $0.50) / 1e6
-    assert est.claude_monthly == pytest.approx(2160 * 0.5 * (900 * 0.10 + 300 * 0.50) / 1e6)
+    # worst case: + 50% referenced posts * post_read
+    #   + (2 accounts + 30 keyword authors + 36 referenced authors per day) * user_read * 30   (REQ-12)
+    assert est.x_worst_case_monthly == pytest.approx(10.80 + 1080 * 0.005 + (32 + 1080 / 30) * 0.010 * 30)  # $36.60
+    # Claude: every watched-account post and every keyword-rule post is scored by default
+    assert est.claude_monthly == pytest.approx(2160 * (900 * 0.10 + 300 * 0.50) / 1e6)
     assert est.one_time_verify == pytest.approx(2 * 0.010)
     assert est.cap_ok is True
     assert est.mode == "stream"
@@ -48,7 +49,7 @@ def test_poll_mode_excludes_keyword_rules(wl: Watchlist) -> None:
     assert est.mode == "poll"
     assert est.posts_per_month == pytest.approx(360)
     assert est.x_monthly == pytest.approx(1.80)
-    assert est.x_worst_case_monthly == pytest.approx(1.80 + 180 * 0.005 + 2 * 0.010 * 30)
+    assert est.x_worst_case_monthly == pytest.approx(1.80 + 180 * 0.005 + (2 + 180 / 30) * 0.010 * 30)
     assert all(not label.startswith("keyword") for label, _, _ in est.lines)
     assert any("keyword rule" in n and "not counted" in n for n in est.notes)
 
@@ -111,7 +112,7 @@ def test_format_cost_estimate(wl: Watchlist) -> None:
     text = format_cost_estimate(estimate_monthly_cost(wl, Settings()))
     assert text.splitlines()[0] == "Estimated monthly cost (stream mode)"
     assert "$10.80 / month" in text  # X post reads
-    assert "$25.80 / month" in text  # worst case
+    assert "$36.60 / month" in text  # worst case
     assert "2,160 / month (within the 3,000,000 monthly cap)" in text
     assert "$0.005 per post read, $0.010 per user read" in text
     assert "est_posts_per_day from the watchlist" in text
@@ -126,3 +127,30 @@ def test_format_truncates_long_source_list() -> None:
     accounts = tuple(Account(f"acct{i}", ("TSLA",), est_posts_per_day=i + 1) for i in range(20))
     text = format_cost_estimate(estimate_monthly_cost(_watchlist(*accounts), Settings()))
     assert "... 8 more:" in text
+
+
+def test_worst_case_counts_referenced_post_authors() -> None:
+    """REQ-12: the referenced_tweets.id.author_id expansion returns each parent post's author."""
+    wl = _watchlist(Account("elonmusk", ("TSLA",), est_posts_per_day=100))
+    est = estimate_monthly_cost(wl, Settings(), mode="poll")
+    referenced = 3000 * 0.5
+    expected_users_per_day = 1 + referenced / 30  # the account itself + 50 parent-post authors a day
+    assert est.x_worst_case_monthly == pytest.approx(15.0 + referenced * 0.005 + expected_users_per_day * 0.010 * 30)
+    assert any("each one's author counted as a distinct user" in n and "~51 user reads per day" in n for n in est.notes)
+
+
+def test_claude_estimate_follows_scoring_policy(wl: Watchlist) -> None:
+    per = (900 * 0.10 + 300 * 0.50) / 1e6
+    s = Settings()
+    assert s.scoring.score_watchlist_unflagged is True
+    est = estimate_monthly_cost(wl, s, flag_rate=0.25)
+    assert est.claude_monthly == pytest.approx(2160 * per)  # flag_rate does not matter: all are scored
+    assert any("every watched-account post is scored" in n for n in est.notes)
+
+    s.scoring.score_watchlist_unflagged = False  # flagged-only: watched accounts at flag_rate
+    est = estimate_monthly_cost(wl, s, flag_rate=0.25)
+    assert est.claude_monthly == pytest.approx((360 * 0.25 + 1800) * per)
+    assert any("25% of watched-account posts pass the fast rules" in n for n in est.notes)
+
+    always = _watchlist(Account("ceo", ("TSLA",), est_posts_per_day=10, always_alert=True))
+    assert estimate_monthly_cost(always, s, flag_rate=0.25).claude_monthly == pytest.approx(300 * per)

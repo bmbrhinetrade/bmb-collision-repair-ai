@@ -3,6 +3,12 @@
 `ClaudeScorer.score` never raises: on any failure (timeout, rate limit, refusal, truncated
 or unparseable output, missing key) it returns `fallback_score(...)` built from the fast
 rules, with `error` set, so an outage at Anthropic can delay nothing but the score quality.
+All attempts for one post share one time budget (``scoring.total_budget_seconds``), so a slow
+or hanging API costs at most that long before the rules-only score is used.
+
+Rules-only scores are deliberately conservative: they are based on the author's own words and
+capped at ``scoring.fallback_max_impact`` (default 7 = the alert threshold), so keywords alone
+never produce an "urgent" alert, an SMS, or a quiet-hours wake-up.
 """
 
 from __future__ import annotations
@@ -13,12 +19,14 @@ import logging
 import math
 import re
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import anthropic
 
 from ..config import ScoringSettings
 from ..models import Account, Direction, Post, RuleResult, Score, ScoreSource
+from ..timeutil import now_utc
 from .prompt import SCORE_JSON_SCHEMA, SYSTEM_PROMPT, build_user_message
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -168,23 +176,68 @@ def parse_score_response(text: str, my_tickers: tuple[str, ...] = ()) -> Score:
 
 # --------------------------------------------------------------------------- fallback
 
+#: scoring.fallback_max_impact default; callers should pass the configured value
+DEFAULT_FALLBACK_MAX_IMPACT: int = ScoringSettings().fallback_max_impact
+
+
+def fallback_impact(rules: RuleResult, max_impact: int = DEFAULT_FALLBACK_MAX_IMPACT) -> int:
+    """Rules-only impact (1..max_impact), driven by the author's OWN words.
+
+    The own-text score is the base. Quoted / parent / reposted context may lift it by half of
+    what it adds (rounded up), and never past ``max_impact``: "lol" quoting an earnings recap
+    (context 10, own 0) gives 5, a fact-heavy own post keeps its score. With the default cap of 7
+    (= the alert threshold) a rules-only score can still alert in the daytime as "high", but never
+    reaches "urgent", SMS, quiet hours or Pushover's high priority.
+    """
+    cap = max(1, min(10, int(max_impact)))
+    own = max(0, int(rules.own_rule_score)) if rules.own_flagged else 0
+    context = max(own, int(rules.rule_score))
+    lifted = own + math.ceil((context - own) / 2)
+    return max(1, min(cap, lifted))
+
+
+def _fallback_tickers(rules: RuleResult, account: Account | None) -> list[str]:
+    """Tickers for a rules-only score.
+
+    Explicit $cashtags / tickers as detected. When the rules only matched company-name aliases
+    and the author is a watched account, the aliases that belong to the account come first
+    (@elonmusk "Starship ..." -> SPCX); if none does ("Gemini" in an @elonmusk post), the
+    account's mapped tickers come first, so a common-word alias cannot replace them.
+    """
+    rule_tickers = list(rules.tickers)
+    acct = list(account.tickers) if account is not None else []
+    if not rule_tickers:
+        return acct
+    if not acct or "ticker" in rules.categories:
+        return rule_tickers
+    shared = [t for t in rule_tickers if t in acct]
+    if shared:
+        return shared + [t for t in rule_tickers if t not in shared]
+    return acct + [t for t in rule_tickers if t not in acct]
+
 
 def fallback_score(
     rules: RuleResult,
     account: Account | None,
     error: str | None,
     source: ScoreSource = "rules_fallback",
+    max_impact: int | None = None,
 ) -> Score:
-    """Score derived from the fast rules only (Claude unavailable, disabled, or failed)."""
-    tickers = list(rules.tickers) or (list(account.tickers) if account else [])
+    """Score derived from the fast rules only (Claude unavailable, disabled, failed, or skipped).
+
+    ``max_impact`` is ``scoring.fallback_max_impact`` (default 7); see `fallback_impact`.
+    """
+    cap = DEFAULT_FALLBACK_MAX_IMPACT if max_impact is None else int(max_impact)
     if rules.reasons:
-        reason = "Fast rules: " + "; ".join(rules.reasons[:5])
+        context_only = rules.flagged and not rules.own_flagged
+        prefix = "Fast rules (quoted/parent post only): " if context_only else "Fast rules: "
+        reason = prefix + "; ".join(rules.reasons[:5])
     else:
         reason = "Fast rules: no market keywords matched"
     return Score(
-        tickers=tickers,
+        tickers=_fallback_tickers(rules, account),
         direction="unclear",
-        impact=max(1, min(10, int(rules.rule_score))),
+        impact=fallback_impact(rules, cap),
         reason=clean_reason(reason),
         is_joke=False,
         source=source,
@@ -235,15 +288,33 @@ def _retry_after_seconds(exc: anthropic.APIStatusError) -> float | None:
         return None
 
 
+#: HTTP statuses that mean "this request will never work as configured" (key, billing, model,
+#: parameters). Retrying is pointless; the operator has to fix settings or the account.
+REJECTED_STATUSES: frozenset[int] = frozenset({400, 401, 402, 403, 404, 413, 422})
+
+
 class ClaudeScorer:
-    """Scores posts with Claude (structured JSON output); falls back to fast-rule scores."""
+    """Scores posts with Claude (structured JSON output); falls back to fast-rule scores.
+
+    Latency: one post gets ``scoring.total_budget_seconds`` (default 4 s) for ALL attempts
+    together, enforced with ``asyncio.timeout``. Each attempt's SDK timeout is the time that is
+    left. A timeout is never retried (the next attempt would hit the same wall). A fast failure
+    (429, 5xx / 529 overloaded, connection error) is retried, at most ``scoring.max_retries``
+    times, only if at least `min_retry_seconds` would remain after the backoff and the server's
+    ``retry-after`` fits in the budget. The SDK's own retries are off (``max_retries=0``).
+    """
 
     #: base delay between retries (doubles per attempt); class attributes so tests can zero them
     retry_base_delay: float = 0.25
-    #: never wait longer than this before a retry - an alert that is late is worth less
+    #: cap for the exponential backoff (a server retry-after may ask for more if the budget allows)
     retry_max_delay: float = 1.0
-    #: extra wall-clock allowance on top of the SDK timeout before we abandon an attempt
-    hard_timeout_slack: float = 0.5
+    #: retry only if at least this much of the budget is left after the backoff
+    min_retry_seconds: float = 1.5
+    #: the startup warm-up is not latency-critical: TLS + a possible schema compile
+    warmup_timeout_seconds: float = 15.0
+    warmup_max_tokens: int = 16
+    #: how often the same "request rejected" error is logged at ERROR level (it repeats per post)
+    rejection_log_interval: float = 3600.0
 
     def __init__(
         self,
@@ -260,8 +331,18 @@ class ClaudeScorer:
             )
             self._owns_client = True
         self._client = client
+        #: last non-retryable rejection (HTTP 400/401/403/404, billing ...), None after a success.
+        #: Lets the app raise a (throttled) system alert: keys and billing can fail after startup.
+        self.last_rejection: str | None = None
+        self.last_rejection_at: float | None = None  # time.monotonic()
+        #: set by warmup(): True when its error is transient (timeout, 429, 5xx, network)
+        self.warmup_transient: bool | None = None
+        self._rejection_logged: tuple[str, float] | None = None
+
+    # ------------------------------------------------------------------ request building
 
     def _request_kwargs(self, user_message: str) -> dict[str, Any]:
+        """Messages API arguments, without ``timeout`` (set per attempt from the remaining budget)."""
         s = self.settings
         kwargs: dict[str, Any] = {
             "model": s.model,
@@ -272,12 +353,13 @@ class ClaudeScorer:
                 "effort": s.effort,
                 "format": {"type": "json_schema", "schema": SCORE_JSON_SCHEMA},
             },
-            "timeout": s.timeout_seconds,
         }
         # No temperature/top_p/top_k: rejected by current models / API version.
         if s.thinking == "disabled":
             kwargs["thinking"] = {"type": "disabled"}
         return kwargs
+
+    # ------------------------------------------------------------------ scoring
 
     async def score(
         self,
@@ -286,8 +368,12 @@ class ClaudeScorer:
         rules: RuleResult,
         my_tickers: tuple[str, ...],
         tz: str,
+        now: datetime | None = None,
     ) -> Score:
-        """Score one post. Never raises (except for task cancellation)."""
+        """Score one post. Never raises (except for task cancellation).
+
+        ``now`` (default: the current time) is shown to Claude so it can judge staleness.
+        """
         started = time.perf_counter()
 
         if not self.settings.enabled:
@@ -296,75 +382,100 @@ class ClaudeScorer:
             return self._fallback(post, rules, account, "Claude unavailable: no ANTHROPIC_API_KEY configured", started)
 
         try:
-            kwargs = self._request_kwargs(build_user_message(post, account, rules, my_tickers, tz))
+            kwargs = self._request_kwargs(build_user_message(post, account, rules, my_tickers, tz, now=now))
         except Exception as exc:  # never raise from score(): e.g. malformed post data
             return self._fallback(post, rules, account, f"could not build prompt: {type(exc).__name__}", started)
 
-        attempts = max(0, int(self.settings.max_retries)) + 1
-        hard_timeout = float(self.settings.timeout_seconds) + self.hard_timeout_slack
-        timeout_text = f"timeout after {self.settings.timeout_seconds:g}s"
-        response: Any = None
-        last_error = "unknown error"
-        for attempt in range(attempts):
-            retryable = False
-            status_exc: anthropic.APIStatusError | None = None
-            try:
-                response = await asyncio.wait_for(self._client.messages.create(**kwargs), timeout=hard_timeout)
-                break
-            # Most specific first: APITimeoutError subclasses APIConnectionError, and
-            # RateLimitError / InternalServerError subclass APIStatusError.
-            except anthropic.APITimeoutError:
-                last_error, retryable = timeout_text, True
-            except TimeoutError:  # our wall-clock guard around the SDK call
-                last_error, retryable = timeout_text, True
-            except anthropic.RateLimitError as exc:
-                status_exc = exc
-                last_error, retryable = _status_error_text(exc), True
-            except anthropic.InternalServerError as exc:  # >= 500, incl. 529 overloaded
-                status_exc = exc
-                last_error, retryable = _status_error_text(exc), True
-            except anthropic.APIStatusError as exc:  # other statuses: bad request, auth, billing ...
-                status_exc = exc
-                last_error = _status_error_text(exc)
-                retryable = exc.status_code >= 500 or exc.status_code in (408, 409)
-                if exc.status_code in (400, 401, 403, 404):
-                    logger.error("claude request rejected (%s); check scoring settings and API key", last_error)
-            except anthropic.APIConnectionError:
-                last_error, retryable = "connection error", True
-            except anthropic.AnthropicError as exc:  # e.g. response validation errors
-                last_error = f"anthropic error: {type(exc).__name__}"
-            except Exception as exc:  # last resort: score() must never raise
-                logger.exception("unexpected error calling Claude for post %s", post.id)
-                last_error = f"unexpected error: {type(exc).__name__}"
-
-            delay = min(self.retry_base_delay * (2**attempt), self.retry_max_delay)
-            if status_exc is not None:
-                header = _should_retry_header(status_exc)
-                if header is not None:
-                    retryable = header
-                retry_after = _retry_after_seconds(status_exc)
-                if retryable and retry_after is not None:
-                    if retry_after > self.retry_max_delay:
-                        retryable = False
-                        last_error += f" (retry-after {retry_after:g}s)"
-                    else:
-                        delay = max(delay, retry_after)
-            if not retryable or attempt + 1 >= attempts:
-                return self._fallback(post, rules, account, last_error, started)
-            logger.info(
-                "claude attempt %d/%d for post %s failed (%s); retrying in %.2fs",
-                attempt + 1,
-                attempts,
-                post.id,
-                last_error,
-                delay,
-            )
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-        if response is None:  # pragma: no cover - the loop always breaks or returns
-            return self._fallback(post, rules, account, last_error, started)
+        response, error = await self._call_within_budget(kwargs, post.id, started)
+        if response is None:
+            return self._fallback(post, rules, account, error, started)
         return self._score_from_response(response, post, rules, account, my_tickers, started)
+
+    async def _call_within_budget(self, kwargs: dict[str, Any], post_id: str, started: float) -> tuple[Any, str]:
+        """(response, "") on success, (None, error text) otherwise. Never raises except cancellation."""
+        assert self._client is not None
+        s = self.settings
+        budget = max(0.05, float(s.total_budget_seconds))
+        per_request = max(0.05, float(s.timeout_seconds))
+        attempts = max(0, int(s.max_retries)) + 1
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget
+
+        def timeout_text() -> str:
+            return f"timeout after {time.perf_counter() - started:.1f}s (scoring budget {budget:g}s)"
+
+        last_error = "unknown error"
+        try:
+            async with asyncio.timeout_at(deadline):
+                for attempt in range(attempts):
+                    attempt_timeout = max(0.05, min(per_request, deadline - loop.time()))
+                    status_exc: anthropic.APIStatusError | None = None
+                    retryable = False
+                    try:
+                        response = await self._client.messages.create(**kwargs, timeout=attempt_timeout)
+                        self.last_rejection = None
+                        return response, ""
+                    # Most specific first: APITimeoutError subclasses APIConnectionError, and
+                    # RateLimitError / InternalServerError subclass APIStatusError.
+                    except anthropic.APITimeoutError:
+                        return None, timeout_text()  # never retry after a timeout
+                    except anthropic.RateLimitError as exc:
+                        status_exc = exc
+                        last_error, retryable = _status_error_text(exc), True
+                    except anthropic.InternalServerError as exc:  # >= 500, incl. 529 overloaded
+                        status_exc = exc
+                        last_error, retryable = _status_error_text(exc), True
+                    except anthropic.APIStatusError as exc:  # other statuses: bad request, auth, billing ...
+                        status_exc = exc
+                        last_error = _status_error_text(exc)
+                        retryable = exc.status_code >= 500 or exc.status_code in (408, 409)
+                        if exc.status_code in REJECTED_STATUSES:
+                            self._note_rejection(last_error)
+                    except anthropic.APIConnectionError:
+                        last_error, retryable = "connection error", True
+                    except anthropic.AnthropicError as exc:  # e.g. response validation errors
+                        last_error = f"anthropic error: {type(exc).__name__}"
+                    except Exception as exc:  # last resort: score() must never raise
+                        logger.exception("unexpected error calling Claude for post %s", post_id)
+                        last_error = f"unexpected error: {type(exc).__name__}"
+
+                    delay = min(self.retry_base_delay * (2**attempt), self.retry_max_delay)
+                    if status_exc is not None:
+                        header = _should_retry_header(status_exc)
+                        if header is not None:
+                            retryable = header
+                        retry_after = _retry_after_seconds(status_exc)
+                        if retryable and retry_after is not None:
+                            if deadline - loop.time() - retry_after < self.min_retry_seconds:
+                                return None, last_error + f" (retry-after {retry_after:g}s)"
+                            delay = max(delay, retry_after)
+                    if not retryable or attempt + 1 >= attempts:
+                        return None, last_error
+                    remaining = deadline - loop.time() - delay
+                    if remaining < self.min_retry_seconds:
+                        return None, last_error  # a retry could not finish within the budget
+                    logger.info(
+                        "claude attempt %d/%d for post %s failed (%s); retrying in %.2fs (%.1fs of budget left)",
+                        attempt + 1,
+                        attempts,
+                        post_id,
+                        last_error,
+                        delay,
+                        remaining,
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+        except TimeoutError:  # the overall budget expired (raised by asyncio.timeout_at)
+            return None, timeout_text()
+        return None, last_error  # pragma: no cover - the loop always returns
+
+    def _note_rejection(self, error: str) -> None:
+        now = time.monotonic()
+        self.last_rejection, self.last_rejection_at = error, now
+        prev = self._rejection_logged
+        if prev is None or prev[0] != error or now - prev[1] >= self.rejection_log_interval:
+            self._rejection_logged = (error, now)
+            logger.error("claude request rejected (%s); check scoring settings, API key and billing", error)
 
     def _fallback(
         self,
@@ -376,7 +487,7 @@ class ClaudeScorer:
         usage: Any = None,
         log: bool = True,
     ) -> Score:
-        fb = fallback_score(rules, account, error)
+        fb = fallback_score(rules, account, error, max_impact=self.settings.fallback_max_impact)
         fb.latency_ms = int((time.perf_counter() - started) * 1000)
         if usage is not None:  # refusals / truncations are still billed
             fb.input_tokens = getattr(usage, "input_tokens", None)
@@ -431,6 +542,78 @@ class ClaudeScorer:
         )
         return score
 
+    # ------------------------------------------------------------------ startup check
+
+    async def warmup(self) -> str | None:
+        """Send one tiny scoring request at startup: validates key, model and request parameters
+        (e.g. ``thinking: disabled`` on a model that rejects it) and warms TLS and the
+        structured-output schema cache, so the first real post does not pay for them.
+
+        Same system prompt, schema and thinking setting as real requests, a synthetic post,
+        ``max_tokens`` = `warmup_max_tokens` and effort "low" (well under $0.001).
+
+        Returns None on success (or when scoring is disabled), else a one-line error that never
+        contains the API key. Errors starting with "Claude rejected" are configuration problems
+        (bad key / model / parameters / billing); for transient ones (timeout, 429, 5xx, network)
+        `warmup_transient` is True. Never raises, except for task cancellation.
+        """
+        self.warmup_transient = None
+        if not self.settings.enabled:
+            return None
+        if self._client is None:
+            self.warmup_transient = False
+            return "Claude unavailable: no ANTHROPIC_API_KEY configured"
+        started = time.perf_counter()
+        try:
+            now = now_utc()
+            post = Post(
+                id="0",
+                text="Warm-up check: Example Corp ships a minor software update for its mobile app.",
+                author_id="0",
+                created_at=now,
+                received_at=now,
+                source="replay",
+                author_username="example_corp",
+                author_name="Example Corp",
+            )
+            kwargs = self._request_kwargs(build_user_message(post, None, RuleResult(flagged=False), (), "UTC", now=now))
+            kwargs["max_tokens"] = self.warmup_max_tokens
+            kwargs["output_config"] = {**kwargs["output_config"], "effort": "low"}
+            async with asyncio.timeout(self.warmup_timeout_seconds):  # hard wall over the SDK's timeouts
+                response = await self._client.messages.create(**kwargs, timeout=self.warmup_timeout_seconds)
+        except (TimeoutError, anthropic.APITimeoutError):
+            self.warmup_transient = True
+            return f"Claude warm-up timed out after {time.perf_counter() - started:.1f}s"
+        except anthropic.APIStatusError as exc:
+            text = _status_error_text(exc)
+            if exc.status_code in REJECTED_STATUSES:
+                self.warmup_transient = False
+                self._note_rejection(text)
+                return (
+                    f"Claude rejected the warm-up request ({text}); check ANTHROPIC_API_KEY, "
+                    f"scoring.model ({self.settings.model}), scoring.thinking and billing"
+                )
+            self.warmup_transient = True
+            return f"Claude warm-up failed ({text})"
+        except anthropic.APIConnectionError:
+            self.warmup_transient = True
+            return "Claude warm-up failed (connection error)"
+        except anthropic.AnthropicError as exc:
+            self.warmup_transient = True
+            return f"Claude warm-up failed (anthropic error: {type(exc).__name__})"
+        except Exception as exc:  # never raise from warmup()
+            logger.debug("unexpected error in Claude warm-up", exc_info=True)
+            self.warmup_transient = True
+            return f"Claude warm-up failed (unexpected error: {type(exc).__name__})"
+        self.last_rejection = None
+        logger.info(
+            "Claude warm-up ok: %s answered in %d ms (stop_reason=%s)",
+            getattr(response, "model", None) or self.settings.model,
+            int((time.perf_counter() - started) * 1000),
+            getattr(response, "stop_reason", None),
+        )
+        return None
+
     async def aclose(self) -> None:
         """Close the HTTP client if this scorer created it."""
         if self._client is not None and self._owns_client:
@@ -453,10 +636,16 @@ class OfflineScorer:
         rules: RuleResult,
         my_tickers: tuple[str, ...],
         tz: str,
+        now: datetime | None = None,
     ) -> Score:
-        sc = fallback_score(rules, account, None, source="offline")
+        cap = self.settings.fallback_max_impact if self.settings is not None else None
+        sc = fallback_score(rules, account, None, source="offline", max_impact=cap)
         sc.latency_ms = 0
         return sc
+
+    async def warmup(self) -> str | None:
+        """Nothing to check or warm up."""
+        return None
 
     async def aclose(self) -> None:
         return None

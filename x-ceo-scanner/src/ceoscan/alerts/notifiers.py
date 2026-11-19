@@ -233,7 +233,10 @@ class PushoverNotifier:
 
     def priority(self, msg: AlertMessage, score: int | None = None) -> int:
         """-1/0/0/1 for low/normal/high/urgent. Priority 1 (bypasses the phone's quiet hours) only for
-        urgent messages; for post alerts with a known score, only at ``high_priority_min_score``+."""
+        urgent messages; for post alerts with a known score, only at ``high_priority_min_score``+.
+        Late ("Missed during outage") post alerts are never priority 1."""
+        if msg.kind == "post" and "late" in msg.tags:
+            return -1 if msg.priority == "low" else 0
         if msg.kind == "post" and score is not None:
             if score >= self.settings.high_priority_min_score:
                 return 1

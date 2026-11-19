@@ -1,12 +1,18 @@
 # systemd unit for ceoscan (alternative to Docker Compose). ALERTS ONLY: never trades.
 #
-# Install (see README, "Deploy with systemd"):
-#   sudo cp /opt/x-ceo-scanner/deploy/ceoscan.service /etc/systemd/system/ceoscan.service
+# Install (see README, "Option B: systemd"). The paths below assume the project folder (the one
+# with README.md, src/ and config/) is /opt/x-ceo-scanner. If it lives elsewhere - for example
+# /opt/ceoscan-src/x-ceo-scanner when ceoscan is a subfolder of a bigger repository - rewrite them
+# while installing:
+#   APP=/opt/ceoscan-src/x-ceo-scanner
+#   sed "s#/opt/x-ceo-scanner#$APP#g" "$APP/deploy/ceoscan.service" | sudo tee /etc/systemd/system/ceoscan.service >/dev/null
 #   sudo systemctl daemon-reload && sudo systemctl enable --now ceoscan
 #   journalctl -u ceoscan -f
 #
-# Expects: system user "ceoscan"; the project at /opt/x-ceo-scanner with a Python 3.12 venv in
-# .venv; .env readable by ceoscan (root:ceoscan, mode 640); data/ and config/ owned by ceoscan.
+# Expects: system user "ceoscan"; the project folder with a Python 3.12 venv in .venv; .env
+# readable by ceoscan (root:ceoscan, mode 640); data/ and config/ owned by ceoscan.
+# The health server binds to 127.0.0.1 (ops.health_host default); ops.config_error_action stays
+# "exit", so a configuration problem sends one alert and exits with code 2 (not restarted).
 
 [Unit]
 Description=ceoscan - real-time X CEO post scanner (alerts only)
@@ -27,8 +33,9 @@ ExecStart=/opt/x-ceo-scanner/.venv/bin/python -m ceoscan run
 
 Restart=always
 RestartSec=5
-# Exit code 2 = configuration problem (e.g. X_BEARER_TOKEN missing, no verified accounts):
-# do not restart-loop on it; fix the config, then `systemctl restart ceoscan`.
+# Exit code 2 = configuration problem (e.g. X_BEARER_TOKEN missing, no verified accounts, a typo in
+# a YAML file; ceoscan alerts once first): do not restart-loop on it; fix the config, then
+# `systemctl restart ceoscan`.
 RestartPreventExitStatus=2
 # Graceful shutdown budget (same as docker-compose stop_grace_period).
 TimeoutStopSec=20

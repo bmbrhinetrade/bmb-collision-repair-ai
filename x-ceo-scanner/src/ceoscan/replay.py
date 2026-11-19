@@ -10,6 +10,9 @@ alerts are always marked ``[REPLAY]`` so they cannot be mistaken for live posts.
 With ``rebase_times`` (default) each sample's post id is rewritten to a fresh snowflake for
 "now - x_delay_seconds" right before it is processed, so the measured latency is meaningful.
 The same original id always maps to the same new id, so duplicate samples still dedupe.
+A sample may carry a top-level ``"replay_age_seconds": 7200`` to be rebased that far in the past
+instead, which replays an outage catch-up (a late post: low-key "Missed during outage" alert).
+Late alerts are reported separately and left out of the replay's latency summary, like in /health.
 """
 
 from __future__ import annotations
@@ -25,11 +28,11 @@ from typing import Any
 
 import aiohttp
 
-from .http import new_session
 from .alerts.decision import is_quiet_hours
 from .alerts.dispatcher import AlertDispatcher, build_dispatcher
 from .alerts.notifiers import ConsoleNotifier
 from .config import AppConfig
+from .http import new_session
 from .models import AlertMessage, AlertRecord, ChannelResult, IngestItem, IngestStatus
 from .pipeline import HandleResult, Pipeline, Scorer
 from .scoring.claude import ClaudeScorer, OfflineScorer
@@ -41,6 +44,8 @@ logger = logging.getLogger(__name__)
 COMMENT_PREFIX = "//"
 REPLAY_TAG = "[REPLAY]"
 REPLAY_NOTE = "(replay of a saved sample - not a live post)"
+#: optional top-level sample key: rebase the post this many seconds before it is "received"
+AGE_KEY = "replay_age_seconds"
 
 
 # --------------------------------------------------------------------------- samples
@@ -86,21 +91,30 @@ class TimeRebaser:
     def __init__(self) -> None:
         self.mapping: dict[str, str] = {}
         self._last = 0
+        self._used: set[int] = set()
 
-    def _new_id(self, created_at: datetime) -> str:
-        sf = max(datetime_to_snowflake(created_at), self._last + 1)  # strictly increasing: keeps order
-        self._last = sf
+    def _new_id(self, created_at: datetime, in_order: bool = True) -> str:
+        if in_order:
+            sf = max(datetime_to_snowflake(created_at), self._last + 1)  # strictly increasing: keeps order
+            self._last = sf
+        else:  # back-dated (e.g. a replayed outage catch-up): exact time, only avoid collisions
+            sf = datetime_to_snowflake(created_at)
+            while sf in self._used:
+                sf += 1
+        self._used.add(sf)
         return str(sf)
 
     def _map(self, value: Any) -> Any:
         old = _id_of(value)
         return self.mapping.get(old, value) if old is not None else value
 
-    def rebase(self, payload: dict, created_at: datetime) -> dict:
+    def rebase(self, payload: dict, created_at: datetime, *, in_order: bool = True) -> dict:
         """Return a copy of ``payload`` whose data.id is a snowflake for ``created_at``.
 
         Ids that refer to already-rebased samples (edit history, conversation, referenced posts and
         their includes) are rewritten with the same mapping so joins and edit detection keep working.
+        New ids are strictly increasing in sample order unless ``in_order`` is false (back-dated
+        samples keep their exact creation time).
         """
         out = copy.deepcopy(payload)
         data = out.get("data")
@@ -110,7 +124,7 @@ class TimeRebaser:
         if old is None:
             return out
         if old not in self.mapping:
-            self.mapping[old] = self._new_id(created_at)
+            self.mapping[old] = self._new_id(created_at, in_order)
         new = self.mapping[old]
         data["id"] = new
         if "created_at" in data:
@@ -195,6 +209,8 @@ def format_replay_line(index: int, res: HandleResult) -> str:
         rec = res.alert
         prio = res.decision.priority if res.decision is not None else ""
         state = "ALERT" if rec.sent_ok else "ALERT FAILED"
+        if rec.late:
+            state = f"LATE {state}"
         latency = f"{rec.total_latency_ms / 1000:.2f}s" if rec.total_latency_ms is not None else "n/a"
         verdict = f"{state} {prio} ({res.detail}) latency {latency}"
     elif res.outcome == "edit_skipped":
@@ -210,22 +226,41 @@ def format_replay_line(index: int, res: HandleResult) -> str:
 def _summary(results: list[HandleResult], scorer_name: str, channels: list[str]) -> list[str]:
     alerts = [r.alert for r in results if r.alert is not None]
     delivered = [a for a in alerts if a.sent_ok]
-    latencies = [a.total_latency_ms for a in delivered if a.total_latency_ms is not None]
+    late = [a for a in delivered if a.late]
+    # like /health: late (catch-up) alerts say nothing about the live post -> phone latency
+    latencies = [a.total_latency_ms for a in delivered if a.total_latency_ms is not None and not a.late]
     count = {o: sum(1 for r in results if r.outcome == o) for o in ("duplicate", "malformed", "error")}
     flagged = sum(1 for r in results if r.rules is not None and r.rules.flagged)
+    scored = sum(1 for r in results if r.score is not None)
     processed = len(results) - count["duplicate"] - count["malformed"]
     line = (
         f"Replay summary: {len(results)} samples | {processed} processed | {count['duplicate']} duplicate | "
-        f"{count['malformed']} malformed | {flagged} flagged | {len(alerts)} alerts ({len(delivered)} delivered)"
+        f"{count['malformed']} malformed | {flagged} flagged | {scored} scored | "
+        f"{len(alerts)} alerts ({len(delivered)} delivered)"
     )
+    if late:
+        line += f" | {len(late)} late"
     if count["error"]:
         line += f" | {count['error']} errors"
     lines = [line]
     if latencies:
         avg = sum(latencies) / len(latencies) / 1000
         lines.append(f"Latency post->phone: avg {avg:.2f}s, max {max(latencies) / 1000:.2f}s (target < 10s)")
+    if late:
+        lines.append(
+            f"Late (catch-up) alerts: {len(late)} - sent low-key as 'Missed during outage', no SMS, "
+            "not counted in the latency"
+        )
     lines.append(f"Scorer: {scorer_name}. Channels: {', '.join(channels) or 'none'}. X API was not contacted.")
     return lines
+
+
+def _sample_age(payload: dict, default: float) -> tuple[float, bool]:
+    """(seconds between post creation and receipt, whether the sample asked for it via AGE_KEY)."""
+    value = payload.get(AGE_KEY)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return float(value), True
+    return default, False
 
 
 # --------------------------------------------------------------------------- entry point
@@ -271,10 +306,17 @@ async def run_replay(
 
         if is_quiet_hours(cfg.settings, now_utc()):
             qh = cfg.settings.alerts.quiet_hours
+            sc = cfg.settings.scoring
             out(
                 f"Note: quiet hours are active now ({qh.start}-{qh.end} {cfg.settings.alerts.timezone}); "
-                f"only scores >= {cfg.settings.scoring.quiet_hours_threshold} alert."
+                f"only scores >= {sc.quiet_hours_threshold} alert."
             )
+            if not use_claude and int(sc.fallback_max_impact) < int(sc.quiet_hours_threshold):
+                out(
+                    f"Note: offline scores are rules-only and capped at {sc.fallback_max_impact} "
+                    f"(scoring.fallback_max_impact), so nothing alerts now except always-alert accounts with "
+                    "the quiet-hours bypass; add --claude or replay outside quiet hours."
+                )
         out(f"Replaying {len(samples)} sample(s) from {path} (synthetic fixtures; X is never contacted)")
 
         rebaser = TimeRebaser()
@@ -282,7 +324,8 @@ async def run_replay(
         for i, payload in enumerate(samples, 1):
             received = now_utc()
             if rebase_times:
-                payload = rebaser.rebase(payload, received - timedelta(seconds=x_delay_seconds))
+                age, back_dated = _sample_age(payload, x_delay_seconds)
+                payload = rebaser.rebase(payload, received - timedelta(seconds=age), in_order=not back_dated)
             res = await pipeline.process(IngestItem(payload=payload, received_at=received, source="replay"))
             results.append(res)
             out(format_replay_line(i, res))

@@ -190,10 +190,21 @@ def test_cost_runs_offline_and_prints_a_total(
 
 
 def test_replay_samples_runs_offline(
-    no_network: None, missing_env: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    no_network: None,
+    missing_env: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(ROOT)
-    assert cli.main(["--env", missing_env, "replay", SAMPLES]) == 0
+    # quiet hours off, so the result does not depend on the time of day the tests run at
+    settings = tmp_path / "settings.yaml"
+    text = SETTINGS.read_text(encoding="utf-8")
+    settings.write_text(
+        text.replace("  quiet_hours:\n    enabled: true", "  quiet_hours:\n    enabled: false"), encoding="utf-8"
+    )
+    assert "enabled: false" in settings.read_text(encoding="utf-8")
+    assert cli.main(["--settings", str(settings), "--env", missing_env, "replay", SAMPLES]) == 0
     out = capsys.readouterr().out
     assert "Replay summary:" in out
     assert "X API was not contacted" in out
@@ -244,7 +255,8 @@ def test_x_commands_without_token_exit_2(
     assert cli.main([*global_flags(missing_env), *command]) == 2
     captured = capsys.readouterr()
     assert "X_BEARER_TOKEN" in captured.out + captured.err
-    assert not (tmp_path / "data").exists()
+    if command != ["run"]:  # `run` opens its database first, to dedupe the configuration-problem alert
+        assert not (tmp_path / "data").exists()
 
 
 def test_run_without_verified_accounts_exits_2(
@@ -349,11 +361,20 @@ class FakeX:
         self.timeline: dict[str, list[dict[str, Any]]] = {}
         self.timeline_requests: list[dict[str, str]] = []
         self.users: list[dict[str, Any]] = []
+        self.users_status = 200  # e.g. 402 -> every /2/users/by call fails with CreditsDepleted
+        self.reject_token = False  # 401 on every endpoint
         self.auth_headers: set[str] = set()
         self.release = asyncio.Event()
 
     def _seen(self, request: web.Request) -> None:
         self.auth_headers.add(request.headers.get("Authorization", ""))
+        if self.reject_token:
+            raise web.HTTPUnauthorized(
+                text=json.dumps(
+                    {"title": "Unauthorized", "type": "about:blank", "status": 401, "detail": "Unauthorized"}
+                ),
+                content_type="application/json",
+            )
 
     async def get_rules(self, request: web.Request) -> web.StreamResponse:
         self._seen(request)
@@ -432,6 +453,15 @@ class FakeX:
 
     async def users_by(self, request: web.Request) -> web.StreamResponse:
         self._seen(request)
+        if self.users_status == 402:
+            return web.json_response(
+                {
+                    "title": "CreditsDepleted",
+                    "detail": "Your enrolled account [123] does not have any credits to fulfill this request.",
+                    "type": "https://api.twitter.com/2/problems/credits",
+                },
+                status=402,
+            )
         wanted = request.query.get("usernames", "").split(",")
         known = {u["username"].lower(): u for u in self.users}
         data = [known[w.lower()] for w in wanted if w.lower() in known]
@@ -445,6 +475,12 @@ class FakeX:
         if errors:
             body["errors"] = errors
         return web.json_response(body)
+
+    async def users_by_ids(self, request: web.Request) -> web.StreamResponse:
+        self._seen(request)
+        wanted = request.query.get("ids", "").split(",")
+        known = {u["id"]: u for u in self.users}
+        return web.json_response({"data": [known[w] for w in wanted if w in known]})
 
     async def connections(self, request: web.Request) -> web.StreamResponse:
         self._seen(request)
@@ -460,6 +496,7 @@ async def fake_x():
     app.router.add_get("/2/tweets/search/stream", srv.stream)
     app.router.add_get("/2/usage/tweets", srv.usage)
     app.router.add_get("/2/users/by", srv.users_by)
+    app.router.add_get("/2/users", srv.users_by_ids)
     app.router.add_get("/2/users/{uid}/tweets", srv.user_tweets)
     app.router.add_delete("/2/connections/filtered_stream", srv.connections)
     server = TestServer(app, host="127.0.0.1")
@@ -776,3 +813,199 @@ async def test_verify_write_stores_user_ids(
     wl = load_watchlist(watchlist)
     assert {a.handle: a.user_id for a in wl.accounts} == {"elonmusk": ELON_ID, "NoSuchCeo": None}
     assert "# Tesla" in watchlist.read_text(encoding="utf-8")  # comments survive
+
+
+def _verify_files(tmp_path: Path, fake_x: FakeX, elon_user_id: str | None = None) -> tuple[Path, Path]:
+    settings = tmp_path / "settings.yaml"
+    settings.write_text(
+        f"x_api:\n  base_url: {fake_x.base_url}\nops:\n  db_path: {tmp_path / 'ceoscan.db'}\n", encoding="utf-8"
+    )
+    watchlist = tmp_path / "watchlist.yaml"
+    pinned = f'    user_id: "{elon_user_id}"\n' if elon_user_id else ""
+    watchlist.write_text(
+        f"accounts:\n  - handle: elonmusk\n{pinned}    expect_name: Elon Musk\n    tickers: [TSLA]\n"
+        "  - handle: LisaSu\n    expect_name: Lisa Su\n    tickers: [AMD]\n",
+        encoding="utf-8",
+    )
+    return settings, watchlist
+
+
+def _elon_user(uid: str = ELON_ID) -> dict[str, Any]:
+    return {
+        "id": uid,
+        "username": "elonmusk",
+        "name": "Elon Musk",
+        "verified": True,
+        "verified_type": "blue",
+        "protected": False,
+        "parody": False,
+        "created_at": "2009-06-02T20:12:29.000Z",
+        "public_metrics": {"followers_count": 200_000_000, "tweet_count": 90_000},
+        "most_recent_tweet_id": fresh_id(),
+    }
+
+
+async def test_verify_credits_depleted_prints_one_clear_message(
+    tmp_path: Path, fake_x: FakeX, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-7: HTTP 402 for every handle -> one line with the fix, no table, no 'up to date', exit 1."""
+    fake_x.users_status = 402
+    settings, watchlist = _verify_files(tmp_path, fake_x)
+    before = watchlist.read_text(encoding="utf-8")
+    monkeypatch.setenv("X_BEARER_TOKEN", TOKEN)
+    cfg = load_app_config(settings, watchlist, tmp_path / "no.env")
+    code = await cli.cmd_verify(cfg, cli.build_parser().parse_args(["verify", "--write"]))
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.err.count("add credits at console.x.com") == 1
+    assert "No handles were checked, nothing was billed and nothing was written." in captured.err
+    assert "up to date" not in captured.out and "STATUS" not in captured.out
+    assert watchlist.read_text(encoding="utf-8") == before
+
+
+async def test_verify_never_silently_changes_a_pinned_user_id(
+    tmp_path: Path, fake_x: FakeX, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-6: the handle now returns another id -> warning; only --accept-warnings writes it, loudly."""
+    fake_x.users = [_elon_user()]
+    settings, watchlist = _verify_files(tmp_path, fake_x, elon_user_id="111")
+    monkeypatch.setenv("X_BEARER_TOKEN", TOKEN)
+    cfg = load_app_config(settings, watchlist, tmp_path / "no.env")
+    assert await cli.cmd_verify(cfg, cli.build_parser().parse_args(["verify", "--write"])) == 0
+    out = capsys.readouterr().out
+    assert f"CHANGED @elonmusk: pinned 111 -> X now returns {ELON_ID}" in out
+    assert f"NOT changed: @elonmusk keeps user_id 111 (X now returns {ELON_ID})." in out
+    assert {a.handle: a.user_id for a in load_watchlist(watchlist).accounts}["elonmusk"] == "111"
+
+    cfg = load_app_config(settings, watchlist, tmp_path / "no.env")
+    args = cli.build_parser().parse_args(["verify", "--write", "--accept-warnings"])
+    assert await cli.cmd_verify(cfg, args) == 0
+    out = capsys.readouterr().out
+    assert f"CHANGED user_id of @elonmusk: 111 -> {ELON_ID}" in out
+    assert {a.handle: a.user_id for a in load_watchlist(watchlist).accounts}["elonmusk"] == ELON_ID
+
+
+async def test_verify_renamed_handle_keeps_pinned_id(
+    tmp_path: Path, fake_x: FakeX, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-4: not found by handle, but the pinned id now has another handle -> keep the id."""
+    renamed = {**_elon_user(), "username": "elon_new"}
+    fake_x.users = [renamed]
+    settings, watchlist = _verify_files(tmp_path, fake_x, elon_user_id=ELON_ID)
+    monkeypatch.setenv("X_BEARER_TOKEN", TOKEN)
+    cfg = load_app_config(settings, watchlist, tmp_path / "no.env")
+    assert await cli.cmd_verify(cfg, cli.build_parser().parse_args(["verify", "--write"])) == 0
+    out = capsys.readouterr().out
+    assert "now uses @elon_new (renamed)" in out
+    assert {a.handle: a.user_id for a in load_watchlist(watchlist).accounts}["elonmusk"] == ELON_ID
+
+
+async def test_check_access_rejected_token_exits_2(
+    tmp_path: Path, fake_x: FakeX, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-10: a wrong bearer token must not exit 0."""
+    fake_x.reject_token = True
+    cfg = make_cfg(tmp_path, fake_x.base_url)
+    assert await cli.cmd_check_access(cfg, cli.build_parser().parse_args(["check-access"])) == 2
+    captured = capsys.readouterr()
+    assert "rejected the bearer token" in captured.out
+    assert "X_BEARER_TOKEN" in captured.err
+
+
+# --------------------------------------------------------------------------- run: configuration cannot be loaded
+
+
+def _broken_settings(tmp_path: Path, extra: str = "") -> Path:
+    p = tmp_path / "settings.yaml"
+    p.write_text(f"alerts:\n  timezone: America/LosAngeles\nops:\n  db_path: {tmp_path / 'c.db'}\n{extra}")
+    return p
+
+
+def test_run_with_broken_settings_alerts_once_and_exits_2(
+    no_network: None,
+    missing_env: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SEC-3 / SEC-8: a typo is caught at load time, alerted once (deduped), and `run` exits 2."""
+    push = CaptureNotifier("ntfy")
+    _patch_dispatcher(monkeypatch, cli, push=[push])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CEOSCAN_CONFIG_ERROR_ACTION", "exit")
+    # a broken settings file: the fallback (defaults) keeps data/ in the working directory
+    settings = _broken_settings(tmp_path)
+    argv = ["--settings", str(settings), "--watchlist", str(WATCHLIST), "--env", missing_env, "run"]
+    assert cli.main(argv) == 2
+    assert "unknown time zone 'America/LosAngeles'" in capsys.readouterr().err
+    assert len(push.sent) == 1
+    assert push.sent[0].title.startswith("ceoscan stopped: configuration problem: alerts.timezone")
+    assert push.sent[0].priority == "high"
+    assert cli.main(argv) == 2  # a restart with the same problem: no second alert
+    assert len(push.sent) == 1
+
+
+async def test_run_config_error_wait_mode_idles_with_health_503(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SEC-8: with config_error_action wait (Docker) `run` stays up instead of restart-looping."""
+    push = CaptureNotifier("ntfy")
+    _patch_dispatcher(monkeypatch, cli, push=[push])
+    settings = tmp_path / "settings.yaml"
+    settings.write_text(
+        f"ops:\n  db_path: {tmp_path / 'c.db'}\n  health_port: 0\n  config_error_action: wait\n", encoding="utf-8"
+    )
+    argv = ["--settings", str(settings), "--watchlist", str(tmp_path / "nope.yaml"), "run"]
+    args = cli.build_parser().parse_args(argv)
+    stop = asyncio.Event()
+    started: list[cli.HealthServer] = []
+    real_start = cli.HealthServer.start
+
+    async def spy_start(self: cli.HealthServer) -> None:
+        await real_start(self)
+        started.append(self)
+
+    monkeypatch.setattr(cli.HealthServer, "start", spy_start)
+    task = asyncio.create_task(
+        cli.run_config_error(args, "watchlist missing", stop=stop, install_signal_handlers=False)
+    )
+    for _ in range(200):
+        if started:
+            break
+        await asyncio.sleep(0.01)
+    assert started and not task.done()
+    srv = started[0]
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"http://127.0.0.1:{srv.port}/health") as resp:
+            assert resp.status == 503
+            body = await resp.json()
+    assert body["state"] == "config_error" and body["status"] == "down"
+    assert "watchlist missing" in body["reasons"][0]
+    assert len(push.sent) == 1 and "idle" in push.sent[0].body
+    stop.set()
+    assert await asyncio.wait_for(task, timeout=5) == 2
+
+
+def test_dotenv_permission_denied_is_not_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-2: systemd already exported the secrets; an unreadable .env must not stop the service."""
+    env = tmp_path / ".env"
+    env.write_text("X_BEARER_TOKEN=from-file\n", encoding="utf-8")
+    env.chmod(0)
+    if os.access(env, os.R_OK):  # running as root: simulate the permission error instead
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(file: Any, *a: Any, **k: Any) -> Any:
+            if str(file) == str(env):
+                raise PermissionError(13, "Permission denied", str(file))
+            return real_open(file, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setenv("X_BEARER_TOKEN", TOKEN)
+    assert cli.main(["--settings", str(SETTINGS), "--watchlist", str(WATCHLIST), "--env", str(env), "cost"]) == 0
+    err = capsys.readouterr().err
+    assert f"warning: cannot read {env} (Permission denied); using the existing environment" in err
+    assert TOKEN not in err

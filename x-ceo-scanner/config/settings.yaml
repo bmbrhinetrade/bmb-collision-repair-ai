@@ -1,5 +1,7 @@
 # ceoscan settings (non-secret). Secrets go in .env - never in this file.
 # Every key is optional; omitted keys use the defaults in src/ceoscan/config.py.
+# The file is checked when ceoscan starts: unknown keys, wrong types, unknown time zones and times
+# that are not "HH:MM" (24 h, quoted) stop the start with a message naming the setting.
 
 x_api:
   # auto   = use the filtered stream if your plan allows it, otherwise poll timelines
@@ -17,10 +19,12 @@ x_api:
     concurrency: 4
     max_results: 10
   recovery:
-    enabled: true                     # after a stream outage, fetch missed posts per account (since_id)
-    min_gap_seconds: 20
-    max_results: 20
-    max_pages: 5                      # follow pagination during catch-up
+    # After a stream outage (and after each start) read the watched accounts' timelines (since_id)
+    # for posts missed in the meantime. Keyword-rule matches cannot be recovered this way.
+    enabled: true
+    min_gap_seconds: 0                # 0 = catch up after every reconnect (empty requests are free)
+    max_results: 20                   # posts per page (5-100)
+    max_pages: 5                      # pages per account per catch-up (5 x 20 = up to 100 posts)
     max_age_seconds: 3600             # never catch up on posts older than 1 hour
     on_startup: true                  # catch up once after each (re)start, e.g. deploys
   rules:
@@ -45,9 +49,10 @@ scoring:
   score_always_alert_unflagged: true
   score_watchlist_unflagged: true     # score every watched-account post (fast rules become hints);
                                       # false = only posts the fast rules flag (saves < $1/month)
-  timeout_seconds: 4.0                # per Claude request
-  total_budget_seconds: 4.0           # hard cap for all attempts; then fall back to the fast-rules score
-  max_retries: 1                      # only for fast failures while budget remains
+  timeout_seconds: 4.0                # per Claude request (it also gets only what is left of the budget)
+  total_budget_seconds: 4.0           # hard cap for all attempts; then the rules-only score is used
+  max_retries: 1                      # only for fast failures (429/5xx/connection) with >= 1.5 s left;
+                                      # never after a timeout
   fallback_max_impact: 7              # rules-only scores never exceed this (no urgent/SMS/quiet-hours)
   max_tokens: 1024
   enabled: true
@@ -76,11 +81,12 @@ alerts:
     min_score: 7
     send_daily_summary: true
     use_ssl: false
-  send_timeout_seconds: 5.0
+    timeout_seconds: 20.0             # one SMTP send (connect + STARTTLS + login); never delays the push
+  send_timeout_seconds: 5.0           # per push / SMS request
   max_post_age_seconds: 900           # older posts (outage catch-up) alert as low-priority "missed" only
 
 ops:
-  health_host: 127.0.0.1             # Docker overrides with CEOSCAN_HEALTH_HOST=0.0.0.0
+  health_host: 127.0.0.1              # this machine only; the Docker image sets CEOSCAN_HEALTH_HOST=0.0.0.0
   health_port: 8080
   db_path: data/ceoscan.db
   log_level: INFO
@@ -88,6 +94,10 @@ ops:
   daily_summary:
     enabled: true
     time: "18:00"                     # local time in alerts.timezone
-  pipeline_workers: 8
+  pipeline_workers: 8                 # posts scored / alerted in parallel
   queue_max: 10000
-  config_error_action: exit           # exit (code 2) | wait (stay up; Docker sets CEOSCAN_CONFIG_ERROR_ACTION=wait)
+  # On a configuration problem (after one "configuration problem" alert):
+  #   exit = exit with code 2 (systemd does not restart it)
+  #   wait = stay up idle, /health 503 with state config_error (the Docker image sets
+  #          CEOSCAN_CONFIG_ERROR_ACTION=wait so its restart policy cannot loop)
+  config_error_action: exit

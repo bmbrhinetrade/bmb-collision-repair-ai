@@ -1,4 +1,8 @@
-"""Dedupe by post id: Store LRU fast path, SQLite primary key across restarts, and the pipeline on top."""
+"""Dedupe by post id: Store LRU fast path, SQLite primary key across restarts, and the pipeline on top.
+
+Also the Store's alert bookkeeping: schema migration of older databases, the latest alert per post
+(edit re-alerts) and the stats used by /health and the daily summary.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +16,18 @@ import pytest
 from ceoscan.alerts.dispatcher import AlertDispatcher
 from ceoscan.alerts.notifiers import CaptureNotifier
 from ceoscan.config import AppConfig, Secrets, Settings
-from ceoscan.models import Account, IngestItem, IngestStatus, Post, Watchlist
+from ceoscan.models import (
+    Account,
+    AlertMessage,
+    AlertRecord,
+    ChannelResult,
+    IngestItem,
+    IngestStatus,
+    Post,
+    RuleResult,
+    Score,
+    Watchlist,
+)
 from ceoscan.pipeline import Pipeline
 from ceoscan.scoring.claude import OfflineScorer
 from ceoscan.store import Store
@@ -206,4 +221,163 @@ async def test_concurrent_workers_alert_once_for_duplicates() -> None:
 
     assert len(capture.sent) == 2  # one per distinct id
     assert post_count(store) == 2
+    store.close()
+
+
+# --------------------------------------------------------------------------- Store: alerts, migration, stats
+
+# The alerts table as created by the first release (no "late" column).
+OLD_ALERTS_SCHEMA = """
+CREATE TABLE alerts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id          TEXT,
+    kind             TEXT NOT NULL,
+    created_at_ms    INTEGER NOT NULL,
+    decision_reason  TEXT,
+    score            INTEGER,
+    direction        TEXT,
+    tickers          TEXT,
+    title            TEXT,
+    body             TEXT,
+    channels         TEXT,
+    sent_ok          INTEGER NOT NULL,
+    quiet_hours      INTEGER NOT NULL DEFAULT 0,
+    total_latency_ms INTEGER,
+    x_delay_ms       INTEGER,
+    scoring_ms       INTEGER,
+    push_ms          INTEGER
+);
+"""
+
+
+def alert(post_id: str | None = "1", *, ok: bool = True, late: bool = False, latency: int | None = 4000,
+          score: int = 8, direction: str = "bullish", tickers: list[str] | None = None,
+          kind: str = "post") -> AlertRecord:
+    return AlertRecord(
+        post_id=post_id, kind=kind, decision_reason="test",  # type: ignore[arg-type]
+        message=AlertMessage(title="t", body="b"),
+        results=[ChannelResult("capture", ok, 5)], score=score, direction=direction,
+        tickers=tickers if tickers is not None else ["TSLA"], late=late,
+        total_latency_ms=latency if ok else None,
+    )
+
+
+def columns(store: Store, table: str) -> list[str]:
+    return [r["name"] for r in store._db.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def test_old_database_gets_late_column(tmp_path: Path) -> None:
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.executescript(OLD_ALERTS_SCHEMA)
+    con.execute("INSERT INTO alerts (post_id, kind, created_at_ms, sent_ok, total_latency_ms) "
+                "VALUES ('9', 'post', 1, 1, 3000)")
+    con.commit()
+    con.close()
+
+    store = Store(db)
+    assert "late" in columns(store, "alerts")
+    assert store._db.execute("SELECT late FROM alerts WHERE post_id='9'").fetchone()[0] == 0  # old rows: live
+    store.record_alert(alert("10", late=True))
+    assert store._db.execute("SELECT late FROM alerts WHERE post_id='10'").fetchone()[0] == 1
+    store.close()
+
+    reopened = Store(db)  # idempotent: no second ALTER
+    assert columns(reopened, "alerts").count("late") == 1
+    reopened.close()
+
+
+def test_migration_tolerates_concurrent_add(tmp_path: Path) -> None:
+    """Another process may add the column between our check and our ALTER."""
+    db = tmp_path / "race.db"
+    con = sqlite3.connect(db)
+    con.executescript(OLD_ALERTS_SCHEMA)
+    con.close()
+
+    class RacingStore(Store):
+        def _columns(self, table: str) -> set[str]:
+            cols = super()._columns(table)
+            if table == "alerts" and "late" not in cols and not getattr(self, "_raced", False):
+                self._raced = True
+                other = sqlite3.connect(db)
+                other.execute("ALTER TABLE alerts ADD COLUMN late INTEGER NOT NULL DEFAULT 0")
+                other.commit()
+                other.close()
+            return cols
+
+    store = RacingStore(db)
+    assert "late" in columns(store, "alerts")
+    store.close()
+
+
+def test_last_alert_for_post() -> None:
+    store = Store(":memory:")
+    assert store.last_alert_for_post("1") is None
+    store.record_alert(alert("1", score=7, direction="bullish", tickers=["TSLA"]))
+    store.record_alert(alert("1", score=9, direction="bearish", tickers=["TSLA", "AMD"]))
+    store.record_alert(alert("1", ok=False, score=10, direction="unclear"))  # failed: never seen by the user
+    last = store.last_alert_for_post("1")
+    assert last is not None
+    assert (last["score"], last["direction"], last["tickers"]) == (9, "bearish", ["TSLA", "AMD"])
+    assert store.last_alert_for_post("2") is None
+    store.close()
+
+
+def test_stats_since_counts_and_latency_excludes_late_alerts() -> None:
+    store = Store(":memory:")
+    since = datetime(2020, 1, 1, tzinfo=UTC)
+    store.record_alert(alert("1", latency=2000))
+    store.record_alert(alert("2", latency=6000))
+    store.record_alert(alert("3", latency=7_200_000, late=True))  # 2 h old catch-up post
+    store.record_alert(alert("4", ok=False))
+    store.record_alert(alert(None, kind="system", latency=None))
+    stats = store.stats_since(since)
+
+    assert stats["alerts"] == 3 and stats["alerts_late"] == 1 and stats["alerts_failed"] == 1
+    assert stats["avg_latency_ms"] == 4000 and stats["max_latency_ms"] == 6000
+    store.close()
+
+
+def test_stats_since_only_late_alerts_has_no_latency() -> None:
+    store = Store(":memory:")
+    store.record_alert(alert("1", latency=9_000_000, late=True))
+    stats = store.stats_since(datetime(2020, 1, 1, tzinfo=UTC))
+    assert stats["alerts"] == 1 and stats["alerts_late"] == 1
+    assert stats["avg_latency_ms"] is None and stats["max_latency_ms"] is None
+    store.close()
+
+
+def test_stats_since_counts_score_and_stream_errors() -> None:
+    store = Store(":memory:")
+    since = datetime(2020, 1, 1, tzinfo=UTC)
+    rules = RuleResult(flagged=True)
+    for pid, error in (("1", "timeout after 4s"), ("2", None), ("3", "HTTP 401 authentication_error")):
+        store.insert_post_if_new(make_post(pid))
+        score = Score(tickers=[], direction="unclear", impact=3, reason="r", is_joke=False,
+                      source="rules_fallback" if error else "claude", error=error)
+        store.update_post_score(pid, rules, score)
+    store.log_event("stream_error", "HTTP 503", level="warning")
+    store.log_event("poll_error", "HTTP 429", level="warning")
+    store.log_event("stream_error", "credits depleted", level="error")
+    store.log_event("gap_recovery", "fetched 3", level="info")
+    stats = store.stats_since(since)
+
+    assert stats["score_errors"] == 2
+    assert stats["last_score_error"] in ("timeout after 4s", "HTTP 401 authentication_error")
+    assert stats["stream_errors"] == 3
+    assert stats["errors"] == 1  # level='error' events, as before
+    # the keys /health and the summary already read are still there
+    for key in ("posts", "flagged", "claude_scored", "alerts", "alerts_failed", "avg_latency_ms", "max_latency_ms"):
+        assert key in stats
+    assert stats["posts"] == 3 and stats["claude_scored"] == 1
+    store.close()
+
+
+def test_stats_since_respects_since() -> None:
+    store = Store(":memory:")
+    store.record_alert(alert("1"))
+    store.log_event("stream_error", "x")
+    stats = store.stats_since(datetime(2999, 1, 1, tzinfo=UTC))
+    assert stats["alerts"] == 0 and stats["alerts_late"] == 0 and stats["stream_errors"] == 0
+    assert stats["score_errors"] == 0 and stats["last_score_error"] is None
     store.close()

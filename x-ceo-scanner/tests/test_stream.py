@@ -10,7 +10,7 @@ import asyncio
 import json
 import random
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiohttp
@@ -26,6 +26,7 @@ from ceoscan.xapi.client import NotAuthorized, XApiError, error_from_response
 from ceoscan.xapi.stream import (
     Backoff,
     FilteredStream,
+    IngestEventLog,
     LineBuffer,
     StreamUnavailable,
     classify_stream_errors,
@@ -35,7 +36,7 @@ from ceoscan.xapi.stream import (
 
 TOKEN = "test-bearer-token-123456"
 STREAM_PATH = "/2/tweets/search/stream"
-NOW = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
 
 
 # --------------------------------------------------------------------------- Backoff
@@ -554,12 +555,12 @@ async def test_stream_429_uses_rate_limit_backoff_with_reset_header(fake_x, sess
     stop = asyncio.Event()
     task = asyncio.create_task(stream.run(stop))
     await wait_until(lambda: status.state == "connected")
-    assert backoff.calls[0] == ("rate_limit", datetime.fromtimestamp(reset, tz=timezone.utc))
+    assert backoff.calls[0] == ("rate_limit", datetime.fromtimestamp(reset, tz=UTC))
     await stop_and_join(stop, task)
 
 
 async def test_stream_429_real_backoff_waits_until_reset(fake_x, session):
-    reset_at = datetime.now(timezone.utc) + timedelta(seconds=900)
+    reset_at = datetime.now(UTC) + timedelta(seconds=900)
     fake_x.scripts = [json_error(429, {"title": "Too Many Requests"},
                                  {"x-rate-limit-reset": str(int(reset_at.timestamp()))})]
     status = IngestStatus()
@@ -656,6 +657,183 @@ async def test_stream_full_queue_pauses_reads_without_heartbeat_timeout(fake_x, 
     await stop_and_join(stop, task)
 
 
+# --------------------------------------------------------------------------- watchdog / catch-up / TMC / events
+
+
+async def test_fresh_connection_going_silent_is_dropped_after_heartbeat_not_connect_timeout(fake_x, session):
+    """ING-4: the idle limit shrinks from connect_timeout + heartbeat to heartbeat once the headers
+    arrive; the watchdog must notice, so a silent fresh connection is dropped ~heartbeat later."""
+    fake_x.scripts = [one_heartbeat_then_stall, keepalives_until_released]
+    status = IngestStatus()
+    stream = FilteredStream(session, TOKEN,
+                            make_settings(fake_x.base_url, heartbeat_timeout_seconds=0.3, connect_timeout_seconds=10.0),
+                            asyncio.Queue(), status, backoff=RecordingBackoff())
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    task = asyncio.create_task(stream.run(stop))
+    await wait_until(lambda: fake_x.connections >= 2, timeout=8.0)
+    assert loop.time() - t0 < 2.5  # ~0.3 s (+ <= 1 s watchdog granularity), not 10.3 s
+    assert "heartbeat timeout" in (status.last_error or "")
+    await stop_and_join(stop, task)
+
+
+async def test_first_connect_catch_up_runs_regardless_of_min_gap(fake_x, session):
+    """ING-5 / SEC-5: with catch_up_on_first_connect the first connection of a process runs gap
+    recovery (posts made while ceoscan was restarting), reporting the seeded gap."""
+    fake_x.scripts = [keepalives_until_released]
+    settings = make_settings(fake_x.base_url)
+    settings.recovery.min_gap_seconds = 3600.0
+    gaps: list[float] = []
+    connected: list[int] = []
+
+    async def on_gap(gap: float) -> None:
+        gaps.append(gap)
+
+    status = IngestStatus()
+    stream = FilteredStream(session, TOKEN, settings, asyncio.Queue(), status, on_reconnect_gap=on_gap,
+                            backoff=RecordingBackoff(), catch_up_on_first_connect=True,
+                            gap_started_at=datetime.now(UTC) - timedelta(seconds=90),
+                            on_connected=lambda: connected.append(1))
+    stop = asyncio.Event()
+    task = asyncio.create_task(stream.run(stop))
+    await wait_until(lambda: len(gaps) == 1)
+    assert 89 <= gaps[0] <= 95
+    assert connected == [1]
+    await stop_and_join(stop, task)
+
+
+async def test_first_connect_without_catch_up_runs_no_recovery(fake_x, session):
+    fake_x.scripts = [keepalives_until_released]
+    gaps: list[float] = []
+
+    async def on_gap(gap: float) -> None:
+        gaps.append(gap)
+
+    status = IngestStatus()
+    stream = FilteredStream(session, TOKEN, make_settings(fake_x.base_url), asyncio.Queue(), status,
+                            on_reconnect_gap=on_gap, backoff=RecordingBackoff())
+    stop = asyncio.Event()
+    task = asyncio.create_task(stream.run(stop))
+    await wait_until(lambda: status.state == "connected")
+    await asyncio.sleep(0.05)
+    assert gaps == []
+    await stop_and_join(stop, task)
+
+
+async def test_short_reconnect_still_recovers_because_of_delivery_margin(fake_x, session):
+    """ING-7: a reconnect after ~0 s still has posts in flight (X's ~5 s delivery lag)."""
+    fake_x.scripts = [two_posts_then_close, keepalives_until_released]
+    settings = make_settings(fake_x.base_url)
+    settings.recovery.min_gap_seconds = 4.0
+    gaps: list[float] = []
+    snapshots: list[int] = []
+
+    async def on_gap(gap: float) -> None:
+        gaps.append(gap)
+
+    status = IngestStatus()
+    stream = FilteredStream(session, TOKEN, settings, asyncio.Queue(), status, on_reconnect_gap=on_gap,
+                            backoff=RecordingBackoff(), on_gap_start=lambda: snapshots.append(1))
+    stop = asyncio.Event()
+    task = asyncio.create_task(stream.run(stop))
+    await wait_until(lambda: len(gaps) == 1)
+    assert gaps[0] < 2.0  # measured gap is short ...
+    assert snapshots == [1]  # ... and the cursors were snapshotted once when it began
+    await stop_and_join(stop, task)
+
+
+async def test_on_gap_start_fires_once_per_outage(session):
+    srv = TestServer(web.Application(), host="127.0.0.1")
+    await srv.start_server()
+    url = str(srv.make_url("")).rstrip("/")
+    await srv.close()  # connection refused on every attempt
+    snapshots: list[int] = []
+    backoff = RecordingBackoff()
+    stream = FilteredStream(session, TOKEN, make_settings(url), asyncio.Queue(), IngestStatus(), backoff=backoff,
+                            on_gap_start=lambda: snapshots.append(1))
+    stop = asyncio.Event()
+    task = asyncio.create_task(stream.run(stop))
+    await wait_until(lambda: len(backoff.calls) >= 4)
+    await stop_and_join(stop, task)
+    assert snapshots == [1]
+
+
+class _NoClient:
+    async def terminate_stream_connections(self) -> bool:
+        return True
+
+
+def _tmc(remaining: str) -> tuple[XApiError, dict[str, str]]:
+    body = {"title": "ConnectionException", "detail": "max allowed connection limit",
+            "connection_issue": "TooManyConnections"}
+    hdr = {"x-rate-limit-limit": "50", "x-rate-limit-remaining": remaining,
+           "x-rate-limit-reset": str(int(datetime.now(UTC).timestamp()) + 800)}
+    return error_from_response(429, body, hdr), hdr
+
+
+async def test_too_many_connections_waits_for_reset_only_when_connects_are_used_up():
+    """ING-8: after the fast retries, wait for the connect window's reset only if remaining == 0."""
+    s = XApiSettings()
+    fs = FilteredStream(None, "t", s, asyncio.Queue(), IngestStatus(), client=_NoClient(),  # type: ignore[arg-type]
+                        backoff=Backoff(jitter=0.0))
+    delays = []
+    for _ in range(5):
+        err, hdr = _tmc("45")
+        delays.append((await fs._on_http_error(err, hdr))[0])
+    assert delays[:3] == [5.0, 5.0, 5.0]  # fast retries after terminating our stale connection
+    assert delays[3] == 60.0 and delays[4] == 120.0  # plain rate-limit backoff, not ~800 s
+    fs2 = FilteredStream(None, "t", s, asyncio.Queue(), IngestStatus(), client=_NoClient(),  # type: ignore[arg-type]
+                         backoff=Backoff(jitter=0.0))
+    for _ in range(3):
+        err, hdr = _tmc("0")
+        await fs2._on_http_error(err, hdr)
+    err, hdr = _tmc("0")
+    assert (await fs2._on_http_error(err, hdr))[0] >= 790  # budget exhausted: wait for the reset
+
+
+class _EventStore:
+    def __init__(self, fail: bool = False) -> None:
+        self.rows: list[tuple[str, str, str]] = []
+        self.fail = fail
+
+    def log_event(self, kind: str, detail: str = "", level: str = "info") -> None:
+        if self.fail:
+            raise RuntimeError("disk full")
+        self.rows.append((kind, detail, level))
+
+
+def test_ingest_event_log_throttles_per_kind_and_counts_repeats():
+    t = [0.0]
+    store = _EventStore()
+    ev = IngestEventLog(store, interval=60.0, clock=lambda: t[0])
+    assert ev.error("stream_error", "HTTP 503 Service Unavailable") is True
+    assert ev.error("stream_error", "HTTP 503 again") is False
+    assert ev.error("poll_error", "timeout") is True  # another kind is not throttled
+    t[0] = 30.0
+    assert ev.error("stream_error", "still down") is False
+    t[0] = 61.0
+    assert ev.error("stream_error", "disconnected by X: operational-disconnect") is True
+    assert [(k, lvl) for k, _, lvl in store.rows] == [("stream_error", "error"), ("poll_error", "error"),
+                                                      ("stream_error", "error")]
+    assert store.rows[2][1].endswith("(+2 more since the previous stream_error event)")
+    assert IngestEventLog(_EventStore(fail=True)).error("stream_error", "x") is False  # never raises
+    assert IngestEventLog(None).error("stream_error", "x") is False
+
+
+async def test_stream_disconnects_are_recorded_as_error_events(fake_x, session):
+    fake_x.scripts = [two_posts_then_close, keepalives_until_released]
+    store = _EventStore()
+    status = IngestStatus()
+    stream = FilteredStream(session, TOKEN, make_settings(fake_x.base_url), asyncio.Queue(), status,
+                            backoff=RecordingBackoff(), events=IngestEventLog(store))
+    stop = asyncio.Event()
+    task = asyncio.create_task(stream.run(stop))
+    await wait_until(lambda: status.reconnects == 1 and status.state == "connected")
+    await stop_and_join(stop, task)
+    assert store.rows == [("stream_error", "stream closed by server", "error")]
+
+
 # --------------------------------------------------------------------------- access check (uses the stream probe)
 
 
@@ -720,3 +898,22 @@ async def test_check_access_busy_stream(fake_x, session):
     r = await check_access(AccessClient([], USAGE), make_settings(fake_x.base_url), 2, session, TOKEN)  # type: ignore[arg-type]
     assert r.mode == "stream" and r.stream_available is True and r.credits_ok is None
     assert any("busy" in m for m in r.messages)
+
+
+async def test_check_access_reports_a_rejected_bearer_token(fake_x, session):
+    """SEC-10: a 401 anywhere sets auth_ok=False, so `check-access` exits 2 instead of 0."""
+    from ceoscan.__main__ import EXIT_CONFIG, access_exit_code
+
+    fake_x.scripts = [json_error(401, {"title": "Unauthorized", "type": "about:blank", "status": 401})]
+    unauthorized = NotAuthorized(status=401, title="Unauthorized")
+    r = await check_access(AccessClient(unauthorized, unauthorized), make_settings(fake_x.base_url), 3, session, TOKEN)  # type: ignore[arg-type]
+    assert r.auth_ok is False and r.credits_ok is None
+    assert "REJECTED (HTTP 401)" in format_access_report(r)
+    assert access_exit_code(r) == EXIT_CONFIG
+
+
+async def test_check_access_accepted_token_sets_auth_ok(fake_x, session):
+    fake_x.scripts = [keepalives_until_released]
+    r = await check_access(AccessClient([], USAGE), make_settings(fake_x.base_url), 3, session, TOKEN)  # type: ignore[arg-type]
+    assert r.auth_ok is True
+    assert "bearer token:     accepted" in format_access_report(r)

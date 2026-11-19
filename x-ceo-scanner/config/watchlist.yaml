@@ -8,7 +8,8 @@
 # Fields per account:
 #   handle             X handle without "@"
 #   kind               person | company
-#   expect_name        display name we expect; verify flags a mismatch (catches look-alikes)
+#   expect_name        display name we expect; verify warns unless every word of it is in the display
+#                      name (a weak signal - badge, followers, account age and the pinned user_id matter more)
 #   tickers            tickers this account can move; "@group" pulls in a ticker_groups entry
 #   always_alert       true = alert on every post (still scored), regardless of score
 #   include_replies    false = ignore this account's replies (big cost saver for heavy repliers)
@@ -270,7 +271,11 @@ keyword_rules:
     extra_operators: "-is:retweet -is:reply lang:en"
     est_posts_per_day: 60
 
-# Company names / product words the fast rules treat like a ticker mention.
+# Company names / product words the fast rules treat like a ticker mention. Matching ignores case,
+# except: an alias written with a leading "=" (e.g. "=Gaudi") matches only with that exact case, and
+# common words are exact-case automatically (Strategy, Base, Meta, Instinct, Llama, Optimus, Rubin, Gemini,
+# Copilot, Azure, Intel, Alphabet; Strategy and Base also never match as a sentence's first word).
+# These are only hints for Claude, which reads the post itself.
 company_names:
   TSLA: [Tesla, Cybertruck, Optimus, Robotaxi, Cybercab, "Model Y", "Model 3", Megapack, FSD]
   SPCX: [SpaceX, Starlink, Starship, Falcon 9]
@@ -286,7 +291,7 @@ company_names:
   CLSK: [CleanSpark]
   HOOD: [Robinhood]
   SOFI: [SoFi]
-  COIN: [Coinbase, Base]
+  COIN: [Coinbase, "Base app", "Base chain"]
   INTC: [Intel, "18A", "14A", Gaudi]
   MU: [Micron, HBM]
   CEG: ["Constellation Energy"]

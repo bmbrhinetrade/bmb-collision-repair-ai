@@ -114,11 +114,15 @@ def test_categories_cover_contract_names() -> None:
         "earnings",
         "guidance",
         "m_and_a",
+        "exec_change",
         "partnership",
         "layoffs",
         "product",
         "regulatory",
+        "corporate_status",
+        "incident",
         "buyback",
+        "capital_return",
         "offering",
         "bitcoin",
         "numbers",
@@ -287,3 +291,325 @@ def test_empty_watchlist_still_works() -> None:
     fr = FastRules(Watchlist(accounts=(), keyword_rules=(), my_tickers=(), company_names={}))
     assert fr.evaluate(make_post("$TSLA to the moon"), None).tickers == ["TSLA"]
     assert not fr.evaluate(make_post("hello world"), None).flagged
+
+
+# --------------------------------------------------------------------------- new categories (SCOR-3)
+
+
+@pytest.mark.parametrize(
+    ("text", "category"),
+    [
+        # executive change
+        ("After 12 incredible years, I've decided to step down as CEO at the end of the year.", "exec_change"),
+        ("I am stepping down as CEO of Tesla", "exec_change"),
+        ("Our CFO has resigned", "exec_change"),
+        ("Please welcome our new CEO", "exec_change"),
+        ("Jane Doe was appointed as chief financial officer", "exec_change"),
+        ("She will be my successor", "exec_change"),
+        ("Personal news: after many wonderful years it is time for me to pass the baton.", "exec_change"),
+        # capital return
+        ("10-for-1 stock split effective June 7", "capital_return"),
+        ("Board declared a special dividend of $1 per share", "capital_return"),
+        ("We are initiating a quarterly dividend", "capital_return"),
+        ("1-for-10 reverse split approved", "capital_return"),
+        # take-private, with words in between, and the famous two-word post
+        ("Am considering taking it private at $420.", "m_and_a"),
+        ("Am considering taking Tesla private at $420.", "m_and_a"),
+        ("Funding secured.", "m_and_a"),
+        ("We could go private", "m_and_a"),
+        # incidents
+        ("Our systems are down right now", "incident"),
+        ("We are aware of an outage affecting some users", "incident"),
+        ("Production at Giga Texas is paused due to a fire", "incident"),
+        ("We halted production at the plant", "incident"),
+        ("Voluntary recall of 2,000 vehicles", "incident"),
+        ("Our database was hacked last night", "incident"),
+        ("We detected a data breach", "incident"),
+        ("Trading halted pending news", "incident"),
+        # bankruptcy / delisting / charter / license
+        ("We received our bank charter", "corporate_status"),
+        ("The company filed for Chapter 11 bankruptcy", "corporate_status"),
+        ("Shares will be delisted from Nasdaq", "corporate_status"),
+        ("We were granted a banking license in the EU", "corporate_status"),
+        # bitcoin sales
+        ("We sold some bitcoin this week to fund the dividend.", "bitcoin"),
+        ("Strategy is selling 704 BTC", "bitcoin"),
+        # product launches ("introducing")
+        ("Today we're introducing the all-new MacBook Pro", "product"),
+    ],
+)
+def test_flags_new_categories(rules: FastRules, text: str, category: str) -> None:
+    result = evaluate(rules, text)
+    assert result.flagged, text
+    assert category in result.categories, (text, result.categories)
+
+
+def test_bitcoin_sale_reason_and_hodl_posts(rules: FastRules) -> None:
+    sale = evaluate(rules, "We sold some bitcoin this week to fund the dividend.", account=SAYLOR)
+    assert any(r.startswith("bitcoin sale: sold some bitcoin") for r in sale.reasons)
+    assert "capital_return" in sale.categories  # "the dividend" (broad)
+    for text in (
+        "Never sell your bitcoin",
+        "Don't sell your ₿itcoin... just kidding, don't sell your bitcoin",
+        "I have no plans to sell bitcoin",
+        "Sell a kidney if you must, but keep the bitcoin",
+    ):
+        assert not any(r.startswith("bitcoin sale") for r in evaluate(rules, text, account=SAYLOR).reasons), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "take your private jet",  # not a take-private
+        "Revenue from services was down 3% year over year",  # a metric, not an outage
+        "Services were down 3% yoy",
+        "This feature is enabled by default on all devices",  # not a debt default
+        "Chapter 7 of my new book is out",
+        "The successor to last year's model ships soon",  # not an executive successor
+        "The next President will be decided in November",  # politics, not a company change
+        "BTC breached $100,000",  # a price level, not a security breach
+    ],
+)
+def test_new_categories_do_not_score_common_phrases(rules: FastRules, text: str) -> None:
+    result = evaluate(rules, text)
+    for cat in ("m_and_a", "incident", "corporate_status", "exec_change"):
+        if cat in result.categories:
+            # at most a broad (unscored) match: the rules-only score ignores it
+            assert result.rule_score <= 2, (text, result)
+
+
+# --------------------------------------------------------------------------- own text vs context (SCOR-1)
+
+
+def test_own_text_is_evaluated_separately_from_context(rules: FastRules) -> None:
+    parent = ReferencedPost(
+        type="replied_to", id="2", text="Is Tesla still on track for Q2 Cybercab production, or will guidance slip?"
+    )
+    result = evaluate(rules, "On track. No change.", referenced=[parent])
+    assert result.flagged and "guidance" in result.categories and result.tickers == ["TSLA"]
+    assert result.own_flagged is False
+    assert result.own_categories == []
+    assert result.own_rule_score == 0
+
+
+def test_own_fields_equal_full_fields_without_context(rules: FastRules) -> None:
+    result = evaluate(rules, "$TSLA Tesla raises guidance after $5B quarter")
+    assert result.own_flagged is True
+    assert result.own_categories == result.categories
+    assert result.own_rule_score == result.rule_score
+
+
+def test_quote_with_own_words(rules: FastRules) -> None:
+    quoted = ReferencedPost(type="quoted", id="2", text="Tesla Q3 earnings: EPS beat estimates, $5B buyback")
+    result = evaluate(rules, "Raising full-year guidance too", referenced=[quoted])
+    assert result.own_categories == ["guidance"]
+    assert result.own_flagged and 1 <= result.own_rule_score < result.rule_score
+
+
+def test_repost_text_counts_as_own_text(rules: FastRules) -> None:
+    original = ReferencedPost(type="retweeted", id="2", text="Tesla raises full-year guidance")
+    result = evaluate(rules, "RT @Tesla: Tesla raises full-year", referenced=[original])
+    assert "guidance" in result.own_categories
+
+
+def test_watched_account_strong_own_news_counts_its_tickers(rules: FastRules) -> None:
+    # "we acquired 1,000 BTC" names no company, but from @saylor it is about MSTR
+    saylor = evaluate(rules, "we acquired 1,000 BTC", account=SAYLOR)
+    named = evaluate(rules, "MicroStrategy has acquired 1,000 BTC", account=SAYLOR)
+    assert saylor.tickers == []  # detected tickers stay what the text says
+    assert saylor.own_rule_score == named.own_rule_score == 7  # +3 account, +2 bitcoin, +1 numbers, +1 mine
+    # the same text from a non-watched author gets no ticker credit
+    assert evaluate(rules, "we acquired 1,000 BTC", account=None).rule_score == 3
+    # weak categories alone do not trigger the account credit
+    assert evaluate(rules, "Launching something tonight", account=ELON).rule_score == 1
+
+
+# --------------------------------------------------------------------------- common-word aliases (SCOR-4)
+
+
+@pytest.fixture(scope="module")
+def alias_rules() -> FastRules:
+    return FastRules(
+        Watchlist(
+            accounts=(ELON, SAYLOR),
+            keyword_rules=(),
+            my_tickers=("TSLA", "MSTR", "COIN", "META", "AMD", "GOOGL", "MSFT"),
+            company_names={
+                "MSTR": ("MicroStrategy", "Strategy"),
+                "COIN": ("Coinbase", "Base"),
+                "META": ("Meta", "Llama", "Meta Quest"),
+                "AMD": ("AMD", "Instinct"),
+                "GOOGL": ("Google", "Gemini", "=Gaudi"),
+                "MSFT": ("Microsoft", "Azure", "Copilot"),
+            },
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Our strategy is simple: build great products",
+        "Strategy is everything.",  # first word of a sentence
+        "Great quarter. Strategy matters",
+        "The base case is that crypto keeps growing",
+        "Back to base.",
+        "Base case: we keep shipping",
+        "So meta",
+        "Trust your instinct",
+        "my AI copilot",
+        "the azure sky",
+        "a llama farm",
+        "gaudi architecture",  # "=Gaudi" marks an alias exact-case
+    ],
+)
+def test_common_word_aliases_do_not_match_everyday_text(alias_rules: FastRules, text: str) -> None:
+    result = alias_rules.evaluate(make_post(text), ELON)
+    assert "company" not in result.categories, (text, result.reasons)
+    assert result.tickers == []
+
+
+@pytest.mark.parametrize(
+    ("text", "ticker"),
+    [
+        ("Strategy has acquired 1,000 BTC", None),  # sentence start: credited via the account instead
+        ("Today Strategy acquired 1,000 BTC", "MSTR"),
+        ("We are building on Base", "COIN"),
+        ("Meta is hiring", "META"),
+        ("New Meta Quest headset", "META"),
+        ("meta quest headsets", "META"),  # the multi-word alias stays case-insensitive
+        ("Instinct MI350 shipping", "AMD"),
+        ("Copilot is now in Word", "MSFT"),
+        ("microsoft and coinbase", "MSFT"),  # ordinary aliases stay case-insensitive
+        ("Gaudi chips", "GOOGL"),
+    ],
+)
+def test_aliases_still_match_when_capitalized(alias_rules: FastRules, text: str, ticker: str | None) -> None:
+    result = alias_rules.evaluate(make_post(text), ELON)
+    if ticker is None:
+        assert "company" not in result.categories, result.reasons
+    else:
+        assert ticker in result.tickers, (text, result.reasons)
+
+
+# --------------------------------------------------------------------------- precise vs broad keywords (SCOR-5)
+
+
+@pytest.mark.parametrize(
+    ("text", "category"),
+    [
+        ("Great results from our team", "earnings"),
+        ("Next quarter we ship faster", "earnings"),
+        ("Copilot in Outlook is now available", "guidance"),
+        ("Weather forecast says rain", "guidance"),
+        ("FSD v14.2 release notes are out", "offering"),
+        ("A new offering for developers", "offering"),
+        ("NASA space probe reaches Jupiter", "regulatory"),
+    ],
+)
+def test_broad_keywords_flag_but_do_not_score(rules: FastRules, text: str, category: str) -> None:
+    result = evaluate(rules, text, account=None)
+    assert category in result.categories  # still a hint for Claude
+    assert result.rule_score <= 2, (text, result)  # but adds nothing to the rules-only score
+
+
+@pytest.mark.parametrize(
+    ("text", "category"),
+    [
+        ("Q3 results are in", "earnings"),
+        ("Record quarter for deliveries", "earnings"),
+        ("We beat estimates", "earnings"),
+        ("Raising our full-year outlook", "guidance"),
+        ("Full-year forecast lowered", "guidance"),
+        ("Priced $1B of convertible senior notes", "offering"),
+        ("4.25% senior notes due 2030", "offering"),
+        ("Launching a secondary offering", "offering"),
+        ("FTC opens probe into the deal", "regulatory"),
+        ("Antitrust probe into cloud pricing", "regulatory"),
+    ],
+)
+def test_precise_keywords_score_as_strong(rules: FastRules, text: str, category: str) -> None:
+    result = evaluate(rules, text, account=None)
+    assert category in result.categories
+    assert result.rule_score >= 2, (text, result)
+
+
+def test_ray_ban_is_not_a_ban(rules: FastRules) -> None:
+    assert "regulatory" not in evaluate(rules, "Ray-Ban glasses now shipping").categories
+    assert "regulatory" in evaluate(rules, "New export-ban on chips").categories
+    assert "regulatory" in evaluate(rules, "The EU banned the app").categories
+
+
+def test_numbers_scoring_unchanged_by_precision_split(rules: FastRules) -> None:
+    satya = evaluate(rules, "Great results from our Azure team this quarter, release notes here", account=None)
+    assert satya.rule_score <= 2  # was 9 ("urgent") before broad words stopped counting as strong
+
+
+# --------------------------------------------------------------------------- long input (SEC-1)
+
+
+def _best_of(n: int, fn) -> float:
+    import time
+
+    best = float("inf")
+    for _ in range(n):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["1," * 12_500, "1" * 25_000, "1." * 12_500, "1%" * 12_500, "₿1," * 8_333, "$1," * 8_333, " " * 25_000],
+    ids=["1-comma", "digits", "1-dot", "1-percent", "btc-amount", "dollar", "spaces"],
+)
+def test_long_adversarial_text_evaluates_fast(rules: FastRules, text: str) -> None:
+    quoted = ReferencedPost(type="quoted", id="2", text=text)
+    own_post = make_post(text)
+    quoting = make_post("lol", referenced=[quoted, ReferencedPost(type="replied_to", id="3", text=text)])
+    # was 43 s for 25k chars of "1," (quadratic number patterns); now linear and the text is capped
+    assert _best_of(3, lambda: rules.evaluate(own_post, ELON)) < 0.1
+    assert _best_of(3, lambda: rules.evaluate(quoting, ELON)) < 0.1
+
+
+def test_number_patterns_are_linear_even_uncapped() -> None:
+    from ceoscan.scoring.rules import _BITCOIN_AMOUNT_RE, _NUMBER_RES
+
+    for text in ("1," * 12_500, "1" * 25_000, "1.1," * 6_250):
+        for rx in (*_NUMBER_RES, _BITCOIN_AMOUNT_RE):
+            assert _best_of(2, lambda rx=rx, text=text: list(rx.finditer(text))) < 0.05, rx.pattern
+
+
+def test_legit_numbers_still_match_after_redos_fix(rules: FastRules) -> None:
+    for text, value in [
+        ("500,000 vehicles", "500,000 vehicles"),
+        ("bought 1,000 BTC today", "1,000 BTC"),
+        ("1.2M units", "1.2M units"),
+        ("21,000 ₿ held", None),
+        ("grew.500 million users", "500 million users"),
+    ]:
+        result = evaluate(rules, text)
+        assert result.has_numbers or "bitcoin" in result.categories, text
+        if value:
+            assert any(value in r for r in result.reasons), (text, result.reasons)
+    assert "bitcoin" in evaluate(rules, "21,000 ₿ held").categories
+
+
+def test_very_long_post_is_capped_but_start_is_scanned(rules: FastRules) -> None:
+    from ceoscan.scoring.rules import MAX_POST_CHARS
+
+    text = "Tesla raises full-year guidance. " + "x " * MAX_POST_CHARS + " $NVDA"
+    result = evaluate(rules, text)
+    assert "guidance" in result.categories
+    assert "NVDA" not in result.tickers  # beyond the scanned prefix (Claude still sees all of it)
+
+
+def test_detected_tickers_are_bounded(rules: FastRules) -> None:
+    import itertools
+    import string
+
+    from ceoscan.scoring.rules import MAX_TICKERS
+
+    tags = " ".join("$" + "".join(t) for t in itertools.islice(itertools.product(string.ascii_uppercase, repeat=3), 500))
+    assert len(evaluate(rules, tags).tickers) == MAX_TICKERS

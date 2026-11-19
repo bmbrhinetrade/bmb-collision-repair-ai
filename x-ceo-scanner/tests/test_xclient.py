@@ -280,6 +280,25 @@ async def test_lookup_users_batches_by_100(client: XClient) -> None:
     assert users[0] == {"id": "1000", "username": "u0"}
 
 
+async def test_lookup_users_by_ids_batches_and_returns_errors(client: XClient) -> None:
+    def respond(url, **kwargs):
+        ids = url.query["ids"].split(",")
+        data = [{"id": i, "username": f"user{i}"} for i in ids if i != "42"]
+        errors = [{"value": "42", "title": "Not Found Error"}] if "42" in ids else []
+        return CallbackResult(status=200, payload={"data": data, "errors": errors})
+
+    calls = Calls(respond)
+    ids = [str(1000 + i) for i in range(120)] + ["42", "1000", "not-an-id"]
+    with aioresponses() as m:
+        m.get(re.compile(r"^https://api\.x\.com/2/users\?.*$"), callback=calls, repeat=True)
+        users, errors = await client.lookup_users_by_ids(ids, ["created_at"])
+
+    batches = [url.query["ids"].split(",") for url, _ in calls.seen]
+    assert [len(b) for b in batches] == [100, 21]  # duplicates and non-numeric ids are not requested
+    assert all(url.query["user.fields"] == "created_at" for url, _ in calls.seen)
+    assert len(users) == 120 and errors == [{"value": "42", "title": "Not Found Error"}]
+
+
 async def test_lookup_users_empty_makes_no_request(client: XClient) -> None:
     with aioresponses():  # any request would fail with "Connection refused"
         assert await client.lookup_users([], ["verified"]) == ([], [])
@@ -426,6 +445,19 @@ async def test_get_user_posts_omits_empty_params_and_clamps(client: XClient) -> 
         )
     q = calls.seen[0][0].query
     assert dict(q) == {"max_results": "5"}
+
+
+async def test_get_user_posts_sends_pagination_token(client: XClient) -> None:
+    calls = Calls(lambda url, **kw: CallbackResult(status=200, payload={"meta": {"result_count": 0}}))
+    with aioresponses() as m:
+        m.get(TIMELINE, callback=calls)
+        await client.get_user_posts(
+            "44196397", since_id="1850000000000000000", max_results=20, exclude=[], tweet_fields=[],
+            expansions=[], user_fields=[], pagination_token="7140dibdnow9c7btw3w29grvxfcgvpb9n9coehpk7xz5i",
+        )
+    q = calls.seen[0][0].query
+    assert q["pagination_token"] == "7140dibdnow9c7btw3w29grvxfcgvpb9n9coehpk7xz5i"
+    assert q["since_id"] == "1850000000000000000"  # the same cursor on every page
 
 
 async def test_get_user_posts_rejects_non_numeric_id(client: XClient) -> None:
