@@ -900,6 +900,26 @@ async def test_check_access_busy_stream(fake_x, session):
     assert any("busy" in m for m in r.messages)
 
 
+async def test_check_access_409_no_rules_means_available_and_paid(fake_x, session):
+    """Seen live: with credits but no rules yet, X answers the connect with 409 'must define rules'."""
+    fake_x.scripts = [
+        json_error(
+            409,
+            {
+                "title": "ConnectionException",
+                "detail": "You must define rules using the POST /2/tweets/search/stream/rules endpoint "
+                "before connecting to filtered stream.",
+                "type": "https://api.twitter.com/2/problems/streaming-connection",
+            },
+        )
+    ]
+    r = await check_access(AccessClient([], USAGE), make_settings(fake_x.base_url), 2, session, TOKEN)  # type: ignore[arg-type]
+    assert r.mode == "stream" and r.stream_available is True and r.credits_ok is True
+    assert not any("busy" in m for m in r.messages)
+    assert any("at least one rule" in m for m in r.messages)
+    assert "credits:          ok" in format_access_report(r)
+
+
 async def test_check_access_reports_a_rejected_bearer_token(fake_x, session):
     """SEC-10: a 401 anywhere sets auth_ok=False, so `check-access` exits 2 instead of 0."""
     from ceoscan.__main__ import EXIT_CONFIG, access_exit_code

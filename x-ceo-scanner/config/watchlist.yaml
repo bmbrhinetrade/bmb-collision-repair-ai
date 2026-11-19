@@ -30,6 +30,7 @@ my_tickers: [APMD]
 accounts:
   # --- Tesla / SpaceX --------------------------------------------------------------------
   - handle: elonmusk
+    user_id: "44196397"
     kind: person
     expect_name: Elon Musk
     tickers: [TSLA, SPCX]
@@ -39,11 +40,13 @@ accounts:
 
   # --- AMD ---------------------------------------------------------------------------------
   - handle: LisaSu
+    user_id: "836224570013138944"
     kind: person
     expect_name: Lisa Su
     tickers: [AMD]
     est_posts_per_day: 1
   - handle: AMD
+    user_id: "14861876"
     kind: company
     expect_name: AMD
     tickers: [AMD]
@@ -52,6 +55,7 @@ accounts:
 
   # --- NVIDIA (Jensen Huang has no active personal account; use the company account) ------
   - handle: nvidia
+    user_id: "61559439"
     kind: company
     expect_name: NVIDIA
     tickers: [NVDA]
@@ -60,11 +64,13 @@ accounts:
 
   # --- OpenAI (AI demand signals) ---------------------------------------------------------
   - handle: sama
+    user_id: "1605"
     kind: person
     expect_name: Sam Altman
     tickers: ["@ai_demand"]
     est_posts_per_day: 4
   - handle: OpenAI
+    user_id: "4398626122"
     kind: company
     expect_name: OpenAI
     tickers: ["@ai_demand"]
@@ -73,11 +79,13 @@ accounts:
 
   # --- Strategy / bitcoin -----------------------------------------------------------------
   - handle: saylor               # Executive Chairman of Strategy (CEO is Phong Le)
+    user_id: "244647486"
     kind: person
     expect_name: Michael Saylor
     tickers: ["@bitcoin"]
     est_posts_per_day: 6
   - handle: Strategy
+    user_id: "12764472"
     kind: company
     expect_name: Strategy
     tickers: ["@bitcoin"]
@@ -86,11 +94,13 @@ accounts:
 
   # --- Robinhood --------------------------------------------------------------------------
   - handle: vladtenev            # note: account was briefly hijacked Jul 23 2026 (fake memecoin post)
+    user_id: "605700792"
     kind: person
     expect_name: Vlad Tenev
     tickers: [HOOD]
     est_posts_per_day: 2
   - handle: RobinhoodApp
+    user_id: "1265037073"
     kind: company
     expect_name: Robinhood
     tickers: [HOOD]
@@ -99,11 +109,13 @@ accounts:
 
   # --- SoFi -------------------------------------------------------------------------------
   - handle: anthonynoto
+    user_id: "35739495"
     kind: person
     expect_name: Anthony Noto
     tickers: [SOFI]
     est_posts_per_day: 5
   - handle: SoFi
+    user_id: "264003515"
     kind: company
     expect_name: SoFi
     tickers: [SOFI]
@@ -112,26 +124,31 @@ accounts:
 
   # --- Big tech CEOs (AI capex) -----------------------------------------------------------
   - handle: satyanadella
+    user_id: "20571756"
     kind: person
     expect_name: Satya Nadella
     tickers: [MSFT, "@ai_capex"]
     est_posts_per_day: 2
   - handle: sundarpichai
+    user_id: "14130366"
     kind: person
     expect_name: Sundar Pichai
     tickers: [GOOGL, "@ai_capex"]
     est_posts_per_day: 1
   - handle: tim_cook             # reported: Apple Executive Chairman since Sep 1 2026
+    user_id: "1636590253"
     kind: person
     expect_name: Tim Cook
     tickers: [AAPL]
     est_posts_per_day: 1
   - handle: finkd
+    user_id: "20749410"
     kind: person
     expect_name: Mark Zuckerberg
     tickers: [META, "@ai_capex"]
     est_posts_per_day: 0.3
   - handle: JeffBezos
+    user_id: "15506669"
     kind: person
     expect_name: Jeff Bezos
     tickers: [AMZN, "@ai_capex"]
@@ -139,6 +156,7 @@ accounts:
 
   # --- Crypto -----------------------------------------------------------------------------
   - handle: brian_armstrong
+    user_id: "14379660"
     kind: person
     expect_name: Brian Armstrong
     tickers: ["@crypto"]
@@ -150,12 +168,14 @@ accounts:
 
   # Intel - CEO Lip-Bu Tan (since Mar 2025)
   - handle: intel
+    user_id: "2803191"
     kind: company
     expect_name: Intel
     tickers: [INTC]
     include_replies: false
     est_posts_per_day: 4
   - handle: LipBuTan1
+    user_id: "1548488713440595968"
     kind: person
     expect_name: Lip-Bu Tan
     tickers: [INTC]
@@ -163,12 +183,14 @@ accounts:
 
   # Micron - CEO Sanjay Mehrotra posts from a role-based handle
   - handle: MicronTech
+    user_id: "19037711"
     kind: company
     expect_name: Micron Technology
     tickers: [MU]
     include_replies: false
     est_posts_per_day: 3
   - handle: MicronCEO
+    user_id: "858053219976495106"
     kind: person
     expect_name: Sanjay Mehrotra
     tickers: [MU]
@@ -176,12 +198,14 @@ accounts:
 
   # Supermicro - live handle is @Supermicro (Supermicro_SMCI appears to be an old name)
   - handle: Supermicro
+    user_id: "374598930"
     kind: company
     expect_name: Supermicro
     tickers: [SMCI]
     include_replies: false
     est_posts_per_day: 3
   - handle: charlesliang
+    user_id: "1804163596533821440"
     kind: person
     expect_name: Charles Liang
     tickers: [SMCI]
@@ -213,6 +237,7 @@ accounts:
 
   # Twilio - no personal X account found for CEO Khozema Shipchandler (IR lists only @twilio)
   - handle: twilio
+    user_id: "15936194"
     kind: company
     expect_name: Twilio
     tickers: [TWLO]
@@ -221,6 +246,7 @@ accounts:
 
   # CleanSpark - CEO S. Matthew Schultz (since Aug 2025)
   - handle: CleanSpark_Inc
+    user_id: "1248284401714094081"
     kind: company
     expect_name: CleanSpark
     tickers: [CLSK]

@@ -164,6 +164,13 @@ async def check_access(
         stream_available = False
         why = "not available on this plan" if probe.error and indicates_no_stream_access(probe.error) else "forbidden"
         messages.append(f"filtered stream: {why} ({probe.error})")
+    elif probe.status == 409 and probe.error is not None and "must define rules" in str(probe.error).lower():
+        # X answers a connect with no rules on the app with 409 - only after billing and access passed.
+        stream_available, credits_ok = True, True
+        messages.append(
+            "filtered stream: available (X wants at least one rule before it connects; "
+            "`rules --apply` or `run` adds them)"
+        )
     elif probe.status in (409, 429):
         stream_available = True
         messages.append(
