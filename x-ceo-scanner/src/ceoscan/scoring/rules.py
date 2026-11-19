@@ -134,6 +134,18 @@ MAX_TICKERS = 25
 
 _TICKER_SHAPE = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 
+# Tickers that are also everyday English words. In all-caps posts ("DOWNLOAD THE APP", "SHOP NOW",
+# "MEME COIN", "IT IS NOW THE BIGGEST...") a bare uppercase match is almost never the stock, so these
+# only count as $CASHTAGS (like 1-2 letter tickers). Company-name aliases still work as usual.
+COMMON_WORD_TICKERS: frozenset[str] = frozenset(
+    {
+        "ALL", "AND", "ANY", "APP", "ARE", "BIG", "CAN", "CAR", "CASH", "CAT", "COIN", "DOW", "EAT", "EYE",
+        "FAST", "FIVE", "FOR", "FUN", "GOOD", "HAS", "HOOD", "HOME", "HOT", "JOB", "KEY", "LIFE", "LOVE",
+        "LOW", "MAIN", "META", "NEW", "NICE", "NOW", "ONE", "OPEN", "OUT", "PLAY", "REAL", "RUN", "SAFE",
+        "SEE", "SHOP", "SNOW", "TECH", "TRUE", "TWO", "WELL", "WIN", "YOU",
+    }
+)
+
 # $TSLA, $tsla, $BRK.B ; never "$5B" (must start with a letter). "$TSLA." -> TSLA.
 _CASHTAG_RE = re.compile(r"(?<![A-Za-z0-9_$])\$([A-Za-z]{1,6}(?:\.[A-Za-z]{1,2})?)(?![A-Za-z0-9_])")
 
@@ -1043,10 +1055,14 @@ class FastRules:
         self.watchlist = watchlist
         self.my_tickers: tuple[str, ...] = tuple(t.upper() for t in watchlist.my_tickers)
 
-        # Bare uppercase tickers: only >= 3 chars (letters part), case-sensitive.
-        # 1-2 character tickers ("MU", "F") are far too ambiguous and only count as $cashtags.
+        # Bare uppercase tickers: only >= 3 chars (letters part), case-sensitive, and not an everyday word.
+        # 1-2 character tickers ("MU", "F") and COMMON_WORD_TICKERS ("NOW", "APP") only count as $cashtags.
         bare = sorted(
-            {t for t in self.my_tickers if len(t.replace(".", "")) >= 3 and _TICKER_SHAPE.match(t)},
+            {
+                t
+                for t in self.my_tickers
+                if len(t.replace(".", "")) >= 3 and _TICKER_SHAPE.match(t) and t not in COMMON_WORD_TICKERS
+            },
             key=len,
             reverse=True,
         )

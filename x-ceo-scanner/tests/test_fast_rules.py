@@ -615,3 +615,18 @@ def test_detected_tickers_are_bounded(rules: FastRules) -> None:
 
     tags = " ".join("$" + "".join(t) for t in itertools.islice(itertools.product(string.ascii_uppercase, repeat=3), 500))
     assert len(evaluate(rules, tags).tickers) == MAX_TICKERS
+
+
+def test_word_like_tickers_only_count_as_cashtags() -> None:
+    """Seen live: an all-caps quoted post ('...VISION IS NOW THE BIGGEST NETWORK...') was tagged NOW (ServiceNow)."""
+    from ceoscan.models import Watchlist
+
+    wl = Watchlist(accounts=(), keyword_rules=(), my_tickers=("NOW", "APP", "SHOP", "COIN", "META", "NVDA"),
+                   company_names={})
+    fr = FastRules(wl)
+    shout = "ELON MUSK'S 2015 SATELLITE VISION IS NOW THE BIGGEST NETWORK. DOWNLOAD THE APP, SHOP NOW, MEME COIN, META"
+    res = evaluate(fr, shout)
+    assert not {"NOW", "APP", "SHOP", "COIN", "META"} & set(res.tickers)
+    assert "ticker" not in res.categories
+    cash = evaluate(fr, "$NOW and $APP beat; $SHOP raised guidance; NVDA too")
+    assert {"NOW", "APP", "SHOP", "NVDA"} <= set(cash.tickers)
