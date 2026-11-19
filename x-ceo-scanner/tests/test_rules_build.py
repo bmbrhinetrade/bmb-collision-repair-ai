@@ -540,3 +540,47 @@ def test_render_term_cashtags_words_and_phrases():
     assert render_term("AD-109") == '"AD-109"'
     assert render_term("  sleep   apnea pill ") == '"sleep apnea pill"'
     assert render_term("") == ""
+
+
+def _kw_watchlist(tmp_path: Path, rule_yaml: str) -> Watchlist:
+    p = tmp_path / "wl.yaml"
+    p.write_text("my_tickers: [APMD, TLN]\naccounts: []\nkeyword_rules:\n" + rule_yaml)
+    return load_watchlist(p)
+
+
+def test_keyword_rule_terms_are_or_ed_with_cashtags(tmp_path):
+    wl = _kw_watchlist(
+        tmp_path,
+        "  - name: apmd\n    tickers: [APMD]\n    terms: [Apnimed, AD109, $apmd, \"Talen Energy\", Apnimed]\n"
+        "    min_followers: 1000\n    extra_operators: \"-is:retweet lang:en\"\n    est_posts_per_day: 6\n",
+    )
+    assert wl.keyword_rules[0].terms == ("Apnimed", "AD109", "$apmd", "Talen Energy")
+    built = build_rules(wl, RulesSettings())
+    assert [r.value for r in built.rules] == [
+        '($APMD OR Apnimed OR AD109 OR "Talen Energy") min_followers:1000 -is:retweet lang:en'
+    ]
+
+
+def test_keyword_rule_terms_only_and_all_keeps_terms(tmp_path):
+    wl = _kw_watchlist(tmp_path, "  - name: words\n    tickers: []\n    terms: [Oxnimbi]\n  - name: big\n    terms: [Talen]\n")
+    built = build_rules(wl, RulesSettings())
+    values = [r.value for r in built.rules]
+    assert values[0].startswith("Oxnimbi min_followers:")
+    assert wl.keyword_rules[1].tickers == ("APMD", "TLN") and wl.keyword_rules[1].terms == ("Talen",)
+    assert values[1].startswith("($APMD OR $TLN OR Talen) min_followers:1000000")
+
+
+@pytest.mark.parametrize("bad", ['"quoted"', "a:b", "(x)", "", "x" * 61, "true"])
+def test_keyword_rule_rejects_bad_terms(tmp_path, bad):
+    from ceoscan.config import ConfigError
+
+    term = bad if bad != "true" else True
+    with pytest.raises(ConfigError):
+        _kw_watchlist(tmp_path, f"  - name: bad\n    tickers: [APMD]\n    terms: [{term!r}]\n" if bad != "true" else "  - name: bad\n    tickers: [APMD]\n    terms: [true]\n")
+
+
+def test_keyword_rule_needs_tickers_or_terms(tmp_path):
+    from ceoscan.config import ConfigError
+
+    with pytest.raises(ConfigError, match="needs tickers or terms"):
+        _kw_watchlist(tmp_path, "  - name: empty\n    tickers: []\n")

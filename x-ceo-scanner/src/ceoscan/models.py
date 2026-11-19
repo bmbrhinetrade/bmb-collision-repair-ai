@@ -47,6 +47,8 @@ class KeywordRule:
     min_followers: int = 1_000_000
     extra_operators: str = "-is:retweet -is:reply"  # appended verbatim to the rule
     est_posts_per_day: float = 50.0
+    # Extra words / exact phrases OR-ed with the cashtags, e.g. ("Apnimed", "AD109", "Talen Energy").
+    terms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

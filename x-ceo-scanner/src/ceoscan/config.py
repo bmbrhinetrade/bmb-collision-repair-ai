@@ -21,7 +21,7 @@ import re
 import sys
 import types
 import typing
-from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass, replace as _dc_replace
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -501,7 +501,9 @@ ACCOUNT_KEYS = (
     "user_id",
     "notes",
 )
-KEYWORD_RULE_KEYS = ("name", "tickers", "min_followers", "extra_operators", "est_posts_per_day")
+KEYWORD_RULE_KEYS = ("name", "tickers", "terms", "min_followers", "extra_operators", "est_posts_per_day")
+# A keyword-rule term: a $CASHTAG, a word or a plain phrase. No quotes, parentheses or ":" (X operators).
+_KW_TERM_RE = re.compile(r"^\$?[A-Za-z0-9][A-Za-z0-9 ._'&+-]{0,59}$")
 
 
 def _check_keys(item: Any, allowed: tuple[str, ...], path: str) -> dict[str, Any]:
@@ -625,13 +627,29 @@ def load_watchlist(path: str | Path) -> Watchlist:
             extra = ""
         if not isinstance(extra, str):
             raise ConfigError(f"{where}.extra_operators must be text (got {extra!r})")
+        terms_cfg = k.get("terms") or []
+        if not isinstance(terms_cfg, list):
+            raise ConfigError(f"{where}.terms must be a list, e.g. [Apnimed, AD109, \"Talen Energy\"] (got {terms_cfg!r})")
+        terms: list[str] = []
+        for t in terms_cfg:
+            text = " ".join(str(t).split()) if isinstance(t, (str, int)) and not isinstance(t, bool) else None
+            if not text or not _KW_TERM_RE.match(text):
+                raise ConfigError(
+                    f"{where}.terms: {t!r} is not a valid term - use a $CASHTAG, a word or a plain phrase"
+                    " (letters, digits, spaces, . _ ' & + -; at most 60 characters; no quotes, parentheses or ':')"
+                )
+            terms.append(text)
+        tickers = ("__ALL__",) if tickers_cfg == "all" else expand(tickers_cfg, f"{where}.tickers")
+        if not tickers and not terms:
+            raise ConfigError(f"{where} needs tickers or terms")
         kw_rules.append(
             KeywordRule(
                 name=str(k.get("name") or f"keywords-{i}"),
-                tickers=("__ALL__",) if tickers_cfg == "all" else expand(tickers_cfg, f"{where}.tickers"),
+                tickers=tickers,
                 min_followers=min_followers,
                 extra_operators=extra,
                 est_posts_per_day=_wl_number(k, "est_posts_per_day", 50.0, where),
+                terms=tuple(dict.fromkeys(terms)),
             )
         )
 
@@ -644,7 +662,7 @@ def load_watchlist(path: str | Path) -> Watchlist:
     my_tickers = tuple(dict.fromkeys(my))
     # "all" keyword rules mean "every ticker I care about".
     kw_rules = [
-        KeywordRule(k.name, my_tickers, k.min_followers, k.extra_operators, k.est_posts_per_day)
+        _dc_replace(k, tickers=my_tickers)
         if k.tickers == ("__ALL__",)
         else k
         for k in kw_rules

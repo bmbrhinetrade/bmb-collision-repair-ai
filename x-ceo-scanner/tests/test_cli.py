@@ -268,7 +268,16 @@ def test_run_without_verified_accounts_exits_2(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("X_BEARER_TOKEN", TOKEN)
-    assert cli.main([*global_flags(missing_env), "run"]) == 2  # the example watchlist has no user_ids
+    # the shipped watchlist now carries verified user_ids: use a copy without them
+    unverified = tmp_path / "watchlist.yaml"
+    unverified.write_text(
+        "".join(line for line in WATCHLIST.read_text(encoding="utf-8").splitlines(keepends=True)
+                if not line.strip().startswith("user_id:")),
+        encoding="utf-8",
+    )
+    assert not any(a.user_id for a in load_watchlist(unverified).accounts)
+    flags = ["--settings", str(SETTINGS), "--watchlist", str(unverified), "--env", missing_env]
+    assert cli.main([*flags, "run"]) == 2
     out = capsys.readouterr().out
     assert "verify --write" in out
     assert ALERTS_ONLY_BANNER in out

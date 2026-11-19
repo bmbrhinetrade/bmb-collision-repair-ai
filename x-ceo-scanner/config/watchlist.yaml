@@ -211,29 +211,30 @@ accounts:
     tickers: [SMCI]
     est_posts_per_day: 0.3
 
-  # Constellation Energy - no personal X account found for CEO Joe Dominguez
+  # Constellation Energy - no personal X account found for CEO Joe Dominguez.
+  # Official but has no X badge (PJM's 2026 company profile links it); accepted explicitly.
   - handle: ConstellationEG
+    user_id: "35742491"
     kind: company
     expect_name: Constellation
     tickers: [CEG]
     include_replies: false
     est_posts_per_day: 1
 
-  # Vistra - no personal X account found for CEO Jim Burke
+  # Vistra - no personal X account found for CEO Jim Burke.
+  # Official (bio "Vistra (NYSE: VST)...", deal threads match investor releases) but no badge
+  # and ~2.6K followers; accepted explicitly. Posts rarely.
   - handle: VistraCorp
+    user_id: "748215038159183872"
     kind: company
     expect_name: Vistra
     tickers: [VST]
     include_replies: false
-    est_posts_per_day: 1
+    est_posts_per_day: 0.2
 
-  # Talen Energy - account looks dormant; CEO changes Jan 1 2027 (McFarland -> Terry Nutt), no X found
-  - handle: TalenEnergy
-    kind: company
-    expect_name: Talen Energy
-    tickers: [TLN]
-    include_replies: false
-    est_posts_per_day: 0.1
+  # Talen Energy (TLN) - @TalenEnergy has been dormant since 2016 and no CEO account exists
+  # (CEO changes Jan 1 2027: McFarland -> Terry Nutt). TLN is covered by the "tln-news"
+  # keyword rule below instead.
 
   # Twilio - no personal X account found for CEO Khozema Shipchandler (IR lists only @twilio)
   - handle: twilio
@@ -244,7 +245,7 @@ accounts:
     include_replies: false
     est_posts_per_day: 3
 
-  # CleanSpark - CEO S. Matthew Schultz (since Aug 2025)
+  # CleanSpark - CEO S. Matthew Schultz (since Aug 2025; bio: "Chairman, Chief Executive Officer... My only account")
   - handle: CleanSpark_Inc
     user_id: "1248284401714094081"
     kind: company
@@ -253,49 +254,74 @@ accounts:
     include_replies: false
     est_posts_per_day: 2
   - handle: smatthewschultz
+    user_id: "61530684"
     kind: person
-    expect_name: Matt Schultz
+    expect_name: Matthew Schultz
     tickers: [CLSK, "@bitcoin"]
     est_posts_per_day: 1
 
-  # APMD = Apnimed (Nasdaq IPO Jul 2026). If you meant APLD (Applied Digital), swap in @APLDdigital.
+  # APMD = Apnimed (Nasdaq: APMD, IPO Jul 31 2026; CEO Kevin Lind since Jun 2026). Oral pill AD109
+  # (proposed brand Oxnimbi) for obstructive sleep apnea; FDA decision (PDUFA) due Feb 28 2027,
+  # IPO lock-up ends ~Jan 27 2027. @apnimed is the official account but has been silent since
+  # Jul 2025 (604 followers, no badge); it is kept as a free "sleeper" in case it wakes up for the
+  # launch. No executive has an X account. Real APMD coverage: the "apmd-catalysts" keyword rule.
   - handle: apnimed
+    user_id: "1298383946892414983"
     kind: company
     expect_name: Apnimed
     tickers: [APMD]
     include_replies: false
+    est_posts_per_day: 0.2
+
+  # --- Leadership changes (checked on X 2026-11-19: active, blue badge, 1M+ followers) ----------
+  # Jensen Huang joined X Jun 2026 (bio "Founder of NVIDIA"); John Ternus has been Apple CEO since
+  # Sep 1 2026 (Tim Cook is Executive Chairman); Andy Jassy is Amazon's CEO. The two new accounts are
+  # younger than a year, so verify flags them for a manual look before their ids are pinned.
+  - handle: JensenHuang
+    user_id: "2070631956824698880"
+    kind: person
+    expect_name: Jensen Huang
+    tickers: [NVDA, "@ai_demand"]
+    est_posts_per_day: 0.3
+  - handle: johnternus
+    user_id: "2067675948074582016"
+    kind: person
+    expect_name: John Ternus
+    tickers: [AAPL]
+    est_posts_per_day: 0.3
+  - handle: ajassy
+    user_id: "26389359"
+    kind: person
+    expect_name: Andy Jassy
+    tickers: [AMZN, "@ai_capex"]
     est_posts_per_day: 0.5
 
-  # --- Suggestions from research (leadership changes) - uncomment to watch ----------------
-  # - handle: APLDdigital          # Applied Digital (APLD), if APMD was a typo
-  #   kind: company
-  #   expect_name: Applied Digital
-  #   tickers: [APLD]
-  #   include_replies: false
-  #   est_posts_per_day: 2
-  # - handle: JensenHuang          # reported: joined X Jul 2026; resigned as NVIDIA CEO Nov 12 2026
-  #   kind: person
-  #   expect_name: Jensen Huang
-  #   tickers: [NVDA]
-  #   est_posts_per_day: 0.5
-  # - handle: johnternus           # reported: Apple CEO since Sep 1 2026 (Tim Cook now Exec Chairman)
-  #   kind: person
-  #   expect_name: John Ternus
-  #   tickers: [AAPL]
-  #   est_posts_per_day: 0.5
-  # - handle: ajassy               # Amazon CEO (Jeff Bezos is not Amazon's CEO) - handle unverified
-  #   kind: person
-  #   expect_name: Andy Jassy
-  #   tickers: [AMZN, "@ai_capex"]
-  #   est_posts_per_day: 0.5
-
-# Handle-less keyword rules: posts that mention my tickers as $CASHTAGS from very large accounts.
+# Handle-less keyword rules: posts from accounts with at least min_followers that mention any
+# of the tickers (as $CASHTAGS) or terms (words, or "exact phrases" when they contain spaces).
 keyword_rules:
   - name: big-account-cashtags
     tickers: all                     # "all" = every ticker above; or a list like [TSLA, NVDA]
     min_followers: 1000000
     extra_operators: "-is:retweet -is:reply lang:en"
     est_posts_per_day: 60
+  # Small-cap biotech: news comes from biotech/FDA trackers and trade press with 1K-100K followers
+  # (fda_tracker, FierceBiotech, Endpoints, HME News, Boston Business Journal...). Every term is unique
+  # to Apnimed; generic words (OSA, sleep apnea, atomoxetine) are left out on purpose. Expect spikes
+  # on catalyst days (lock-up ~Jan 27, PDUFA ~Feb 26-28 2027).
+  - name: apmd-catalysts
+    tickers: [APMD]
+    terms: [Apnimed, Oxnimbi, AD109, aroxybutynin, LunAIRo, SynAIRgy]
+    min_followers: 1000
+    extra_operators: "-is:retweet -is:reply lang:en"
+    est_posts_per_day: 6
+  # Talen Energy has no active X account; catch news from mid-size accounts instead. "Talen Energy"
+  # is an exact phrase because Talen alone is also a surname.
+  - name: tln-news
+    tickers: [TLN]
+    terms: ["Talen Energy"]
+    min_followers: 20000
+    extra_operators: "-is:retweet -is:reply lang:en"
+    est_posts_per_day: 8
 
 # Company names / product words the fast rules treat like a ticker mention. Matching ignores case,
 # except: an alias written with a leading "=" (e.g. "=Gaudi") matches only with that exact case, and
@@ -324,4 +350,4 @@ company_names:
   VST: [Vistra]
   TLN: ["Talen Energy", Talen]
   TWLO: [Twilio]
-  APMD: [Apnimed, AD109, Oxnimbi]
+  APMD: [Apnimed, AD109, Oxnimbi, aroxybutynin, LunAIRo, SynAIRgy]

@@ -179,8 +179,9 @@ def build_rules(watchlist: Watchlist, settings: RulesSettings) -> RuleBuildResul
             continue
         if kw.min_followers < LOW_MIN_FOLLOWERS_WARNING:
             warnings.append(
-                f"keyword rule {kw.name!r} uses min_followers:{kw.min_followers}; this can match a very"
-                " large (and costly) volume of posts"
+                f"keyword rule {kw.name!r} uses min_followers:{kw.min_followers} (watchlist estimate:"
+                f" {kw.est_posts_per_day:g} posts/day); a low threshold with common words can match a large"
+                " (and costly) volume of posts - check the daily summary's post count"
             )
         tail = _with_tail(f"min_followers:{int(kw.min_followers)}", _normalize_ops(kw.extra_operators))
 
