@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ceoscan"
+version = "1.0.0"
+description = "Real-time X (Twitter) CEO post scanner that pushes market-moving posts to your phone. Alerts only - never trades."
+requires-python = ">=3.12"
+dependencies = [
+  "anthropic==2.10.0",
+  "aiohttp==3.14.5",
+  "ruamel.yaml==0.19.1",
+  "python-dotenv==1.2.4",
+  "tzdata==2026.6",
+]
+
+[project.scripts]
+ceoscan = "ceoscan.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]

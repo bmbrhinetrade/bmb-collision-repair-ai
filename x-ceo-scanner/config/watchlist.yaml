@@ -1,0 +1,179 @@
+# ceoscan watchlist - who to watch and which tickers each account can move.
+#
+# After editing handles, run:   python -m ceoscan verify --write
+# That looks every handle up on X (GET /2/users/by), checks it is the real verified
+# account, writes its numeric user_id below, and prints a report of anything wrong.
+# Accounts without a user_id are NOT streamed (never stream an unverified handle).
+#
+# Fields per account:
+#   handle             X handle without "@"
+#   kind               person | company
+#   expect_name        display name we expect; verify flags a mismatch (catches look-alikes)
+#   tickers            tickers this account can move; "@group" pulls in a ticker_groups entry
+#   always_alert       true = alert on every post (still scored), regardless of score
+#   include_replies    false = ignore this account's replies (big cost saver for heavy repliers)
+#   include_retweets   false (default) = ignore plain reposts; quote posts are always included
+#   est_posts_per_day  only used for the startup cost estimate
+#   user_id            filled in by `verify --write`; do not edit by hand
+
+ticker_groups:
+  big_tech: [AAPL, MSFT, GOOGL, AMZN, META, NVDA]
+  ai_capex: [NVDA, AMD, SMCI, MU, MSFT, CEG, VST, TLN]
+  ai_demand: [NVDA, AMD, SMCI, MSFT]
+  bitcoin: [MSTR, CLSK]
+  crypto: [COIN, MSTR, CLSK, HOOD]
+
+# Extra tickers you care about that no account below maps to (used by Claude + keyword rules).
+my_tickers: [APMD]
+
+accounts:
+  # --- Tesla / SpaceX --------------------------------------------------------------------
+  - handle: elonmusk
+    kind: person
+    expect_name: Elon Musk
+    tickers: [TSLA, SPCX]
+    always_alert: false
+    include_replies: true            # Elon replies ~100x/day; set false to cut X cost by ~60%
+    est_posts_per_day: 100
+
+  # --- AMD ---------------------------------------------------------------------------------
+  - handle: LisaSu
+    kind: person
+    expect_name: Lisa Su
+    tickers: [AMD]
+    est_posts_per_day: 1
+  - handle: AMD
+    kind: company
+    expect_name: AMD
+    tickers: [AMD]
+    include_replies: false
+    est_posts_per_day: 4
+
+  # --- NVIDIA (Jensen Huang has no active personal account; use the company account) ------
+  - handle: nvidia
+    kind: company
+    expect_name: NVIDIA
+    tickers: [NVDA]
+    include_replies: false
+    est_posts_per_day: 5
+
+  # --- OpenAI (AI demand signals) ---------------------------------------------------------
+  - handle: sama
+    kind: person
+    expect_name: Sam Altman
+    tickers: ["@ai_demand"]
+    est_posts_per_day: 4
+  - handle: OpenAI
+    kind: company
+    expect_name: OpenAI
+    tickers: ["@ai_demand"]
+    include_replies: false
+    est_posts_per_day: 5
+
+  # --- Strategy / bitcoin -----------------------------------------------------------------
+  - handle: saylor
+    kind: person
+    expect_name: Michael Saylor
+    tickers: ["@bitcoin"]
+    est_posts_per_day: 6
+  - handle: Strategy
+    kind: company
+    expect_name: Strategy
+    tickers: ["@bitcoin"]
+    include_replies: false
+    est_posts_per_day: 1
+
+  # --- Robinhood --------------------------------------------------------------------------
+  - handle: vladtenev
+    kind: person
+    expect_name: Vlad Tenev
+    tickers: [HOOD]
+    est_posts_per_day: 2
+  - handle: RobinhoodApp
+    kind: company
+    expect_name: Robinhood
+    tickers: [HOOD]
+    include_replies: false
+    est_posts_per_day: 3
+
+  # --- SoFi -------------------------------------------------------------------------------
+  - handle: anthonynoto
+    kind: person
+    expect_name: Anthony Noto
+    tickers: [SOFI]
+    est_posts_per_day: 5
+  - handle: SoFi
+    kind: company
+    expect_name: SoFi
+    tickers: [SOFI]
+    include_replies: false
+    est_posts_per_day: 3
+
+  # --- Big tech CEOs (AI capex) -----------------------------------------------------------
+  - handle: satyanadella
+    kind: person
+    expect_name: Satya Nadella
+    tickers: [MSFT, "@ai_capex"]
+    est_posts_per_day: 2
+  - handle: sundarpichai
+    kind: person
+    expect_name: Sundar Pichai
+    tickers: [GOOGL, "@ai_capex"]
+    est_posts_per_day: 1
+  - handle: tim_cook
+    kind: person
+    expect_name: Tim Cook
+    tickers: [AAPL]
+    est_posts_per_day: 1
+  - handle: finkd
+    kind: person
+    expect_name: Mark Zuckerberg
+    tickers: [META, "@ai_capex"]
+    est_posts_per_day: 0.3
+  - handle: JeffBezos
+    kind: person
+    expect_name: Jeff Bezos
+    tickers: [AMZN, "@ai_capex"]
+    est_posts_per_day: 0.3
+
+  # --- Crypto -----------------------------------------------------------------------------
+  - handle: brian_armstrong
+    kind: person
+    expect_name: Brian Armstrong
+    tickers: ["@crypto"]
+    est_posts_per_day: 4
+
+  # --- Company accounts (INTC, MU, SMCI, CEG, VST, TLN, TWLO, CLSK) -----------------------
+  # CEO_AND_COMPANY_ACCOUNTS_PLACEHOLDER
+
+# Handle-less keyword rules: posts that mention my tickers as $CASHTAGS from very large accounts.
+keyword_rules:
+  - name: big-account-cashtags
+    tickers: all                     # "all" = every ticker above; or a list like [TSLA, NVDA]
+    min_followers: 1000000
+    extra_operators: "-is:retweet -is:reply lang:en"
+    est_posts_per_day: 60
+
+# Company names / product words the fast rules treat like a ticker mention.
+company_names:
+  TSLA: [Tesla, Cybertruck, Optimus, Robotaxi, Cybercab, "Model Y", "Model 3", Megapack, FSD]
+  SPCX: [SpaceX, Starlink, Starship, Falcon 9]
+  AMD: [AMD, Radeon, Ryzen, EPYC, Instinct, MI350, MI400, MI450]
+  NVDA: [Nvidia, NVIDIA, Blackwell, Rubin, GeForce, CUDA, "GB200", "GB300"]
+  SMCI: [Supermicro, "Super Micro"]
+  MSFT: [Microsoft, Azure, Copilot]
+  GOOGL: [Google, Alphabet, Gemini, Waymo, YouTube, TPU]
+  AAPL: [Apple, iPhone, "Vision Pro"]
+  AMZN: [Amazon, AWS, Trainium, Kuiper]
+  META: [Meta, Instagram, WhatsApp, Llama]
+  MSTR: [MicroStrategy, Strategy]
+  CLSK: [CleanSpark]
+  HOOD: [Robinhood]
+  SOFI: [SoFi]
+  COIN: [Coinbase, Base]
+  INTC: [Intel, "18A", "14A", Gaudi]
+  MU: [Micron, HBM]
+  CEG: ["Constellation Energy"]
+  VST: [Vistra]
+  TLN: ["Talen Energy", Talen]
+  TWLO: [Twilio]
