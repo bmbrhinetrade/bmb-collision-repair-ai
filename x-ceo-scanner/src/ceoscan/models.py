@@ -140,7 +140,12 @@ class RuleResult:
     categories: list[str] = field(default_factory=list)  # e.g. ["ticker", "earnings", "numbers"]
     tickers: list[str] = field(default_factory=list)  # tickers detected by rules (uppercase)
     has_numbers: bool = False
-    rule_score: int = 0  # rough 0-10 heuristic, used only when Claude is unavailable
+    rule_score: int = 0  # rough 0-10 heuristic over post + quoted/parent context
+    # The same evaluation over the post's OWN text only (no quoted/parent context). The rules-only
+    # fallback score is based on this so a bare "lol" quoting an earnings post cannot score 10.
+    own_flagged: bool = False
+    own_categories: list[str] = field(default_factory=list)
+    own_rule_score: int = 0
 
 
 @dataclass
@@ -202,6 +207,7 @@ class AlertRecord:
     direction: str | None = None
     tickers: list[str] = field(default_factory=list)
     quiet_hours: bool = False
+    late: bool = False  # post was older than alerts.max_post_age_seconds when received (catch-up)
     # latency breakdown, all milliseconds; None for system alerts
     total_latency_ms: int | None = None  # post created -> first successful push channel returned
     x_delay_ms: int | None = None  # post created -> we received it

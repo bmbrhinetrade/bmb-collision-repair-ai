@@ -55,6 +55,9 @@ class RecoverySettings:
     enabled: bool = True  # after a stream gap, poll each account's timeline with since_id
     min_gap_seconds: float = 20.0
     max_results: int = 20
+    max_pages: int = 5  # follow pagination up to this many pages per account during catch-up
+    max_age_seconds: float = 3600.0  # never catch up on posts older than this (cost + noise bound)
+    on_startup: bool = True  # also catch up once after the first connect of a process (restarts/deploys)
 
 
 @dataclass
@@ -120,8 +123,14 @@ class ScoringSettings:
     joke_threshold: int = 9  # posts Claude marks as joke/meme alert only at this score or higher
     require_my_ticker: bool = True  # non-always-alert posts must affect at least one of my tickers
     score_always_alert_unflagged: bool = True  # Claude-score always-alert posts even if fast rules miss
-    timeout_seconds: float = 4.0
-    max_retries: int = 1
+    # Send every post from a watched account to Claude (fast rules become hints). Posts like
+    # "Funding secured." or a CEO resignation slip past keyword rules; scoring them all costs < $1/month.
+    # Keyword-rule (non-watchlist) posts are always gated by the fast rules.
+    score_watchlist_unflagged: bool = True
+    timeout_seconds: float = 4.0  # per-request timeout
+    total_budget_seconds: float = 4.0  # hard cap on all Claude attempts for one post (latency target < 10 s)
+    max_retries: int = 1  # only for fast failures (429/5xx/connection) when budget remains; never after a timeout
+    fallback_max_impact: int = 7  # rules-only scores (Claude down / no key) never exceed this
     max_tokens: int = 1024
     enabled: bool = True  # false -> use rules_fallback scores only
     pricing: ClaudePricing = field(default_factory=ClaudePricing)
@@ -171,6 +180,9 @@ class AlertSettings:
     sms: SmsSettings = field(default_factory=SmsSettings)
     email: EmailSettings = field(default_factory=EmailSettings)
     send_timeout_seconds: float = 5.0
+    # Posts older than this when received (gap recovery, catch-up) are stored and scored but pushed only
+    # as low-priority "missed during outage" alerts (no SMS, no urgent) and left out of latency stats.
+    max_post_age_seconds: float = 900.0
 
 
 @dataclass
@@ -181,14 +193,18 @@ class DailySummarySettings:
 
 @dataclass
 class OpsSettings:
-    health_host: str = "0.0.0.0"
+    health_host: str = "127.0.0.1"  # env CEOSCAN_HEALTH_HOST overrides (the Docker image sets 0.0.0.0)
     health_port: int = 8080
     db_path: str = "data/ceoscan.db"
     log_level: str = "INFO"
     stream_down_alert_seconds: float = 120.0
     daily_summary: DailySummarySettings = field(default_factory=DailySummarySettings)
-    pipeline_workers: int = 4
+    pipeline_workers: int = 8
     queue_max: int = 10_000
+    # What `run` does on a non-transient configuration error: "exit" (code 2; systemd will not restart) or
+    # "wait" (stay up, report it on /health, never exit - avoids Docker restart loops). Env
+    # CEOSCAN_CONFIG_ERROR_ACTION overrides; the Docker image sets "wait".
+    config_error_action: str = "exit"
 
 
 @dataclass
@@ -219,12 +235,28 @@ def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
     return cls(**kwargs)
 
 
+# Non-secret deployment overrides read from the environment (used by the Docker image).
+ENV_OVERRIDES = {
+    "CEOSCAN_HEALTH_HOST": ("ops", "health_host"),
+    "CEOSCAN_CONFIG_ERROR_ACTION": ("ops", "config_error_action"),
+}
+
+
+def _apply_env_overrides(settings: Settings) -> None:
+    for env_name, (section, attr) in ENV_OVERRIDES.items():
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            setattr(getattr(settings, section), attr, value.strip())
+
+
 def load_settings(path: str | Path) -> Settings:
     p = Path(path)
-    if not p.exists():
-        return Settings()
-    raw = YAML(typ="safe").load(p.read_text(encoding="utf-8")) or {}
-    settings = _build(Settings, raw, "settings")
+    if p.exists():
+        raw = YAML(typ="safe").load(p.read_text(encoding="utf-8")) or {}
+        settings = _build(Settings, raw, "settings")
+    else:
+        settings = Settings()
+    _apply_env_overrides(settings)
     _validate_settings(settings)
     return settings
 
@@ -248,6 +280,12 @@ def _validate_settings(s: Settings) -> None:
         raise ConfigError("x_api.poll.max_results must be 5-100")
     if not 0 <= s.x_api.stream.backfill_minutes <= 5:
         raise ConfigError("x_api.stream.backfill_minutes must be 0-5")
+    if s.ops.config_error_action not in ("exit", "wait"):
+        raise ConfigError("ops.config_error_action must be exit or wait")
+    if not 1 <= int(s.scoring.fallback_max_impact) <= 10:
+        raise ConfigError("scoring.fallback_max_impact must be 1-10")
+    if s.scoring.total_budget_seconds <= 0:
+        raise ConfigError("scoring.total_budget_seconds must be > 0")
 
 
 # --------------------------------------------------------------------------- watchlist

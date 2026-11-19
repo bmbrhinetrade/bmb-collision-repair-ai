@@ -20,6 +20,9 @@ x_api:
     enabled: true                     # after a stream outage, fetch missed posts per account (since_id)
     min_gap_seconds: 20
     max_results: 20
+    max_pages: 5                      # follow pagination during catch-up
+    max_age_seconds: 3600             # never catch up on posts older than 1 hour
+    on_startup: true                  # catch up once after each (re)start, e.g. deploys
   rules:
     max_rules: 1000                   # pay-per-use filtered stream limits
     max_rule_length: 1024
@@ -40,8 +43,12 @@ scoring:
   joke_threshold: 9                   # posts Claude marks as joke/meme need this score
   require_my_ticker: true             # score must name at least one ticker from the watchlist
   score_always_alert_unflagged: true
-  timeout_seconds: 4.0                # if Claude is slower, fall back to the fast-rules score
-  max_retries: 1
+  score_watchlist_unflagged: true     # score every watched-account post (fast rules become hints);
+                                      # false = only posts the fast rules flag (saves < $1/month)
+  timeout_seconds: 4.0                # per Claude request
+  total_budget_seconds: 4.0           # hard cap for all attempts; then fall back to the fast-rules score
+  max_retries: 1                      # only for fast failures while budget remains
+  fallback_max_impact: 7              # rules-only scores never exceed this (no urgent/SMS/quiet-hours)
   max_tokens: 1024
   enabled: true
   pricing:
@@ -70,9 +77,10 @@ alerts:
     send_daily_summary: true
     use_ssl: false
   send_timeout_seconds: 5.0
+  max_post_age_seconds: 900           # older posts (outage catch-up) alert as low-priority "missed" only
 
 ops:
-  health_host: 0.0.0.0
+  health_host: 127.0.0.1             # Docker overrides with CEOSCAN_HEALTH_HOST=0.0.0.0
   health_port: 8080
   db_path: data/ceoscan.db
   log_level: INFO
@@ -80,5 +88,6 @@ ops:
   daily_summary:
     enabled: true
     time: "18:00"                     # local time in alerts.timezone
-  pipeline_workers: 4
+  pipeline_workers: 8
   queue_max: 10000
+  config_error_action: exit           # exit (code 2) | wait (stay up; Docker sets CEOSCAN_CONFIG_ERROR_ACTION=wait)
