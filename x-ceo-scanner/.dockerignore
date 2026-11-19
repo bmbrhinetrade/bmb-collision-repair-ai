@@ -1,0 +1,42 @@
+# Keep the build context small and, above all, keep secrets out of the image.
+# The Dockerfile copies only requirements.txt, src/, config/ and samples/.
+
+# Secrets (passed to the container at runtime via `env_file: .env`, never baked in)
+.env
+.env.*
+
+# Runtime state - mounted as a volume instead
+data/
+**/*.db
+**/*.db-*
+
+# VCS, editors, OS
+.git
+.gitignore
+.dockerignore
+**/.DS_Store
+.idea/
+.vscode/
+
+# Python build/test artifacts
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Not needed inside the image
+tests/
+deploy/
+Dockerfile
+docker-compose.yml
+README.md
+requirements-dev.txt
+config/.*.tmp

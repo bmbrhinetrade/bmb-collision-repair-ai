@@ -1,0 +1,198 @@
+"""Monthly cost estimate printed at startup (and by `python -m ceoscan cost`).
+
+X pay-per-use pricing (``settings.x_api.pricing``, from docs.x.com, see ``pricing.checked``):
+
+* every post returned (each streamed post too, deduped per UTC day) is one *post read*;
+* every user object returned is one *user read*;
+* failed and empty responses are not billed.
+
+Post volume comes from ``est_posts_per_day`` in the watchlist (per account and per keyword rule),
+so the estimate is only as good as those numbers. The "worst case" adds charges for expanded
+objects (referenced posts, author users) because X does not document whether those are billed.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+from ..config import Settings
+from ..models import Watchlist
+
+logger = logging.getLogger(__name__)
+
+DAYS_PER_MONTH = 30
+# Worst-case assumptions (X does not document whether expansions are billed).
+REFERENCED_POST_SHARE = 0.5  # share of posts that quote/reply to/repost another post
+KEYWORD_AUTHORS_PER_DAY = 30  # distinct non-watchlist authors per keyword rule per day
+TOP_LINES_SHOWN = 12
+
+
+@dataclass
+class CostEstimate:
+    lines: list[tuple[str, float, float]]  # (label, posts_per_month, usd_per_month)
+    x_monthly: float
+    x_worst_case_monthly: float
+    claude_monthly: float
+    one_time_verify: float
+    posts_per_month: float
+    cap_ok: bool
+    notes: list[str]
+    # Extra context for format_cost_estimate (defaults keep the spec'd constructor valid).
+    mode: str = "stream"
+    monthly_post_cap: int = 0
+    worst_case_posts_per_month: float = 0.0
+
+    @property
+    def total_monthly(self) -> float:
+        return self.x_monthly + self.claude_monthly
+
+    @property
+    def total_worst_case_monthly(self) -> float:
+        return self.x_worst_case_monthly + self.claude_monthly
+
+
+def estimate_monthly_cost(
+    watchlist: Watchlist,
+    settings: Settings,
+    mode: str = "stream",
+    flag_rate: float = 0.5,
+    avg_input_tokens: int = 900,
+    avg_output_tokens: int = 300,
+) -> CostEstimate:
+    """Estimate monthly X API + Claude spend from the watchlist's ``est_posts_per_day``.
+
+    ``mode`` is "stream" or "poll" ("auto" is treated as stream). Keyword rules are handle-less
+    filtered-stream rules, so they are not counted in poll mode.
+    """
+    pricing = settings.x_api.pricing
+    poll = mode == "poll"
+    if not 0.0 <= flag_rate <= 1.0:
+        raise ValueError("flag_rate must be between 0 and 1")
+
+    lines: list[tuple[str, float, float]] = []
+    for a in watchlist.accounts:
+        ppm = max(a.est_posts_per_day, 0.0) * DAYS_PER_MONTH
+        lines.append((f"@{a.handle}", ppm, ppm * pricing.post_read))
+    keyword_rules = () if poll else watchlist.keyword_rules
+    for k in keyword_rules:
+        ppm = max(k.est_posts_per_day, 0.0) * DAYS_PER_MONTH
+        lines.append((f"keyword rule {k.name}", ppm, ppm * pricing.post_read))
+
+    posts_per_month = sum(ppm for _, ppm, _ in lines)
+    x_monthly = posts_per_month * pricing.post_read
+
+    referenced_posts = posts_per_month * REFERENCED_POST_SHARE
+    authors_per_day = len(watchlist.accounts) + KEYWORD_AUTHORS_PER_DAY * len(keyword_rules)
+    x_worst = x_monthly + referenced_posts * pricing.post_read + authors_per_day * pricing.user_read * DAYS_PER_MONTH
+    worst_posts = posts_per_month + referenced_posts
+
+    sc = settings.scoring
+    per_scored = (avg_input_tokens * sc.pricing.input_per_mtok + avg_output_tokens * sc.pricing.output_per_mtok) / 1e6
+    claude_monthly = posts_per_month * flag_rate * per_scored if sc.enabled else 0.0
+
+    one_time_verify = len(watchlist.accounts) * pricing.user_read
+    cap = int(pricing.monthly_post_cap)
+    cap_ok = posts_per_month <= cap
+
+    notes = [
+        (
+            f"Estimate uses est_posts_per_day from the watchlist and X API pricing checked {pricing.checked} "
+            f"(${pricing.post_read:.3f} per post read, ${pricing.user_read:.3f} per user read)."
+        ),
+        "Streamed and polled posts are billed once per post per UTC day; failed or empty responses are not billed.",
+        (
+            f"Worst case also bills expanded objects (not documented by X): {REFERENCED_POST_SHARE:.0%} of posts "
+            f"reference another post, plus ~{authors_per_day} author user reads per day."
+        ),
+    ]
+    if poll:
+        notes.append(
+            f"Poll mode: {len(watchlist.keyword_rules)} keyword rule(s) need the filtered stream and are not counted."
+        )
+    if sc.enabled:
+        notes.append(
+            f"Claude estimate assumes {flag_rate:.0%} of posts pass the fast rules and are scored by {sc.model} "
+            f"(~{avg_input_tokens} input / {avg_output_tokens} output tokens at ${sc.pricing.input_per_mtok:.2f} / "
+            f"${sc.pricing.output_per_mtok:.2f} per million tokens)."
+        )
+    else:
+        notes.append("Claude scoring is disabled (scoring.enabled=false): no Claude cost.")
+    if cap_ok:
+        if worst_posts > cap:
+            notes.append(f"Worst case ({worst_posts:,.0f} post reads/month) would exceed the {cap:,} monthly cap.")
+    else:
+        notes.append(
+            f"WARNING: {posts_per_month:,.0f} posts/month exceeds the {cap:,} monthly post-read cap; "
+            "reduce accounts, set include_replies: false, or tighten keyword rules."
+        )
+    missing_ids = sum(1 for a in watchlist.accounts if not a.user_id)
+    if missing_ids:
+        notes.append(
+            f"{missing_ids} account(s) have no user_id yet (run `verify --write`); they are included in the estimate."
+        )
+    if x_monthly > 0 and lines:
+        label, ppm, usd = max(lines, key=lambda line: line[2])
+        share = usd / x_monthly
+        if share >= 0.3:
+            hint = ""
+            acct = watchlist.by_handle().get(label.lstrip("@").lower()) if label.startswith("@") else None
+            if acct is not None and acct.include_replies:
+                hint = " (include_replies: false would cut it)"
+            notes.append(f"Largest source: {label} at {share:.0%} of the X cost{hint}.")
+
+    est = CostEstimate(
+        lines=lines,
+        x_monthly=x_monthly,
+        x_worst_case_monthly=x_worst,
+        claude_monthly=claude_monthly,
+        one_time_verify=one_time_verify,
+        posts_per_month=posts_per_month,
+        cap_ok=cap_ok,
+        notes=notes,
+        mode="poll" if poll else "stream",
+        monthly_post_cap=cap,
+        worst_case_posts_per_month=worst_posts,
+    )
+    logger.debug(
+        "cost estimate: %.0f posts/month, X $%.2f (worst $%.2f), Claude $%.2f",
+        posts_per_month,
+        x_monthly,
+        x_worst,
+        claude_monthly,
+    )
+    return est
+
+
+def _usd(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def format_cost_estimate(est: CostEstimate) -> str:
+    """Human-readable multi-line cost report."""
+    cap_text = f"the {est.monthly_post_cap:,} monthly cap" if est.monthly_post_cap else "the monthly cap"
+    cap_state = f"within {cap_text}" if est.cap_ok else f"OVER {cap_text}"
+    out = [
+        f"Estimated monthly cost ({est.mode} mode)",
+        f"  Posts read from X:   {est.posts_per_month:,.0f} / month ({cap_state})",
+        f"  X API post reads:    {_usd(est.x_monthly)} / month",
+        f"  X API worst case:    {_usd(est.x_worst_case_monthly)} / month (if expansions are billed)",
+        f"  Claude scoring:      {_usd(est.claude_monthly)} / month",
+        f"  Total:               {_usd(est.total_monthly)} / month (worst case {_usd(est.total_worst_case_monthly)})",
+        f"  One-time verify:     {_usd(est.one_time_verify)} (user lookups)",
+    ]
+    if est.lines:
+        out.append("  By source:")
+        ranked = sorted(est.lines, key=lambda line: (-line[2], line[0]))
+        width = max(len(label) for label, _, _ in ranked[:TOP_LINES_SHOWN])
+        for label, ppm, usd in ranked[:TOP_LINES_SHOWN]:
+            out.append(f"    {label:<{width}}  {ppm:>9,.0f} posts/mo  {_usd(usd):>9}/mo")
+        rest = ranked[TOP_LINES_SHOWN:]
+        if rest:
+            out.append(
+                f"    ... {len(rest)} more: {sum(p for _, p, _ in rest):,.0f} posts/mo, "
+                f"{_usd(sum(u for _, _, u in rest))}/mo"
+            )
+    for note in est.notes:
+        out.append(f"  * {note}")
+    return "\n".join(out)

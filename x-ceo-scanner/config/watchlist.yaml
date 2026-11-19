@@ -71,7 +71,7 @@ accounts:
     est_posts_per_day: 5
 
   # --- Strategy / bitcoin -----------------------------------------------------------------
-  - handle: saylor
+  - handle: saylor               # Executive Chairman of Strategy (CEO is Phong Le)
     kind: person
     expect_name: Michael Saylor
     tickers: ["@bitcoin"]
@@ -84,7 +84,7 @@ accounts:
     est_posts_per_day: 1
 
   # --- Robinhood --------------------------------------------------------------------------
-  - handle: vladtenev
+  - handle: vladtenev            # note: account was briefly hijacked Jul 23 2026 (fake memecoin post)
     kind: person
     expect_name: Vlad Tenev
     tickers: [HOOD]
@@ -120,7 +120,7 @@ accounts:
     expect_name: Sundar Pichai
     tickers: [GOOGL, "@ai_capex"]
     est_posts_per_day: 1
-  - handle: tim_cook
+  - handle: tim_cook             # reported: Apple Executive Chairman since Sep 1 2026
     kind: person
     expect_name: Tim Cook
     tickers: [AAPL]
@@ -143,8 +143,124 @@ accounts:
     tickers: ["@crypto"]
     est_posts_per_day: 4
 
-  # --- Company accounts (INTC, MU, SMCI, CEG, VST, TLN, TWLO, CLSK) -----------------------
-  # CEO_AND_COMPANY_ACCOUNTS_PLACEHOLDER
+  # --- Company accounts + CEOs with an active X account -----------------------------------
+  # Handles below came from web research on 2026-11-19 (company IR pages / press releases /
+  # indexed X posts). `verify --write` confirms each one against the X API before it is used.
+
+  # Intel - CEO Lip-Bu Tan (since Mar 2025)
+  - handle: intel
+    kind: company
+    expect_name: Intel
+    tickers: [INTC]
+    include_replies: false
+    est_posts_per_day: 4
+  - handle: LipBuTan1
+    kind: person
+    expect_name: Lip-Bu Tan
+    tickers: [INTC]
+    est_posts_per_day: 0.3
+
+  # Micron - CEO Sanjay Mehrotra posts from a role-based handle
+  - handle: MicronTech
+    kind: company
+    expect_name: Micron Technology
+    tickers: [MU]
+    include_replies: false
+    est_posts_per_day: 3
+  - handle: MicronCEO
+    kind: person
+    expect_name: Sanjay Mehrotra
+    tickers: [MU]
+    est_posts_per_day: 0.2
+
+  # Supermicro - live handle is @Supermicro (Supermicro_SMCI appears to be an old name)
+  - handle: Supermicro
+    kind: company
+    expect_name: Supermicro
+    tickers: [SMCI]
+    include_replies: false
+    est_posts_per_day: 3
+  - handle: charlesliang
+    kind: person
+    expect_name: Charles Liang
+    tickers: [SMCI]
+    est_posts_per_day: 0.3
+
+  # Constellation Energy - no personal X account found for CEO Joe Dominguez
+  - handle: ConstellationEG
+    kind: company
+    expect_name: Constellation
+    tickers: [CEG]
+    include_replies: false
+    est_posts_per_day: 1
+
+  # Vistra - no personal X account found for CEO Jim Burke
+  - handle: VistraCorp
+    kind: company
+    expect_name: Vistra
+    tickers: [VST]
+    include_replies: false
+    est_posts_per_day: 1
+
+  # Talen Energy - account looks dormant; CEO changes Jan 1 2027 (McFarland -> Terry Nutt), no X found
+  - handle: TalenEnergy
+    kind: company
+    expect_name: Talen Energy
+    tickers: [TLN]
+    include_replies: false
+    est_posts_per_day: 0.1
+
+  # Twilio - no personal X account found for CEO Khozema Shipchandler (IR lists only @twilio)
+  - handle: twilio
+    kind: company
+    expect_name: Twilio
+    tickers: [TWLO]
+    include_replies: false
+    est_posts_per_day: 3
+
+  # CleanSpark - CEO S. Matthew Schultz (since Aug 2025)
+  - handle: CleanSpark_Inc
+    kind: company
+    expect_name: CleanSpark
+    tickers: [CLSK]
+    include_replies: false
+    est_posts_per_day: 2
+  - handle: smatthewschultz
+    kind: person
+    expect_name: Matt Schultz
+    tickers: [CLSK, "@bitcoin"]
+    est_posts_per_day: 1
+
+  # APMD = Apnimed (Nasdaq IPO Jul 2026). If you meant APLD (Applied Digital), swap in @APLDdigital.
+  - handle: apnimed
+    kind: company
+    expect_name: Apnimed
+    tickers: [APMD]
+    include_replies: false
+    est_posts_per_day: 0.5
+
+  # --- Suggestions from research (leadership changes) - uncomment to watch ----------------
+  # - handle: APLDdigital          # Applied Digital (APLD), if APMD was a typo
+  #   kind: company
+  #   expect_name: Applied Digital
+  #   tickers: [APLD]
+  #   include_replies: false
+  #   est_posts_per_day: 2
+  # - handle: JensenHuang          # reported: joined X Jul 2026; resigned as NVIDIA CEO Nov 12 2026
+  #   kind: person
+  #   expect_name: Jensen Huang
+  #   tickers: [NVDA]
+  #   est_posts_per_day: 0.5
+  # - handle: johnternus           # reported: Apple CEO since Sep 1 2026 (Tim Cook now Exec Chairman)
+  #   kind: person
+  #   expect_name: John Ternus
+  #   tickers: [AAPL]
+  #   est_posts_per_day: 0.5
+  # - handle: ajassy               # Amazon CEO (Jeff Bezos is not Amazon's CEO) - handle unverified
+  #   kind: person
+  #   expect_name: Andy Jassy
+  #   tickers: [AMZN, "@ai_capex"]
+  #   est_posts_per_day: 0.5
 
 # Handle-less keyword rules: posts that mention my tickers as $CASHTAGS from very large accounts.
 keyword_rules:
@@ -177,3 +293,4 @@ company_names:
   VST: [Vistra]
   TLN: ["Talen Energy", Talen]
   TWLO: [Twilio]
+  APMD: [Apnimed, AD109, Oxnimbi]

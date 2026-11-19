@@ -284,7 +284,10 @@ class TimelinePoller:
                 if aborted:
                     return
                 try:
-                    total += await self._fetch(account, source="recovery", max_results=max_results)
+                    # Await first: `total += await ...` would read `total` before the await and
+                    # lose counts from concurrent passes.
+                    n = await self._fetch(account, source="recovery", max_results=max_results)
+                    total += n
                 except (CreditsDepleted, RateLimited) as exc:
                     aborted = str(exc)
                 except XApiError as exc:

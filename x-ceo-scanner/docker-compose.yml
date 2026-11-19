@@ -1,0 +1,49 @@
+# ceoscan on a Linux server with Docker Compose. ALERTS ONLY: never trades, never touches a brokerage.
+#
+#   cp .env.example .env && chmod 600 .env && nano .env      # secrets
+#   mkdir -p data
+#   docker compose build
+#   docker compose run --rm ceoscan verify --write           # writes user_ids into config/watchlist.yaml
+#   docker compose up -d --build
+#   curl -s 127.0.0.1:8080/health
+#   docker compose logs -f --tail 100
+#
+# Any sub-command works the same way: docker compose run --rm ceoscan cost | check-access | rules |
+# test-alert | replay samples/sample_posts.jsonl   (`run` does not publish ports, so it can run
+# next to the live service).
+services:
+  ceoscan:
+    build:
+      context: .
+      args:
+        # The container runs as this non-root UID/GID so it can write ./data and ./config.
+        # Default 1000 = the first login user on most Linux servers; if `id -u` / `id -g` print
+        # something else, set CEOSCAN_UID / CEOSCAN_GID in .env (see README, "Deploy").
+        CEOSCAN_UID: ${CEOSCAN_UID:-1000}
+        CEOSCAN_GID: ${CEOSCAN_GID:-1000}
+    image: ceoscan:local
+    env_file: .env                      # secrets; never baked into the image
+    restart: unless-stopped
+    init: true                          # tiny init as PID 1: forwards SIGTERM, reaps zombies
+    stop_grace_period: 20s              # time for a graceful shutdown before SIGKILL
+    ports:
+      - "127.0.0.1:8080:8080"           # health endpoint, reachable from this host only
+    volumes:
+      - ./data:/app/data                # SQLite database (posts, alerts, since_ids, events)
+      - ./config:/app/config            # read-write: `verify --write` updates watchlist.yaml.
+                                        # Mount the directory, not single files (the update is an
+                                        # atomic rename inside the directory).
+    # Hardening: read-only root filesystem (only the two mounts above and /tmp are writable),
+    # no Linux capabilities, no privilege escalation.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

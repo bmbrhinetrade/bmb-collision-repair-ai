@@ -395,7 +395,8 @@ class FilteredStream:
                     log.info("stream: next connection attempt in %.1fs (%s)", delay, state)
                     if await _wait_or_stop(stop, delay):
                         break
-                self.status.state = "reconnecting"
+                if self.status.state != "credits_depleted":  # keep the cause visible while retrying
+                    self.status.state = "reconnecting"
         except StreamUnavailable:
             unavailable = True
             raise
@@ -534,7 +535,7 @@ class FilteredStream:
         if kind == "other":
             log.warning("stream: X reported: %s", summary)
             return None
-        log.warning("stream: X ended the stream (%s): %s", kind, summary)
+        log.debug("stream: X ended the stream (%s): %s", kind, summary)  # logged by _on_stream_end
         return _StreamEnd(kind, summary)
 
     async def _enqueue(self, item: IngestItem) -> None:

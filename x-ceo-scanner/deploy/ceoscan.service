@@ -1,0 +1,66 @@
+# systemd unit for ceoscan (alternative to Docker Compose). ALERTS ONLY: never trades.
+#
+# Install (see README, "Deploy with systemd"):
+#   sudo cp /opt/x-ceo-scanner/deploy/ceoscan.service /etc/systemd/system/ceoscan.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ceoscan
+#   journalctl -u ceoscan -f
+#
+# Expects: system user "ceoscan"; the project at /opt/x-ceo-scanner with a Python 3.12 venv in
+# .venv; .env readable by ceoscan (root:ceoscan, mode 640); data/ and config/ owned by ceoscan.
+
+[Unit]
+Description=ceoscan - real-time X CEO post scanner (alerts only)
+Documentation=file:///opt/x-ceo-scanner/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ceoscan
+Group=ceoscan
+WorkingDirectory=/opt/x-ceo-scanner
+EnvironmentFile=/opt/x-ceo-scanner/.env
+Environment=PYTHONPATH=/opt/x-ceo-scanner/src
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/x-ceo-scanner/.venv/bin/python -m ceoscan run
+
+Restart=always
+RestartSec=5
+# Exit code 2 = configuration problem (e.g. X_BEARER_TOKEN missing, no verified accounts):
+# do not restart-loop on it; fix the config, then `systemctl restart ceoscan`.
+RestartPreventExitStatus=2
+# Graceful shutdown budget (same as docker-compose stop_grace_period).
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# ---- Hardening -------------------------------------------------------------------------------
+NoNewPrivileges=true
+# Whole filesystem read-only for the service, except the two paths below.
+ProtectSystem=strict
+ReadWritePaths=/opt/x-ceo-scanner/data /opt/x-ceo-scanner/config
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

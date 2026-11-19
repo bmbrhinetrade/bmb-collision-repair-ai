@@ -1,10 +1,28 @@
+# Secrets - never commit. Only the empty template is tracked.
 .env
 .env.*
 !.env.example
+
+# Runtime state (SQLite database, WAL/SHM files)
 data/
 *.db
 *.db-*
+
+# Leftover temp file if `verify --write` is interrupted mid-write
+config/.*.tmp
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
 .venv/
+venv/
+
+# Tooling caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
