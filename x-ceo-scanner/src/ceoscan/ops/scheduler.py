@@ -15,6 +15,8 @@
   same window as the daily summary and after it (once it was sent or tried, or right away when the
   summary is disabled), at most once per local date (kv ``last_daily_review``, set before the fire is
   queued, so a restart never repeats it).
+* Claude Duet feed daily review (``claude_duet.daily_review``, only when the feed is running): the same
+  window and order, once per local date (kv ``last_duet_review``, set before the email is queued).
 * :func:`send_config_error_alert`: at most one "ceoscan stopped: configuration problem" alert per
   distinct problem for ``run`` when even the configuration cannot be loaded (kv
   ``config_problem_alert``, shared with ``app.Service``), so a restart loop can never spam the phone.
@@ -41,12 +43,14 @@ from ..timeutil import format_local, local_day_start, now_utc, parse_hhmm
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..alerts.claude_desk import ClaudeDesk
     from ..alerts.dispatcher import AlertDispatcher
+    from ..alerts.duet_feed import DuetFeed
 
 logger = logging.getLogger(__name__)
 
 KV_LAST_DAILY_SUMMARY = "last_daily_summary"
 KV_DAILY_SUMMARY_ATTEMPT = "daily_summary_attempt"
 KV_LAST_DAILY_REVIEW = "last_daily_review"
+KV_LAST_DUET_REVIEW = "last_duet_review"
 KV_CONFIG_ERROR_ALERT = "config_problem_alert"  # shared with app.Service (same {"hash", "at"} format)
 CONFIG_ERROR_ALERT_TITLE = "ceoscan stopped: configuration problem"
 CONFIG_ERROR_ALERT_REPEAT = timedelta(hours=24)
@@ -198,6 +202,7 @@ class OpsScheduler:
         clock: Callable[[], datetime] = now_utc,
         started_at: datetime | None = None,
         desk: ClaudeDesk | None = None,
+        duet: DuetFeed | None = None,
     ) -> None:
         self.cfg = cfg
         self.settings = cfg.settings
@@ -207,6 +212,8 @@ class OpsScheduler:
         self.clock = clock
         #: Claude analyst desk (None = off): gets the daily review fire after the daily summary
         self.desk = desk
+        #: Claude Duet feed (None = off): gets the daily review email after the daily summary
+        self.duet = duet
         #: when this service started collecting posts (the cost projection only uses data since then)
         self.started_at = started_at or clock()
         self._down_alert_since: datetime | None = None  # outage we alerted (or tried to alert) about
@@ -230,7 +237,12 @@ class OpsScheduler:
         )
         while not stop.is_set():
             now = self.clock()
-            for check in (self.check_stream_down, self.maybe_send_daily_summary, self.maybe_fire_daily_review):
+            for check in (
+                self.check_stream_down,
+                self.maybe_send_daily_summary,
+                self.maybe_fire_daily_review,
+                self.maybe_email_duet_review,
+            ):
                 try:
                     await check(now)
                 except asyncio.CancelledError:
@@ -510,6 +522,32 @@ class OpsScheduler:
         logger.info("ops: Claude desk daily review for %s %s", day, "queued" if queued else "NOT queued")
         return queued
 
+    async def maybe_email_duet_review(self, now: datetime) -> bool:
+        """Queue the Claude Duet feed's daily review email once per local date, after the daily summary.
+
+        The same window and order as :meth:`maybe_fire_daily_review`; kv ``last_duet_review`` is written
+        before queueing, so a restart never sends it twice. True when the email was queued.
+        """
+        duet = self.duet
+        if duet is None or not self.settings.claude_duet.daily_review:
+            return False
+        scheduled = self._scheduled_at(now)
+        local = now.astimezone(scheduled.tzinfo)
+        if not scheduled <= local < scheduled + SUMMARY_WINDOW:
+            return False
+        day = local.date().isoformat()
+        if self.store.kv_get(KV_LAST_DUET_REVIEW) == day:
+            return False
+        if self.settings.ops.daily_summary.enabled:
+            summary_done = self.store.kv_get(KV_LAST_DAILY_SUMMARY) == day
+            if not summary_done and self._summary_attempt().get("day") != day:
+                return False  # the summary goes first
+        self.store.kv_set(KV_LAST_DUET_REVIEW, day)
+        queued = duet.submit_daily_review(now)
+        self._log_event("duet_daily_review", f"{day}: queued={queued}", "info" if queued else "warning")
+        logger.info("ops: Claude Duet daily review email for %s %s", day, "queued" if queued else "NOT queued")
+        return queued
+
     def _projection(self, now: datetime) -> tuple[float | None, str]:
         """Projected monthly X cost from the posts received in the last 24 h of this service's run.
 
@@ -548,6 +586,8 @@ class OpsScheduler:
         stream_errors = int(stats.get("stream_errors") or 0)
         desk_fires = int(stats.get("desk_fires") or 0)
         desk_errors = int(stats.get("desk_errors") or 0)
+        duet_emails = int(stats.get("duet_emails") or 0)
+        duet_errors = int(stats.get("duet_errors") or 0)
         avg_ms, max_ms = stats.get("avg_latency_ms"), stats.get("max_latency_ms")
 
         error_kinds: list[str] = []
@@ -589,6 +629,8 @@ class OpsScheduler:
         ]
         if self.settings.claude_desk.enabled or desk_fires or desk_errors:
             body_lines.append(f"Claude desk: {desk_fires} analyses ({desk_errors} failed)")
+        if self.settings.claude_duet.enabled or duet_emails or duet_errors:
+            body_lines.append(f"Claude Duet feed: {duet_emails} emails ({duet_errors} failed)")
         body_lines += [
             f"Errors: {errors_line}" if errors else "Errors: none",
             f"Ingest: {st.mode} / {st.state}, {st.reconnects} reconnect(s) since start",

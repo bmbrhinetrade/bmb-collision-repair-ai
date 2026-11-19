@@ -117,10 +117,34 @@ CREATE TABLE IF NOT EXISTS desk_fires (
     text_chars  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_desk_fires_at ON desk_fires(fired_at_ms);
+
+-- Claude Duet feed: one row per email to the inbox Claude Duet reads (or per dropped batch). A table of
+-- its own, so the desk's hourly budget and stats never mix with emails. Never holds secrets and never
+-- the recipient or sender address (personal data).
+CREATE TABLE IF NOT EXISTS duet_emails (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at_ms  INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    post_ids    TEXT,
+    tickers     TEXT,
+    status      TEXT NOT NULL,
+    smtp_code   INTEGER,
+    error       TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    subject     TEXT,
+    text_chars  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_duet_emails_at ON duet_emails(sent_at_ms);
 """
 
 #: desk_fires.status values
 DESK_SENT, DESK_FAILED, DESK_DROPPED = "sent", "failed", "dropped"
+#: duet_emails.status values
+DUET_SENT, DUET_FAILED, DUET_DROPPED = "sent", "failed", "dropped"
+#: (delivered, failed or dropped) Duet feed emails since a time: /health and the daily summary agree.
+_DUET_COUNTS_SQL = (
+    "SELECT COALESCE(SUM(status = ?), 0), COALESCE(SUM(status != ?), 0) FROM duet_emails WHERE sent_at_ms >= ?"
+)
 
 #: Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` does not touch an existing
 #: table, so databases created by an older version get these with ``ALTER TABLE ... ADD COLUMN`` on open.
@@ -467,6 +491,92 @@ class Store:
             ).fetchall()
         return [int(r[0]) for r in rows]
 
+    # ------------------------------------------------------------------ Claude Duet feed
+
+    def record_duet_email(
+        self,
+        kind: str,
+        post_ids: list[str],
+        tickers: list[str],
+        status: str,
+        *,
+        smtp_code: int | None = None,
+        error: str | None = None,
+        attempts: int = 0,
+        subject: str | None = None,
+        text_chars: int | None = None,
+        sent_at: datetime | None = None,
+    ) -> int:
+        """One Duet feed email (or a dropped batch). Callers pass no addresses: none are stored."""
+        with self._lock:
+            cur = self._db.execute(
+                """INSERT INTO duet_emails (sent_at_ms, kind, post_ids, tickers, status, smtp_code, error, attempts,
+                   subject, text_chars) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    to_ms(sent_at or now_utc()),
+                    kind,
+                    json.dumps(list(post_ids)),
+                    json.dumps(list(tickers)),
+                    status,
+                    smtp_code,
+                    (error or None) and str(error)[:500],
+                    int(attempts),
+                    (subject or None) and str(subject)[:200],
+                    text_chars,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def duet_emails(self, since: datetime | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Duet feed emails (newest first), post_ids / tickers decoded."""
+        q = "SELECT * FROM duet_emails"
+        args: list[Any] = []
+        if since is not None:
+            q += " WHERE sent_at_ms >= ?"
+            args.append(to_ms(since))
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(int(limit))
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(q, args).fetchall()]
+        for row in rows:
+            for key in ("post_ids", "tickers"):
+                try:
+                    value = json.loads(row.get(key) or "[]")
+                except ValueError:
+                    value = []
+                row[key] = [str(v) for v in value] if isinstance(value, list) else []
+        return rows
+
+    def duet_email_counts(self, since: datetime) -> tuple[int, int]:
+        """(delivered, failed or dropped) Duet feed emails since ``since``: COUNTs, whatever the number of rows."""
+        with self._lock:
+            sent, other = self._db.execute(_DUET_COUNTS_SQL, (DUET_SENT, DUET_SENT, to_ms(since))).fetchone()
+        return int(sent), int(other)
+
+    def last_duet_email(self, *, since: datetime | None = None, failed: bool = False) -> dict[str, Any] | None:
+        """The newest Duet feed row (``failed``: the newest one not delivered that has an error), or None."""
+        q = "SELECT id, sent_at_ms, kind, status, smtp_code, error FROM duet_emails WHERE 1=1"
+        args: list[Any] = []
+        if since is not None:
+            q += " AND sent_at_ms >= ?"
+            args.append(to_ms(since))
+        if failed:
+            q += " AND status != ? AND error IS NOT NULL AND error != ''"
+            args.append(DUET_SENT)
+        q += " ORDER BY id DESC LIMIT 1"
+        with self._lock:
+            row = self._db.execute(q, args).fetchone()
+        return dict(row) if row is not None else None
+
+    def duet_sent_times_ms(self, since: datetime) -> list[int]:
+        """sent_at_ms of every delivered Duet email since ``since`` (oldest first): the hourly cap."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT sent_at_ms FROM duet_emails WHERE sent_at_ms >= ? AND status = ? ORDER BY sent_at_ms",
+                (to_ms(since), DUET_SENT),
+            ).fetchall()
+        return [int(r[0]) for r in rows]
+
     def post_alerts_since(
         self,
         since: datetime,
@@ -538,6 +648,8 @@ class Store:
         * ``errors``: events with level 'error'.
         * ``desk_fires``: Claude analyst desk runs started (fires answered 200); ``desk_errors``: fires that
           failed or alerts that were dropped before a fire.
+        * ``duet_emails``: Claude Duet feed emails the SMTP server accepted; ``duet_errors``: emails that failed
+          or alerts that were dropped before an email.
         """
         ms = to_ms(since)
         kinds = ",".join("?" for _ in INGEST_ERROR_KINDS)
@@ -583,6 +695,7 @@ class Store:
                    WHERE fired_at_ms >= ?""",
                 (DESK_SENT, DESK_SENT, ms),
             ).fetchone()
+            duet_sent, duet_errors = self._db.execute(_DUET_COUNTS_SQL, (DUET_SENT, DUET_SENT, ms)).fetchone()
         return {
             "posts": posts,
             "flagged": flagged,
@@ -598,4 +711,6 @@ class Store:
             "stream_errors": stream_errors,
             "desk_fires": int(desk_sent),
             "desk_errors": int(desk_errors),
+            "duet_emails": int(duet_sent),
+            "duet_errors": int(duet_errors),
         }

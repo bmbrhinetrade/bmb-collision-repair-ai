@@ -125,3 +125,27 @@ claude_desk:
   notify_link: false                  # true = extra low-priority push with the analysis session link
   queue_max: 200                      # alerts waiting for the desk (also while held); when full, the
                                       # lowest-scored is dropped and recorded. One fire takes at most 10.
+
+# Claude Duet feed: strong alerts are emailed to the inbox your Claude Duet agent reads (through the Claude
+# Gmail connector), and the ceoscan-alert-desk skill tells Duet how to analyze them. Duet has no webhook, so
+# email is the way in. Step-by-step setup for non-developers: claude/DUET_SETUP.md. Decision support only;
+# nothing trades. The phone push stays the instant alert; Duet checks in every few hours and in its
+# morning brief (or right away when you ask it "analyze my latest ceoscan alert").
+claude_duet:
+  enabled: false                      # needs SMTP_* in .env and DUET_FEED_TO (or ALERT_EMAIL_TO); works even
+                                      # while alerts.email.enabled is false (it is its own channel)
+  min_score: 8                        # email post alerts with impact >= this (same semantics as claude_desk:
+                                      # with include_rules_only, rules-only alerts qualify from
+                                      # min(min_score, scoring.fallback_max_impact))
+  include_always_alert: true          # also email alerts from always_alert accounts, whatever the score
+  include_rules_only: false           # rules-only scores (Claude failed / offline) are not emailed by default
+  include_late: true                  # Duet is not real time: late catch-up alerts are still useful
+                                      # (marked LATE in the subject)
+  batch_window_seconds: 60            # alerts arriving within this window share one email
+  max_emails_per_hour: 30             # inbox protection (1-120); overflow rolls into the next email as a
+                                      # batch, never silently dropped
+  daily_review: true                  # email the day's review at ops.daily_summary.time, after the summary
+                                      # (once per local day, remembered across restarts)
+  context_days: 7                     # recent alerts for the same tickers / accounts sent along as context
+  subject_prefix: "[ceoscan]"         # the skill looks for subjects starting with this - keep them in sync
+  max_text_chars: 60000               # one email body (preface + alert data); the longest fields are cut first

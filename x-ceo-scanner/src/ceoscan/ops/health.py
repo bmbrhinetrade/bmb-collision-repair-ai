@@ -13,7 +13,8 @@ Overall status:
 * ``ok``       - connected (stream) or polling, with fresh heartbeats.
 
 The ``claude_desk`` block reports the Claude analyst desk (enabled, configured, fires today, last fire,
-last error, queued, budget left this hour); it never affects the overall status.
+last error, queued, budget left this hour), the ``claude_duet`` block the Claude Duet feed (emails today,
+last email, last error, queued, cap left this hour - never an address); neither affects the overall status.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from aiohttp import web
 
 from .. import __version__
 from ..alerts.claude_desk import desk_health
+from ..alerts.duet_feed import duet_health
 from ..config import Settings
 from ..models import IngestStatus
 from ..store import Store
@@ -37,6 +39,7 @@ from ..timeutil import format_local, from_ms, local_day_start, now_utc
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..alerts.claude_desk import ClaudeDesk
+    from ..alerts.duet_feed import DuetFeed
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +129,8 @@ class HealthServer:
         queue: asyncio.Queue | None = None,
         desk: ClaudeDesk | None = None,
         desk_problem: str | None = None,
+        duet: DuetFeed | None = None,
+        duet_problem: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -137,6 +142,9 @@ class HealthServer:
         #: the Claude analyst desk (set by the service once it exists) and why it is off, if it is
         self.desk = desk
         self.desk_problem = desk_problem
+        #: the Claude Duet feed (set by the service once it exists) and why it is off, if it is
+        self.duet = duet
+        self.duet_problem = duet_problem
         self._runner: web.AppRunner | None = None
 
     # ------------------------------------------------------------------ snapshot
@@ -188,6 +196,10 @@ class HealthServer:
             "score_errors": stats.get("score_errors", 0),
             "stream_errors": stats.get("stream_errors", 0),
             "errors": stats.get("errors", 0),
+            "desk_fires": stats.get("desk_fires", 0),
+            "desk_errors": stats.get("desk_errors", 0),
+            "duet_emails": stats.get("duet_emails", 0),
+            "duet_errors": stats.get("duet_errors", 0),
         }
 
     def snapshot(self, now: datetime | None = None) -> dict:
@@ -218,6 +230,10 @@ class HealthServer:
             "claude_desk": desk_health(
                 self.settings.claude_desk, self.store, self.desk, now, self.settings.alerts.timezone,
                 self.desk_problem,
+            ),
+            "claude_duet": duet_health(
+                self.settings.claude_duet, self.store, self.duet, now, self.settings.alerts.timezone,
+                self.duet_problem,
             ),
             "queue_size": queue_size,
             "uptime_seconds": round(max((now - self.started_at).total_seconds(), 0.0), 1),

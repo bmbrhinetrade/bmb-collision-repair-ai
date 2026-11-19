@@ -13,6 +13,8 @@ Commands:
 * ``test-alert [--message TEXT]``  send a system alert through every configured channel
 * ``test-desk [--message TEXT]``   fire the Claude analyst desk once (kind "test") and print the
                               session link (needs CLAUDE_DESK_FIRE_URL + CLAUDE_DESK_TOKEN)
+* ``test-duet [--message TEXT]``   send one test email to the inbox Claude Duet reads and print the
+                              (masked) recipient (needs SMTP_* and DUET_FEED_TO or ALERT_EMAIL_TO)
 
 Global flags (before the command): ``--settings``, ``--watchlist``, ``--env``.
 
@@ -43,6 +45,8 @@ import aiohttp
 from . import __version__
 from .alerts.claude_desk import DeskClient, build_test_text, check_desk_secrets, fire_with_retries, rejection_hint
 from .alerts.dispatcher import AlertDispatcher, build_dispatcher
+from .alerts.duet_feed import KIND_HEADER, SmtpMailer, build_test_email, check_duet_config, send_with_retries
+from .alerts.duet_feed import rejection_hint as duet_rejection_hint
 from .alerts.format import format_system_alert
 from .alerts.notifiers import Notifier
 from .app import EXIT_CONFIG, EXIT_ERROR, EXIT_OK, MISSING_X_TOKEN, Service
@@ -63,7 +67,7 @@ from .ops.cost import estimate_monthly_cost, format_cost_estimate
 from .ops.health import HealthServer
 from .ops.scheduler import send_config_error_alert
 from .replay import run_replay
-from .store import DESK_FAILED, DESK_SENT, Store
+from .store import DESK_FAILED, DESK_SENT, DUET_FAILED, DUET_SENT, Store
 from .timeutil import now_utc
 from .xapi.access import AccessReport, check_access, format_access_report
 from .xapi.client import XApiError, XClient
@@ -98,6 +102,8 @@ TEST_ALERT_BODY = (
 
 #: test-desk retries a 5xx / network failure after these pauses (the service uses 5 s and 20 s)
 TEST_DESK_RETRY_DELAYS = (2.0, 5.0)
+#: test-duet retries a 4xx / network failure / timeout after these pauses (the service uses 5 s and 20 s)
+TEST_DUET_RETRY_DELAYS = (2.0, 5.0)
 
 Handler = Callable[[AppConfig, argparse.Namespace], Coroutine[Any, Any, int]]
 
@@ -166,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
         "test-desk", help="fire the Claude analyst desk (Claude Code scheduled task) once with a test alert"
     )
     p.add_argument("--message", metavar="TEXT", default=None, help="a note to include in the test fire")
+
+    p = sub.add_parser(
+        "test-duet", help="send one test email to the inbox Claude Duet reads (the Claude Duet feed)"
+    )
+    p.add_argument("--message", metavar="TEXT", default=None, help="a note to include in the test email")
     return parser
 
 
@@ -511,6 +522,65 @@ async def cmd_test_desk(cfg: AppConfig, args: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+async def cmd_test_duet(cfg: AppConfig, args: argparse.Namespace) -> int:
+    """One test email to the Claude Duet inbox now. 0 sent, 1 failure, 2 configuration problem / refused."""
+    check = check_duet_config(cfg.secrets)
+    for warning in check.warnings:
+        print(f"warning: {warning}")
+    if check.problem is not None:
+        _err(
+            f"error: {check.problem}. The Claude Duet feed sends email through your SMTP account: set SMTP_HOST, "
+            "SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, ALERT_EMAIL_FROM and DUET_FEED_TO (the inbox Claude Duet "
+            "reads; ALERT_EMAIL_TO is used when it is empty) in .env (see claude/DUET_SETUP.md)."
+        )
+        return EXIT_CONFIG
+    d = cfg.settings.claude_duet
+    if not d.enabled:
+        print(
+            "note: claude_duet.enabled is false in the settings file - `run` does not email Claude Duet until you "
+            "set it to true. This test sends one email anyway."
+        )
+    now = now_utc()
+    subject, body = build_test_email(
+        args.message, settings=d, tz=cfg.settings.alerts.timezone, now=now, my_tickers=cfg.watchlist.my_tickers
+    )
+    mailer = SmtpMailer(cfg.secrets, cfg.settings.alerts.email, check.recipients)
+    mode = "SMTPS" if mailer.use_ssl else "STARTTLS"
+    print(
+        f"Sending a test email to {check.masked} (from {check.source}) via {mailer.host}:{mailer.port} {mode}..."
+    )
+    print(f"Subject: {subject}")
+    result, attempts = await send_with_retries(mailer, subject, body, "test", TEST_DUET_RETRY_DELAYS)
+    try:  # best effort, like test-desk: the service's /health then shows the test as the last email
+        store = Store(cfg.settings.ops.db_path)
+        try:
+            store.record_duet_email(
+                "test", [], [], DUET_SENT if result.ok else DUET_FAILED, smtp_code=result.smtp_code,
+                error=result.error, attempts=attempts, subject=subject, text_chars=len(body), sent_at=now,
+            )
+        finally:
+            store.close()
+    except (OSError, sqlite3.Error) as exc:
+        _err(f"warning: could not record the test email in {cfg.settings.ops.db_path}: {_network_error(exc)}")
+    if result.ok:
+        print(f"OK: the SMTP server accepted the test email for {check.masked} (attempt {attempts}, "
+              f"{result.elapsed_ms} ms; header {KIND_HEADER}: test).")
+        print(
+            "Next: check that inbox for the subject above, then ask Claude Duet: \"Check my email for the ceoscan "
+            "test and confirm the feed is wired.\" Decision support only - ceoscan never trades."
+        )
+        return EXIT_OK
+    _err(f"error: the test email failed after {attempts} attempt(s): {result.error}")
+    if result.outcome == "rejected":
+        _err(f"  {duet_rejection_hint(result.smtp_code, result.error)[1]}")
+        return EXIT_CONFIG
+    if result.outcome == "limit":  # temporary, but not a network problem: say what it is
+        _err(f"  {duet_rejection_hint(result.smtp_code, result.error)[1]} Try the test again later.")
+        return EXIT_ERROR
+    _err("  A network problem, a timeout or a temporary SMTP error (4xx): check SMTP_HOST / SMTP_PORT and try again.")
+    return EXIT_ERROR
+
+
 def _config_problem_text(exc: BaseException) -> str:
     if isinstance(exc, ConfigError):
         return str(exc)
@@ -610,6 +680,7 @@ COMMANDS: dict[str, Handler] = {
     "replay": cmd_replay,
     "test-alert": cmd_test_alert,
     "test-desk": cmd_test_desk,
+    "test-duet": cmd_test_duet,
 }
 
 

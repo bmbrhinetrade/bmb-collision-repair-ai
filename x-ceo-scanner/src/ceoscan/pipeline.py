@@ -19,7 +19,9 @@ off and run each through the same steps:
 4. ``decide`` -> format -> dispatch to the phone, with the latency of every step measured and stored
    on the ``alerts`` row (target: under 10 s from post creation to phone).
 5. Optional: once the alert is recorded, strong alerts are handed to the Claude analyst desk
-   (``desk.submit``, alerts/claude_desk.py). That call only queues the alert; the push never waits for it.
+   (``desk.submit``, alerts/claude_desk.py) and to the Claude Duet feed (``duet.submit``,
+   alerts/duet_feed.py: an email to the inbox Claude Duet reads). Both calls only queue the alert; the
+   push never waits for them.
 
 Late posts (``received_at - created_at > alerts.max_post_age_seconds``: outage / restart catch-up) are
 stored and scored like any other, but alert at most at "normal" priority with a "Missed during outage"
@@ -68,6 +70,7 @@ from .timeutil import now_utc, snowflake_to_datetime
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .alerts.claude_desk import ClaudeDesk
+    from .alerts.duet_feed import DuetFeed
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +378,7 @@ class Pipeline:
         fast_rules: FastRules | None = None,
         clock: Callable[[], datetime] = now_utc,
         desk: ClaudeDesk | None = None,
+        duet: DuetFeed | None = None,
     ) -> None:
         self.cfg = cfg
         self.settings = cfg.settings
@@ -387,6 +391,8 @@ class Pipeline:
         self.clock = clock
         #: Claude analyst desk (None = off). Only ever gets a non-blocking submit after the alert is recorded.
         self.desk = desk
+        #: Claude Duet feed (None = off). Same contract as the desk: one non-blocking submit after recording.
+        self.duet = duet
         self.my_tickers: tuple[str, ...] = tuple(cfg.watchlist.my_tickers)
         self.tz = cfg.settings.alerts.timezone
         self._by_id = cfg.watchlist.by_user_id()
@@ -603,8 +609,10 @@ class Pipeline:
             logger.info("post %s %s: edit of alerted post %s re-alerts: %s", post.id, handle, eid, edit_note)
 
         desk_brief = self.desk is not None and self.desk.wants(score, account, late)
+        duet_line = self.duet is not None and self.duet.wants(score, account, late)
         msg = format_post_alert(
-            post, account, score, decision, self.settings.alerts, edit_note=edit_note, desk_brief=desk_brief
+            post, account, score, decision, self.settings.alerts, edit_note=edit_note, desk_brief=desk_brief,
+            duet_line=duet_line,
         )
         t_push = self.clock()
         # Late posts carry the "late" tag (format_post_alert): the dispatcher never sends them by SMS and
@@ -640,6 +648,8 @@ class Pipeline:
         self.store.record_alert(rec)
         if self.desk is not None:  # queues only (never blocks or raises); the push already went out
             self.desk.submit(rec, post, score, account, rules)
+        if self.duet is not None:  # the same: queues the email, never waits for SMTP
+            self.duet.submit(rec, post, score, account, rules)
         self._log_alert(rec, handle, catch_up=post.source == CATCH_UP_SOURCE)
 
     def _log_alert(self, rec: AlertRecord, handle: str, catch_up: bool = False) -> None:

@@ -77,6 +77,8 @@ STOPSIGNAL SIGTERM
 
 # Lets you pass a ceoscan sub-command directly, e.g. `docker compose run --rm ceoscan verify --write`
 # or `docker run --rm --env-file .env ceoscan cost`; anything else (like the default CMD) runs as-is.
+# The list must name every command of `python -m ceoscan` (tests/test_cli.py checks it); after a change,
+# rebuild the image (`docker compose up -d --build`).
 # `exec` keeps Python as the signal-receiving process so SIGTERM triggers a graceful shutdown.
-ENTRYPOINT ["/bin/sh", "-c", "if [ \"$#\" -eq 0 ]; then set -- run; fi; case \"$1\" in run|verify|rules|check-access|cost|replay|test-alert|-*) exec python -m ceoscan \"$@\" ;; *) exec \"$@\" ;; esac", "ceoscan"]
+ENTRYPOINT ["/bin/sh", "-c", "if [ \"$#\" -eq 0 ]; then set -- run; fi; case \"$1\" in run|verify|rules|check-access|cost|replay|test-alert|test-desk|test-duet|-*) exec python -m ceoscan \"$@\" ;; *) exec \"$@\" ;; esac", "ceoscan"]
 CMD ["python", "-m", "ceoscan", "run"]

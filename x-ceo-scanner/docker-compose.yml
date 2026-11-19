@@ -9,8 +9,8 @@
 #   docker compose logs -f --tail 100
 #
 # Any sub-command works the same way: docker compose run --rm ceoscan cost | check-access | rules |
-# test-alert | replay samples/sample_posts.jsonl   (`run` does not publish ports, so it can run
-# next to the live service).
+# test-alert | test-desk | test-duet | replay samples/sample_posts.jsonl   (`run` does not publish
+# ports, so it can run next to the live service). After `git pull`, rebuild: docker compose up -d --build
 services:
   ceoscan:
     build:

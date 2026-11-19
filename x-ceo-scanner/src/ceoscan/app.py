@@ -12,6 +12,9 @@
 * the health server (``GET /health``) and the ops scheduler (stream-down alerts, daily summary);
 * the optional Claude analyst desk (``claude_desk``: a Claude Code scheduled task fired for strong
   alerts, plus a daily review), sharing the HTTP session; stopped after the pipeline has drained;
+* the optional Claude Duet feed (``claude_duet``: strong alerts emailed to the inbox the user's Claude
+  Duet agent reads, plus a daily review email); stopped after the pipeline has drained, at the same
+  time as the desk (so the two 5 s stop limits do not add up past the 20 s stop budget);
 * housekeeping: the "last alive" time (kv ``ingest_last_alive``, every ~30 s and at shutdown) that
   the next start catches up from, and a throttled alert when Claude rejects our requests.
 
@@ -52,6 +55,7 @@ import aiohttp
 from .http import new_session
 from . import __version__
 from .alerts.claude_desk import ClaudeDesk, build_desk
+from .alerts.duet_feed import DuetFeed, build_duet
 from .alerts.dispatcher import AlertDispatcher, build_dispatcher
 from .alerts.format import format_system_alert
 from .config import AppConfig
@@ -127,6 +131,16 @@ def _describe_exc(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}"[:300] if text else type(exc).__name__
 
 
+async def _stop_together(stops: list[Callable[[], Awaitable[None]]]) -> None:
+    """Run the given stop coroutines at the same time (each has its own time limit); log, never raise."""
+    if not stops:
+        return
+    results = await asyncio.gather(*(stop() for stop in stops), return_exceptions=True)
+    for stop, result in zip(stops, results, strict=True):
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            logger.error("shutdown: %s failed: %s", getattr(stop, "__qualname__", stop), _describe_exc(result))
+
+
 def describe_latency(latency: tuple[float, float]) -> str:
     return f"typical {latency[0]:.1f}s, worst {latency[1]:.1f}s"
 
@@ -176,6 +190,8 @@ class Service:
         self.events: IngestEventLog | None = None
         self.desk: ClaudeDesk | None = None
         self.desk_problem: str | None = None  # why claude_desk.enabled is true but the desk is off
+        self.duet: DuetFeed | None = None
+        self.duet_problem: str | None = None  # why claude_duet.enabled is true but the feed is off
         self.config_problem: str | None = None
         self.warmup_error: str | None = None
         self._exit_code = EXIT_OK
@@ -440,9 +456,9 @@ class Service:
         self._spawn_background(self._startup_alert(report, build, len(verified)), "startup-alert")
         self._spawn_background(self._housekeeping(), "housekeeping")
 
-        desk = self._start_desk(stack, store, session)
-        pipeline = Pipeline(cfg, store, scorer, self.dispatcher, self.status, desk=desk)
-        scheduler = OpsScheduler(cfg, store, self.status, self.dispatcher, desk=desk)
+        desk, duet = self._start_analysts(stack, store, session)
+        pipeline = Pipeline(cfg, store, scorer, self.dispatcher, self.status, desk=desk, duet=duet)
+        scheduler = OpsScheduler(cfg, store, self.status, self.dispatcher, desk=desk, duet=duet)
         return await self._supervise(
             {
                 "ingest": self._ingest(mode, client, session, token, build.rules, poller, queue, last_alive),
@@ -451,10 +467,32 @@ class Service:
             }
         )
 
-    def _start_desk(
+    def _start_analysts(
         self, stack: contextlib.AsyncExitStack, store: Store, session: aiohttp.ClientSession
+    ) -> tuple[ClaudeDesk | None, DuetFeed | None]:
+        """The optional Claude analyst desk and Claude Duet feed, stopped *together* after the pipeline drained.
+
+        Each stop may take up to 5 s (DESK_STOP_SECONDS / DUET_STOP_SECONDS) after the drain's 15 s; one after
+        the other they would push the shutdown past systemd's TimeoutStopSec / compose's stop_grace_period
+        (20 s), and the SIGKILL would skip recording the leftovers and closing the store.
+        """
+        stops: list[Callable[[], Awaitable[None]]] = []
+        stack.push_async_callback(_stop_together, stops)  # runs after the pipeline drained (it may still submit)
+        desk = self._start_desk(stack, store, session, stops)
+        duet = self._start_duet(stack, store, stops)
+        return desk, duet
+
+    def _start_desk(
+        self,
+        stack: contextlib.AsyncExitStack,
+        store: Store,
+        session: aiohttp.ClientSession,
+        stops: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> ClaudeDesk | None:
-        """The Claude analyst desk when enabled and configured; otherwise None (one warning, never fatal)."""
+        """The Claude analyst desk when enabled and configured; otherwise None (one warning, never fatal).
+
+        Its stop joins ``stops`` (see :meth:`_start_analysts`), or else ``stack``.
+        """
         try:
             desk, problem = build_desk(self.cfg, store, session, self.dispatcher)
         except Exception as exc:  # the desk is optional: never keep the scanner from running
@@ -468,7 +506,10 @@ class Service:
                 self.out(f"WARNING: the Claude analyst desk is off: {problem}. Phone alerts are not affected.")
             return None
         desk.start()
-        stack.push_async_callback(desk.stop)  # runs after the pipeline drained (it may still submit)
+        if stops is not None:
+            stops.append(desk.stop)
+        else:
+            stack.push_async_callback(desk.stop)  # runs after the pipeline drained (it may still submit)
         d = self.settings.claude_desk
         self.out(
             f"Claude analyst desk: on (alerts with score >= {d.min_score}"
@@ -478,6 +519,43 @@ class Service:
             + ")"
         )
         return desk
+
+    def _start_duet(
+        self,
+        stack: contextlib.AsyncExitStack,
+        store: Store,
+        stops: list[Callable[[], Awaitable[None]]] | None = None,
+    ) -> DuetFeed | None:
+        """The Claude Duet feed when enabled and configured; otherwise None (one warning, never fatal).
+
+        Its stop joins ``stops`` (see :meth:`_start_analysts`), or else ``stack``.
+        """
+        try:
+            duet, problem = build_duet(self.cfg, store, self.dispatcher)
+        except Exception as exc:  # the feed is optional: never keep the scanner from running
+            logger.exception("claude_duet: could not be set up; continuing without it")
+            duet, problem = None, f"could not be set up: {_describe_exc(exc)}"
+        self.duet, self.duet_problem = duet, problem
+        if self.health is not None:
+            self.health.duet, self.health.duet_problem = duet, problem
+        if duet is None:
+            if problem:
+                self.out(f"WARNING: the Claude Duet feed is off: {problem}. Phone alerts are not affected.")
+            return None
+        duet.start()
+        if stops is not None:
+            stops.append(duet.stop)
+        else:
+            stack.push_async_callback(duet.stop)  # runs after the pipeline drained (it may still submit)
+        d = self.settings.claude_duet
+        self.out(
+            f"Claude Duet feed: on (emails to {duet.recipients_masked} for alerts with score >= {d.min_score}"
+            + (" or from always-alert accounts" if d.include_always_alert else "")
+            + f", at most {d.max_emails_per_hour} emails/hour"
+            + (", daily review" if d.daily_review else "")
+            + ")"
+        )
+        return duet
 
     # ------------------------------------------------------------------ ingest
 

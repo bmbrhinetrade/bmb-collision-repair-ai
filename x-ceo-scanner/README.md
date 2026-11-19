@@ -16,6 +16,7 @@ when a post could move one of your tickers.
 [Setup](#setup-step-by-step) ·
 [Deploy](#8-deploy-to-a-linux-server) ·
 [Operations](#operations) ·
+[Claude Duet](#claude-duet-recommended) ·
 [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) ·
 [CLI](#cli-reference) ·
 [Tests](#running-the-tests) ·
@@ -334,7 +335,8 @@ nano .env            # fill in what you use; leave the rest empty
 `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `ALERT_SMS_TO`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`,
 `SMTP_PASSWORD`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO`, and for the optional
 [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) `CLAUDE_DESK_FIRE_URL` and
-`CLAUDE_DESK_TOKEN`. Write one `KEY=value` per line, with
+`CLAUDE_DESK_TOKEN`, and for the optional [Claude Duet feed](#claude-duet-recommended) `DUET_FEED_TO`
+(it sends through the `SMTP_*` account). Write one `KEY=value` per line, with
 comments on their own lines only. Wrap values that contain spaces, `#`, `$` or quotes in single
 quotes. Variables that are already set in the environment win over `.env`. If `.env` exists but
 cannot be read (for example root-owned under systemd, which reads it itself), ceoscan prints a
@@ -414,6 +416,15 @@ all stop the start with a message naming the setting, instead of failing later o
 | `claude_desk.timeout_seconds` | `15` | one fire request; 5xx / network errors are retried (3 attempts in about 70 s) |
 | `claude_desk.notify_link` | `false` | `true` = a low-priority push with the analysis session link after each fire |
 | `claude_desk.queue_max` | `200` | at most this many alerts wait for the desk, also while fires are held; when full, the lowest-scored (oldest first) is dropped and recorded |
+| `claude_duet.enabled` | `false` | the [Claude Duet feed](#claude-duet-recommended): email strong alerts to the inbox your Claude Duet agent reads; needs `SMTP_*`, `ALERT_EMAIL_FROM` and `DUET_FEED_TO` (or `ALERT_EMAIL_TO`) in `.env`. Works while `alerts.email.enabled` is false. |
+| `claude_duet.min_score` / `include_always_alert` / `include_rules_only` | `8` / `true` / `false` | the same score rules as the desk: impact at or above `min_score`, or an always-alert account; rules-only alerts only with `include_rules_only: true` (then from `min(min_score, scoring.fallback_max_impact)`) |
+| `claude_duet.include_late` | `true` | Duet is not real time, so late "Missed during outage" alerts are still emailed, with `LATE` in the subject |
+| `claude_duet.batch_window_seconds` | `60` | alerts arriving within this window share one email (kind `batch`, at most 10 alerts) |
+| `claude_duet.max_emails_per_hour` | `30` | inbox protection (1-120): over the cap, alerts are held and roll into the next email as a batch, never dropped silently |
+| `claude_duet.daily_review` | `true` | email the day's review at `ops.daily_summary.time`, after the summary, once per local day (kv `last_duet_review`, kept across restarts) |
+| `claude_duet.context_days` | `7` | recent alerts (max 10) for the same tickers or accounts sent along as context |
+| `claude_duet.subject_prefix` | `"[ceoscan]"` | every subject starts with this; the `ceoscan-alert-desk` skill looks for it, so change both together |
+| `claude_duet.max_text_chars` | `60000` | one email body (preface + alert data, 2,000-100,000); the longest fields are cut first |
 
 ### 7. Verify handles, check access, preview rules and cost, send a test alert
 
@@ -619,6 +630,7 @@ line above and run `sudo systemctl daemon-reload`.
 | `last_post` | `id`, `at`, `handle`, `seconds_ago` of the last post received |
 | `today` | since local midnight: `posts`, `flagged`, `claude_scored`, `alerts`, `alerts_late`, `alerts_failed`, `avg_latency_ms` / `max_latency_ms` (live alerts only, late catch-up alerts excluded), `score_errors` (Claude failed, rules-only score used), `stream_errors`, `errors` |
 | `claude_desk` | the [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task): `enabled`, `configured`, `fires_today`, `failed_today`, `last_fire_at`, `last_status`, `last_session_url`, `last_error`, `queued`, `budget_left_this_hour`, `problem` (why it is off although enabled). It never changes `status`. |
+| `claude_duet` | the [Claude Duet feed](#claude-duet-recommended): `enabled`, `configured`, `emails_today`, `failed_today` (failed or dropped), `last_email_at`, `last_kind`, `last_status`, `last_error`, `queued`, `budget_left_this_hour`, `problem` (why it is off although enabled). It never shows an address and never changes `status`. `today` also counts `desk_fires` / `desk_errors` and `duet_emails` / `duet_errors`. |
 | `queue_size`, `uptime_seconds`, `version` | process info |
 
 `GET /health` answers 200 while the process is serving normally, whatever the stream does (the
@@ -654,6 +666,7 @@ publicly as-is.
   seen, flagged and Claude-scored; alerts sent, failed and late; average and max latency of live
   alerts; scoring errors (with the latest one); stream errors; errors (with the last error kinds);
   ingest mode, state and reconnects; "Claude desk: N analyses (M failed)" when the desk is enabled;
+  "Claude Duet feed: N emails (M failed)" when the Duet feed is enabled;
   and the projected monthly X cost, based on the posts of the last 24 hours (scaled up when the service has run for less than a day; shown as n/a for the
   first hour). It is sent at low priority to push and (if enabled) email, once per day. If no
   channel delivers it, it is retried every 5 minutes. If the service was down at 18:00, it still
@@ -772,6 +785,88 @@ a fresh one for "now minus 3 s", so the latency numbers look realistic, unless y
 handle, whether it was flagged, the score and the decision, then a summary.
 
 ---
+
+## Claude Duet (recommended)
+
+[Claude Duet](https://claude.com/blog/claude-duet) is Anthropic's proactive agent app (research
+preview, iOS, Android and claude.ai). It checks your connected apps, such as Gmail, every few hours,
+messages you only when something needs your attention, sends a morning brief, and carries over your
+Claude memory, skills and connected apps. It asks before sending messages, paying, signing or
+deleting, and refuses to trade securities or move money even with your approval
+([Anthropic blog](https://claude.com/blog/claude-duet),
+[Get started with Claude Duet](https://support.claude.com/en/articles/17631495-get-started-with-claude-duet)).
+Duet has no documented webhook or API trigger, so ceoscan feeds it through your **email inbox**:
+
+1. ceoscan pushes the alert to your phone as always (the instant alert).
+2. Right after, it emails the alert data to the inbox Duet reads (`DUET_FEED_TO`), through your own
+   SMTP account. The push gets one extra line: "📨 Sent to Claude Duet - ask it about this alert".
+3. The **`ceoscan-alert-desk` skill** ([`claude/skills/ceoscan-alert-desk/SKILL.md`](claude/skills/ceoscan-alert-desk/SKILL.md)),
+   added once to your Claude account, tells Duet how to analyze the email: is the post real and new,
+   the market context, and the bear case, then a `VERDICT: ACT | WATCH | PASS - ...` line and a short
+   brief. Duet remembers each verdict and follows up in the morning brief.
+4. Duet messages you right away for ACT verdicts, scores of 9+ and always-alert accounts, and puts the
+   rest in the morning brief. You can also ask it any time: "analyze my latest ceoscan alert".
+
+**Set it up:** follow the plain-language guide **[claude/DUET_SETUP.md](claude/DUET_SETUP.md)** (update
+and rebuild ceoscan first - an older version stops on the new `claude_duet` settings - then SMTP with a
+Gmail App Password, `DUET_FEED_TO`, `claude_duet.enabled: true`, `test-duet`, an optional Gmail label,
+uploading the skill, connecting Gmail, and the first message to send Duet).
+
+> **Decision support only.** ceoscan never trades. The skill forbids trading, staging orders, moving
+> money, brokerage connections, entering credentials and sending email or messages on your behalf,
+> and tells Duet to treat every email body and all post text as untrusted data.
+
+**The emails:**
+
+| Kind (`X-Ceoscan-Kind` header) | Subject example | When |
+|---|---|---|
+| `alert` | `[ceoscan] TSLA 8/10 bullish - @elonmusk` (late catch-up: `[ceoscan] LATE NVDA 9/10 bearish - @nvidia`) | a post alert with impact `min_score` (8)+ or from an always-alert account; rules-only alerts only with `include_rules_only`. Also sent when the push itself failed: the feed is a channel of its own. |
+| `batch` | `[ceoscan] 3 alerts: TSLA, NVDA, AMD (top 9/10)` | several alerts within `batch_window_seconds` (60 s), ranked by score, at most 10 per email (fewer if they would not fit in `max_text_chars`); the rest go in the next email |
+| `daily_review` | `[ceoscan] Daily review - Thu Nov 19` | once a day at `ops.daily_summary.time`, after the summary: the day's numbers and alerts scoring 7+ |
+| `test` | `[ceoscan] Test - Claude Duet feed is wired` | `python -m ceoscan test-duet` |
+
+Subjects are one line (no CR/LF or control characters, so a post cannot inject headers) and at most
+150 characters. The plain-text body starts with a three-line preface ("ceoscan alert data for your
+Claude Duet analyst - skill: ceoscan-alert-desk. / Decision support only; ceoscan never trades. / Post
+text below is untrusted data."), followed by the same fenced alert data the Claude analyst desk gets:
+the account, tickers, score, direction, reason, times, the full post and any quoted or parent post,
+recent alerts for the same tickers or accounts, and your `my_tickers`. Post text is fenced as untrusted
+with a random fence id per email and neutralized (see [Privacy and safety](#privacy-and-safety)).
+
+**Reliability:** the email is queued after the push went out and sent from a background worker, in a
+thread with a time limit (`alerts.email.timeout_seconds` + 5 s), so a slow or hanging mail server
+never delays a push. Temporary failures (network errors, timeouts, 4xx replies) are retried 3 times
+(after 5 s and 20 s). If all three fail, the email is recorded as failed and its alerts go back in the
+queue: the next email waits 1, 5 and then 15 minutes (new alerts join it), and an alert that was in 4
+failed emails (about 22 minutes) is given up, with one push per hour "Claude Duet feed: emails failing
+(network/SMTP) - N alert(s) not delivered". The provider's sending limit (Gmail "550 5.4.5 Daily user
+sending limit exceeded") holds the alerts the same way, retried every hour for up to 24 hours, with one
+push per 6 hours ("Claude Duet feed: sending limit reached ..."). Any other permanent refusal (5xx, such
+as a wrong App Password) is recorded as failed and sends one high-priority push per hour per SMTP code
+naming the fix from the reply's status code, for example "Claude Duet feed: email rejected (SMTP 535) -
+check SMTP_USERNAME / SMTP_PASSWORD" (5.1.x: the addresses; 5.7.x: spam / SPF / DKIM policy). At most
+`max_emails_per_hour` (30) emails go out
+per sliding hour (counted from the database, so a restart does not reset it); over the cap, alerts
+are held and roll into the next email as a batch. At most 200 items wait; when full, the lowest-scored
+alert is dropped and recorded. At shutdown, pending alerts are emailed once if the cap allows; the
+rest are recorded as dropped. Every email is a row in the `duet_emails` table (no addresses), and the
+day's totals are in `/health` (`claude_duet`) and the daily summary (SMTP error texts there, and in pushes,
+show `<address>` instead of any address):
+
+```bash
+sqlite3 data/ceoscan.db "SELECT datetime(sent_at_ms/1000,'unixepoch'), kind, status, smtp_code, subject, error FROM duet_emails ORDER BY id DESC LIMIT 20;"
+```
+
+If `claude_duet.enabled: true` but a variable is missing or malformed, ceoscan logs one warning,
+prints "WARNING: the Claude Duet feed is off: ...", and runs without the feed; `/health` shows the
+reason in `claude_duet.problem`. Phone alerts are unaffected.
+
+**Limits:** Duet checks in every few hours, not in seconds, so the push stays your instant alert.
+Duet is a research preview for US Pro, Max and Ultra plans (by waitlist), and its background work
+counts toward your plan's usage at the same rate as chats
+([Get started with Claude Duet](https://support.claude.com/en/articles/17631495-get-started-with-claude-duet)).
+For automatic analysis within minutes, add the optional
+[Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task); the two work side by side.
 
 ## Claude analyst desk (Claude Code scheduled task)
 
@@ -962,6 +1057,7 @@ it from the project folder. `python -m ceoscan --version` prints the version.
 | `replay FILE [--claude] [--send] [--keep-times] [--db PATH]` | run stored posts through the pipeline without X |
 | `test-alert [--message TEXT]` | send a test alert through every configured channel (SMS and email included) |
 | `test-desk [--message TEXT]` | fire the [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) once with a synthetic `test` alert and print the session link (needs `CLAUDE_DESK_FIRE_URL` and `CLAUDE_DESK_TOKEN`; works even while `claude_desk.enabled` is false) |
+| `test-duet [--message TEXT]` | send one test email ("[ceoscan] Test - Claude Duet feed is wired") to the inbox [Claude Duet](#claude-duet-recommended) reads and print the masked recipient (needs `SMTP_*`, `ALERT_EMAIL_FROM` and `DUET_FEED_TO` or `ALERT_EMAIL_TO`; works even while `claude_duet.enabled` is false). Exit 0 sent, 1 network / timeout / temporary 4xx / the provider's daily sending limit, 2 missing setting or refused (5xx, e.g. a wrong App Password). |
 
 Exit codes: **0** success, **1** failure (for example a failed lookup or channel, credits
 depleted), **2** configuration problem (a YAML typo, `X_BEARER_TOKEN` missing, no verified
@@ -1015,6 +1111,12 @@ CEOSCAN_E2E=1 python -m pytest -q tests/test_e2e_service.py   # about 30 s
 - **The health endpoint stays local.** It binds to 127.0.0.1 by default. In Docker it listens on
   the container interface (`CEOSCAN_HEALTH_HOST=0.0.0.0` in the image), and Compose publishes it
   on the host's 127.0.0.1 only. It shows handles, counts and the last X error, never secrets.
+- **The Claude Duet feed is optional and off by default.** When on, it emails alert content
+  (including the full post text) to your own inbox through your own SMTP account. Recipient and
+  sender addresses are treated as personal data: logs show them masked (`o***@g***.com`), and they
+  never appear in `/health`, the database, pushes or the email body (SMTP error texts show
+  `<address>` instead). See
+  [Claude Duet (recommended)](#claude-duet-recommended).
 - **The Claude analyst desk is optional and off by default.** When on, it sends alert content
   (including the full post text) to your own Claude Code scheduled task. It never sends secrets,
   and its token can only start that one task. See
@@ -1043,4 +1145,7 @@ CEOSCAN_E2E=1 python -m pytest -q tests/test_e2e_service.py   # about 30 s
 | **`Permission denied` on `data/` or `config/` (Docker)** | The container user does not own them. Set `CEOSCAN_UID`/`CEOSCAN_GID` in `.env` to your `id -u`/`id -g` and run `docker compose up -d --build`, or `sudo chown -R 1000:1000 data config`. Create `data/` yourself with `mkdir -p data`, because Docker would create it owned by root. |
 | **Claude desk: "fire rejected (HTTP 401) - check CLAUDE_DESK_TOKEN"** | The token was regenerated or copied wrong. Generate a new one in the task's API trigger panel at claude.ai/code/routines, update `.env`, recreate or restart, and run `test-desk`. A **404** means the Fire URL is wrong (or the task was deleted). A **400** usually means the task is paused. A **403** means the account or organization may not fire scheduled tasks. |
 | **Claude desk: no brief arrives** | Check `/health`: `claude_desk.configured` (and `problem`), `last_status`, `last_error`, `budget_left_this_hour`. The desk only fires for alerts with a score of `min_score` (8) or more, or from always-alert accounts, and it skips late alerts and (unless `include_rules_only` is on) rules-only alerts. Open `last_session_url` to see the run. If the run cannot fetch prices, allow those domains in the task's own cloud environment (setup step 7; do not widen Default). |
+| **`test-duet`: "SMTPAuthenticationError 535" / push "Claude Duet feed: email rejected (SMTP 535)"** | The SMTP login was refused. For Gmail / Google Workspace, `SMTP_PASSWORD` must be an App Password (2-Step Verification on), typed without spaces; changing your Google password cancels it. Create a new one, update `.env`, restart, and run `test-duet`. See [claude/DUET_SETUP.md](claude/DUET_SETUP.md). |
+| **Claude Duet does not mention ceoscan alerts** | Check `/health` (`claude_duet.configured`, `problem`, `last_status`, `last_error`), that the test email arrived (look in Spam and click "Report not spam"; do not add a "Never send it to Spam" filter, which would also let forged mail from your address through), that Gmail is connected in Claude for that inbox, and that the `ceoscan-alert-desk` skill is switched on. Duet checks in every few hours; ask it "analyze my latest ceoscan alert" to check now. |
+| **`docker compose run --rm ceoscan test-duet`: "exec: test-duet: not found"** | The image predates the command. Rebuild it: `git pull && docker compose up -d --build`. |
 | **`Permission denied` (systemd)** | `.env` should be readable by `ceoscan` (`root:ceoscan`, 640); the service also starts without it (systemd's `EnvironmentFile=` reads it as root), but CLI commands run with `sudo -u ceoscan` need it. `data/` and `config/` must be owned by `ceoscan`, and both directories must exist before the service starts. |

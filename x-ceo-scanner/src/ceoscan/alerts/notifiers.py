@@ -18,7 +18,7 @@ import ssl
 import time
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
-from typing import Any, Callable, Iterable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
 import aiohttp
 
@@ -327,13 +327,27 @@ class TwilioSmsNotifier:
 
 
 class EmailNotifier:
-    """Email via stdlib smtplib, run in a worker thread. STARTTLS by default, SMTPS when use_ssl."""
+    """Email via stdlib smtplib, run in a worker thread. STARTTLS by default, SMTPS when use_ssl.
 
-    def __init__(self, secrets: Secrets, settings: EmailSettings, timeout: float = 10.0) -> None:
-        self.name = "email"
+    ``to`` overrides the recipient(s) (default ``ALERT_EMAIL_TO``); the Claude Duet feed uses it for
+    ``DUET_FEED_TO``. ``build_message(msg, headers)`` adds extra headers, and :meth:`deliver` is the blocking
+    SMTP exchange for callers that run it in their own thread.
+    """
+
+    def __init__(
+        self,
+        secrets: Secrets,
+        settings: EmailSettings,
+        timeout: float = 10.0,
+        *,
+        to: str | None = None,
+        name: str = "email",
+    ) -> None:
+        self.name = name
         self._secrets = secrets
         self.settings = settings
         self.timeout = float(timeout)
+        self._to = to
         self._scrub = _Scrubber([secrets.smtp_password, secrets.smtp_username])
 
     @property
@@ -343,20 +357,26 @@ class EmailNotifier:
             return 465
         return port
 
-    def build_message(self, msg: AlertMessage) -> EmailMessage:
+    def build_message(self, msg: AlertMessage, headers: Mapping[str, str] | None = None) -> EmailMessage:
         s = self._secrets
         em = EmailMessage()
         em["Subject"] = _one_line(msg.title)[:250] or "ceoscan alert"
         em["From"] = s.email_from or ""
-        em["To"] = s.email_to or ""
+        em["To"] = self._to or s.email_to or ""
         em["Date"] = formatdate(usegmt=True)
         domain = (s.email_from or "").rpartition("@")[2].strip(" >") or "ceoscan.local"
         em["Message-ID"] = make_msgid(domain=domain)
+        for key, value in (headers or {}).items():
+            em[key] = _one_line(value)
         body = msg.body or msg.title
         if msg.url and msg.url not in body:
             body = f"{body}\n\n{msg.url}"
         em.set_content(body + "\n\n-- \nceoscan (alerts only; never trades)\n")
         return em
+
+    def deliver(self, em: EmailMessage) -> None:
+        """The blocking SMTP exchange for one built message (raises smtplib / OSError exceptions)."""
+        self._send_sync(em)
 
     def _send_sync(self, em: EmailMessage) -> None:
         s = self._secrets

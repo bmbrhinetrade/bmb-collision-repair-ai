@@ -13,8 +13,10 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
+import subprocess
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -141,6 +143,8 @@ def global_flags(env: str) -> list[str]:
         (["test-alert", "--message", "hello phone"], {"command": "test-alert", "message": "hello phone"}),
         (["test-desk"], {"command": "test-desk", "message": None}),
         (["test-desk", "--message", "hello desk"], {"command": "test-desk", "message": "hello desk"}),
+        (["test-duet"], {"command": "test-duet", "message": None}),
+        (["test-duet", "--message", "hello duet"], {"command": "test-duet", "message": "hello duet"}),
     ],
 )
 def test_parse_every_command(argv: list[str], expected: dict[str, Any]) -> None:
@@ -162,6 +166,40 @@ def test_every_subcommand_has_a_handler() -> None:
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     assert set(sub.choices) == set(cli.COMMANDS)
+
+
+def _docker_entrypoint() -> list[str]:
+    lines = (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+    (line,) = [ln for ln in lines if ln.startswith("ENTRYPOINT ")]
+    return json.loads(line[len("ENTRYPOINT "):])
+
+
+def test_docker_entrypoint_routes_every_cli_command_to_ceoscan() -> None:
+    """`docker compose run --rm ceoscan <command>` must work for every command (the docs say so; DUET_SETUP
+    step A6 uses test-duet). A command missing from the ENTRYPOINT's case list is exec'd as a program
+    instead: "exec: test-duet: not found", exit 127."""
+    shell, flag, script, argv0 = _docker_entrypoint()
+    assert (shell, flag, argv0) == ("/bin/sh", "-c", "ceoscan")
+    case = script[script.index('case "$1" in ') + len('case "$1" in '):]
+    patterns = case[: case.index(")")].split("|")
+    assert set(cli.COMMANDS) <= set(patterns), sorted(set(cli.COMMANDS) - set(patterns))
+    sh = shutil.which("sh")
+    if sh is None:  # pragma: no cover - every Linux / macOS CI has one
+        pytest.skip("no POSIX shell")
+    # the same routing with echo instead of exec: which branch runs for each first argument?
+    probe = script.replace('exec python -m ceoscan "$@"', 'echo "ceoscan $*"').replace('exec "$@"', 'echo "exec $*"')
+    assert probe != script and probe.count("echo") == 2
+
+    def route(*args: str) -> str:
+        done = subprocess.run([sh, "-c", probe, argv0, *args], capture_output=True, text=True, timeout=10, check=False)
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip()
+
+    for command in cli.COMMANDS:
+        assert route(command, "--help") == f"ceoscan {command} --help", command
+    assert route() == "ceoscan run"  # no argument: the service
+    assert route("--version") == "ceoscan --version"
+    assert route("python", "-m", "ceoscan", "run") == "exec python -m ceoscan run"  # the default CMD runs as-is
 
 
 @pytest.mark.parametrize("argv", [["replay"], ["bogus"], ["rules", "--write"], ["verify", "--apply"]])

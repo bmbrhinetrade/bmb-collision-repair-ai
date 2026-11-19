@@ -258,6 +258,34 @@ class ClaudeDeskSettings:
     queue_max: int = 200  # alerts waiting for the desk, also while held; when full the lowest-scored is dropped
 
 
+#: Upper bound for claude_duet.max_emails_per_hour (inbox protection; Gmail also caps daily sending).
+DUET_MAX_EMAILS_PER_HOUR = 120
+#: Upper bound for claude_duet.max_text_chars (one email body).
+DUET_TEXT_LIMIT = 100_000
+
+
+@dataclass
+class ClaudeDuetSettings:
+    """The Claude Duet feed: strong alerts emailed to the inbox the user's Claude Duet agent reads.
+
+    Claude Duet has no webhook or API trigger, so ceoscan feeds it through email (Duet reads Gmail
+    through the Claude Gmail connector). Needs SMTP_* plus DUET_FEED_TO (or ALERT_EMAIL_TO) in .env;
+    works even when alerts.email.enabled is false. Decision support only: nothing here trades.
+    """
+
+    enabled: bool = False
+    min_score: int = 8  # email post alerts whose impact is >= this (rules-only cap aware, as claude_desk)
+    include_always_alert: bool = True  # also email always-alert accounts, whatever the score
+    include_rules_only: bool = False  # True: rules-only scores from min(min_score, scoring.fallback_max_impact)
+    include_late: bool = True  # Duet is not real time: late catch-up alerts are still useful (LATE in the subject)
+    batch_window_seconds: float = 60.0  # alerts arriving within this window share one email
+    max_emails_per_hour: int = 30  # inbox protection; overflow rolls into the next email, never dropped silently
+    daily_review: bool = True  # email the day's review at ops.daily_summary.time (once per local day)
+    context_days: int = 7  # recent alerts for the same tickers / accounts sent along as context
+    subject_prefix: str = "[ceoscan]"  # the ceoscan-alert-desk skill looks for subjects starting with this
+    max_text_chars: int = 60_000  # one email body (preface + fenced alert data)
+
+
 @dataclass
 class Settings:
     x_api: XApiSettings = field(default_factory=XApiSettings)
@@ -265,6 +293,7 @@ class Settings:
     alerts: AlertSettings = field(default_factory=AlertSettings)
     ops: OpsSettings = field(default_factory=OpsSettings)
     claude_desk: ClaudeDeskSettings = field(default_factory=ClaudeDeskSettings)
+    claude_duet: ClaudeDuetSettings = field(default_factory=ClaudeDuetSettings)
 
 
 def _did_you_mean(key: Any, allowed: typing.Iterable[str]) -> str:
@@ -524,6 +553,24 @@ def _settings_problems(s: Settings) -> list[str]:
         p.append(f"claude_desk.api_version must be a date such as 2023-06-01 (2023-06-01 or later; got "
                  f"{d.api_version!r})")
     between(d.queue_max, 1, 10_000, "claude_desk.queue_max")
+
+    du = s.claude_duet
+    between(du.min_score, 1, 10, "claude_duet.min_score")
+    between(du.batch_window_seconds, 0, 3600, "claude_duet.batch_window_seconds")
+    between(du.max_emails_per_hour, 1, DUET_MAX_EMAILS_PER_HOUR, "claude_duet.max_emails_per_hour")
+    between(du.context_days, 0, 90, "claude_duet.context_days")
+    between(du.max_text_chars, 2000, DUET_TEXT_LIMIT, "claude_duet.max_text_chars")
+    prefix = du.subject_prefix if isinstance(du.subject_prefix, str) else ""
+    if (
+        not prefix.strip()
+        or prefix != prefix.strip()
+        or len(prefix) > 40
+        or any(not ch.isprintable() for ch in prefix)
+    ):
+        p.append(
+            'claude_duet.subject_prefix must be 1-40 printable characters on one line without leading or trailing '
+            f'spaces, e.g. "[ceoscan]" (got {du.subject_prefix!r})'
+        )
     return p
 
 
@@ -782,6 +829,8 @@ SECRET_ENV_VARS = (
     "SMTP_PASSWORD",
     "CLAUDE_DESK_FIRE_URL",
     "CLAUDE_DESK_TOKEN",
+    # Not a credential, but personal data: the Claude Duet feed's recipient address(es), kept out of logs.
+    "DUET_FEED_TO",
 )
 
 
@@ -806,6 +855,8 @@ class Secrets:
     # Claude analyst desk (a Claude Code scheduled task's API trigger): the Fire URL and its token
     claude_desk_fire_url: str | None = None
     claude_desk_token: str | None = None
+    # Claude Duet feed: the inbox Claude Duet reads (falls back to email_to). Personal data, never logged.
+    duet_feed_to: str | None = None
 
     def __repr__(self) -> str:  # never print secret values
         present = [f.name for f in fields(self) if isinstance(getattr(self, f.name), str) and getattr(self, f.name)]
@@ -829,7 +880,12 @@ class Secrets:
             # Not a credential on its own, but it names the scheduled task: kept out of logs as well.
             "claude_desk_fire_url",
         )
-        return [v for n in names if (v := getattr(self, n)) and len(v) >= 6]
+        values = [v for n in names if (v := getattr(self, n)) and len(v) >= 6]
+        # The Claude Duet recipient(s): personal data, redacted whole and address by address.
+        if self.duet_feed_to:
+            parts = [self.duet_feed_to, *(a.strip() for a in self.duet_feed_to.split(","))]
+            values.extend(a for a in parts if len(a) >= 6 and a not in values)
+        return values
 
 
 def load_secrets() -> Secrets:
@@ -859,6 +915,7 @@ def load_secrets() -> Secrets:
         email_to=clean("ALERT_EMAIL_TO"),
         claude_desk_fire_url=clean("CLAUDE_DESK_FIRE_URL"),
         claude_desk_token=clean("CLAUDE_DESK_TOKEN"),
+        duet_feed_to=clean("DUET_FEED_TO"),
     )
 
 
