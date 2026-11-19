@@ -46,12 +46,13 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '\033[33m    WARNING: %s\033[0m\n' "$*" >&2; }
 die() { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
+need_value() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value (see --help)"; }
 while [ $# -gt 0 ]; do
     case "$1" in
-        --email) EMAIL="${2:-}"; shift 2 ;;
-        --ntfy-topic) NTFY_TOPIC_ARG="${2:-}"; shift 2 ;;
-        --dir) INSTALL_DIR="${2:-}"; shift 2 ;;
-        --branch) BRANCH="${2:-}"; shift 2 ;;
+        --email) need_value "$@"; EMAIL="$2"; shift 2 ;;
+        --ntfy-topic) need_value "$@"; NTFY_TOPIC_ARG="$2"; shift 2 ;;
+        --dir) need_value "$@"; INSTALL_DIR="$2"; shift 2 ;;
+        --branch) need_value "$@"; BRANCH="$2"; shift 2 ;;
         --yes|-y) ASSUME_YES=1; shift ;;
         --skip-docker-install) SKIP_DOCKER_INSTALL=1; shift ;;
         --skip-tests) SKIP_TESTS=1; shift ;;
@@ -85,7 +86,7 @@ ask_secret() {  # ask_secret VAR "question" ENVNAME - hidden input; never echoed
     if [ "$ASSUME_YES" -eq 1 ]; then printf -v "$__var" '%s' "${!__env:-}"; return; fi
     printf '%s (typing is hidden; paste and press Enter): ' "$__q" > "$TTY"
     IFS= read -rs __ans < "$TTY" || true
-    printf '\n' > "$TTY"
+    printf '\n    (received %s characters)\n' "${#__ans}" > "$TTY"   # length only, never the value
     printf -v "$__var" '%s' "$__ans"
 }
 pause() {
@@ -104,6 +105,10 @@ case "$ARCH" in
     *) die "unsupported CPU architecture: $ARCH" ;;
 esac
 
+apt_get() {  # sudo drops DEBIAN_FRONTEND, so pass it through env; wait up to 10 min for the apt lock
+    $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 "$@"
+}
+
 install_cli_plugin() {  # install_cli_plugin NAME URL
     local name="$1" url="$2" dir="/usr/local/lib/docker/cli-plugins"
     info "installing the Docker $name plugin from GitHub ($url)"
@@ -117,7 +122,12 @@ ensure_compose() {
         install_cli_plugin compose \
             "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${DL_ARCH}"
     fi
-    if ! $SUDO docker buildx version >/dev/null 2>&1; then
+    # A missing or old buildx (< 0.17) breaks `compose build` on newer Compose: install the pinned one
+    # into /usr/local/lib, which the Docker CLI searches before the OS package folders.
+    local bx minor
+    bx="$($SUDO docker buildx version 2>/dev/null || true)"
+    minor="$(printf '%s\n' "$bx" | sed -n 's/.*v0\.\([0-9][0-9]*\)\..*/\1/p' | head -n 1)"
+    if [ -z "$bx" ] || { [ -n "$minor" ] && [ "$minor" -lt 17 ]; }; then
         install_cli_plugin buildx \
             "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${BX_ARCH}"
     fi
@@ -134,16 +144,16 @@ if [ "$SKIP_DOCKER_INSTALL" -eq 0 ]; then
             fi
             ;;
         ubuntu|debian)
-            export DEBIAN_FRONTEND=noninteractive
-            $SUDO apt-get update -qq
-            $SUDO apt-get install -y -qq git curl ca-certificates >/dev/null
+            info "(if the server is busy installing updates, this waits for it - up to 10 minutes)"
+            apt_get update -qq
+            apt_get install -y -qq git curl ca-certificates >/dev/null
             if ! command -v docker >/dev/null 2>&1; then
-                $SUDO apt-get install -y -qq docker.io >/dev/null
+                apt_get install -y -qq docker.io >/dev/null
             fi
-            $SUDO apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
-                || $SUDO apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || true
-            $SUDO apt-get install -y -qq docker-buildx >/dev/null 2>&1 \
-                || $SUDO apt-get install -y -qq docker-buildx-plugin >/dev/null 2>&1 || true
+            apt_get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
+                || apt_get install -y -qq docker-compose-plugin >/dev/null 2>&1 || true
+            apt_get install -y -qq docker-buildx >/dev/null 2>&1 \
+                || apt_get install -y -qq docker-buildx-plugin >/dev/null 2>&1 || true
             ;;
         *)
             command -v docker >/dev/null 2>&1 \
@@ -195,6 +205,14 @@ else
 fi
 
 # --------------------------------------------------------------------------- 3. code
+if ! git ls-remote --exit-code --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
+    if git ls-remote --exit-code --heads "$REPO_URL" main >/dev/null 2>&1; then
+        warn "branch $BRANCH no longer exists (merged?); using main"
+        BRANCH="main"
+    else
+        die "cannot reach $REPO_URL (no internet, or GitHub is down?)"
+    fi
+fi
 say "3/5 Getting ceoscan (branch $BRANCH) into $INSTALL_DIR"
 if [ -d "$INSTALL_DIR/.git" ]; then
     changed="$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=no)"
@@ -202,7 +220,7 @@ if [ -d "$INSTALL_DIR/.git" ]; then
         # e.g. config/watchlist.yaml edited here or updated by `verify --write` - never overwrite it
         warn "files were changed on this server, so the code was NOT updated (your changes are kept):"
         printf '%s\n' "$changed" | sed 's/^/        /' >&2
-        warn "to update anyway: cd $INSTALL_DIR && git stash && bash x-ceo-scanner/deploy/install-server.sh, then git stash pop"
+        warn "to update anyway: cd \"$INSTALL_DIR\" && git stash && bash x-ceo-scanner/deploy/install-server.sh --dir \"$INSTALL_DIR\", then git stash pop"
     else
         git -C "$INSTALL_DIR" fetch -q --depth 1 origin "$BRANCH"
         git -C "$INSTALL_DIR" checkout -q -B "$BRANCH" FETCH_HEAD
@@ -220,25 +238,29 @@ cd "$APP"
 if [ "$(id -u)" -eq 0 ]; then RUN_UID=10001; RUN_GID=10001; else RUN_UID="$(id -u)"; RUN_GID="$(id -g)"; fi
 
 # --------------------------------------------------------------------------- 4. .env
-set_env() {  # set_env KEY VALUE - replace or append KEY=VALUE in .env (value written verbatim)
-    local key="$1" val="$2" tmp
+set_env_in() {  # set_env_in FILE KEY VALUE - replace or append KEY=VALUE (value written verbatim)
+    local file="$1" key="$2" val="$3" tmp
     tmp="$(mktemp "$APP/.env.XXXXXX")"
     chmod 600 "$tmp"
-    if [ -f .env ]; then grep -v "^${key}=" .env > "$tmp" || true; fi
+    if [ -f "$file" ]; then grep -v "^${key}=" "$file" > "$tmp" || true; fi
     printf '%s=%s\n' "$key" "$val" >> "$tmp"
-    mv -f "$tmp" .env
+    mv -f "$tmp" "$file"
 }
 clean_secret() { printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+env_has() { grep -Eq "^$1=.+" .env 2>/dev/null; }
 
-if [ -f .env ]; then
+NEW_ENV=""
+trap '[ -n "$NEW_ENV" ] && rm -f "$NEW_ENV"' EXIT
+if [ -f .env ] && env_has X_BEARER_TOKEN; then
     say "4/5 Keeping your existing .env (delete it and run this again to start over)"
-    grep -q '^CEOSCAN_UID=' .env || set_env CEOSCAN_UID "$RUN_UID"
-    grep -q '^CEOSCAN_GID=' .env || set_env CEOSCAN_GID "$RUN_GID"
+    env_has CEOSCAN_UID || set_env_in .env CEOSCAN_UID "$RUN_UID"
+    env_has CEOSCAN_GID || set_env_in .env CEOSCAN_GID "$RUN_GID"
 else
+    if [ -f .env ]; then
+        warn "the existing .env has no X bearer token (an earlier run stopped early?) - asking again"
+    fi
     say "4/5 Creating .env (your private keys - stored only on this server, readable only by you)"
     umask 077
-    cp .env.example .env
-    chmod 600 .env
 
     while [ -z "$EMAIL" ] || ! printf '%s' "$EMAIL" | grep -Eq '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'; do
         [ "$ASSUME_YES" -eq 1 ] && die "--email is required with --yes"
@@ -258,35 +280,58 @@ else
     info "  2. Anthropic key:    console.anthropic.com > API Keys > Create Key (starts with sk-ant-)"
     info "  3. Gmail App Password for ${EMAIL}: myaccount.google.com > Security > 2-Step Verification"
     info "     (turn on) > App passwords > create one named ceoscan (16 letters; spaces are fine)"
+    info "Paste tip: in a browser terminal use the right mouse button or Ctrl+Shift+V (Cmd+V on a Mac)."
     echo
     X_TOKEN=""; ANTH_KEY=""; APP_PW=""
-    ask_secret X_TOKEN "1. X bearer token" X_BEARER_TOKEN
+    for attempt in 1 2 3; do
+        ask_secret X_TOKEN "1. X bearer token" X_BEARER_TOKEN
+        X_TOKEN="$(clean_secret "$X_TOKEN")"
+        [ -n "$X_TOKEN" ] && break
+        [ "$ASSUME_YES" -eq 1 ] && die "X_BEARER_TOKEN is empty (required with --yes)"
+        warn "nothing was received - try pasting again (attempt $attempt of 3)"
+    done
+    [ -n "$X_TOKEN" ] || die "the X bearer token is required; run this again when you have it"
     ask_secret ANTH_KEY "2. Anthropic API key (Enter to skip: rules-only scoring)" ANTHROPIC_API_KEY
     ask_secret APP_PW "3. Gmail App Password (Enter to skip: no Claude Duet emails)" SMTP_PASSWORD
-    X_TOKEN="$(clean_secret "$X_TOKEN")"; ANTH_KEY="$(clean_secret "$ANTH_KEY")"
+    ANTH_KEY="$(clean_secret "$ANTH_KEY")"
     APP_PW="$(clean_secret "$APP_PW" | tr -d ' ')"
-    [ -n "$X_TOKEN" ] || die "the X bearer token is required"
     case "$ANTH_KEY" in ""|sk-ant-*) ;; *) warn "the Anthropic key does not start with sk-ant- - check it later with the test commands" ;; esac
     if [ -n "$APP_PW" ] && [ "${#APP_PW}" -ne 16 ]; then warn "a Gmail App Password has 16 letters; yours has ${#APP_PW}"; fi
 
-    set_env X_BEARER_TOKEN "$X_TOKEN"
-    set_env ANTHROPIC_API_KEY "$ANTH_KEY"
-    set_env NTFY_TOPIC "$NTFY_TOPIC"
-    set_env SMTP_HOST "smtp.gmail.com"
-    set_env SMTP_PORT "587"
-    set_env SMTP_USERNAME "$EMAIL"
-    set_env SMTP_PASSWORD "$APP_PW"
-    set_env ALERT_EMAIL_FROM "$EMAIL"
-    set_env ALERT_EMAIL_TO "$EMAIL"
-    set_env DUET_FEED_TO "$EMAIL"
-    set_env CEOSCAN_UID "$RUN_UID"
-    set_env CEOSCAN_GID "$RUN_GID"
+    # Build the whole file aside and move it into place only when every value is in, so an
+    # interrupted run never leaves a half-filled .env behind.
+    NEW_ENV="$(mktemp "$APP/.env.XXXXXX")"
+    chmod 600 "$NEW_ENV"
+    cat .env.example > "$NEW_ENV"
+    set_env_in "$NEW_ENV" X_BEARER_TOKEN "$X_TOKEN"
+    set_env_in "$NEW_ENV" ANTHROPIC_API_KEY "$ANTH_KEY"
+    set_env_in "$NEW_ENV" NTFY_TOPIC "$NTFY_TOPIC"
+    set_env_in "$NEW_ENV" SMTP_HOST "smtp.gmail.com"
+    set_env_in "$NEW_ENV" SMTP_PORT "587"
+    set_env_in "$NEW_ENV" SMTP_USERNAME "$EMAIL"
+    set_env_in "$NEW_ENV" SMTP_PASSWORD "$APP_PW"
+    set_env_in "$NEW_ENV" ALERT_EMAIL_FROM "$EMAIL"
+    set_env_in "$NEW_ENV" ALERT_EMAIL_TO "$EMAIL"
+    set_env_in "$NEW_ENV" DUET_FEED_TO "$EMAIL"
+    set_env_in "$NEW_ENV" CEOSCAN_UID "$RUN_UID"
+    set_env_in "$NEW_ENV" CEOSCAN_GID "$RUN_GID"
+    mv -f "$NEW_ENV" .env
+    NEW_ENV=""
     unset X_TOKEN ANTH_KEY APP_PW
     info "saved .env (permissions 600)"
 fi
 mkdir -p data
 if [ "$(stat -c %u data)" != "$RUN_UID" ]; then $SUDO chown -R "$RUN_UID:$RUN_GID" data config; fi
-TOPIC_NOW="$(grep '^NTFY_TOPIC=' .env | head -1 | cut -d= -f2-)"
+TOPIC_NOW="$({ grep '^NTFY_TOPIC=' .env || true; } | head -n 1 | cut -d= -f2-)"
+
+# The status page needs a free port on this server's 127.0.0.1 (docker-compose.yml "ports", default 8080).
+HEALTH_PORT="$({ sed -n 's/^ *- *"127\.0\.0\.1:\([0-9][0-9]*\):8080".*/\1/p' docker-compose.yml || true; } | head -n 1)"
+HEALTH_PORT="${HEALTH_PORT:-8080}"
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$HEALTH_PORT") 2>/dev/null; }
+if port_in_use && [ -z "$($SUDO docker compose ps -q ceoscan 2>/dev/null || true)" ]; then
+    die "another program on this server already uses port $HEALTH_PORT. Free it, or change the first $HEALTH_PORT in
+       the ports line of $APP/docker-compose.yml (e.g. \"127.0.0.1:18080:8080\"), then run this again"
+fi
 
 # --------------------------------------------------------------------------- 5. build, test, start
 say "5/5 Building the ceoscan image (2-5 minutes the first time)"
@@ -322,7 +367,7 @@ if [ "$NO_START" -eq 0 ]; then
     $SUDO docker compose up -d
     health=""
     for _ in $(seq 1 30); do
-        health="$(curl -s -m 3 http://127.0.0.1:8080/health 2>/dev/null || true)"
+        health="$(curl -s -m 3 "http://127.0.0.1:${HEALTH_PORT}/health" 2>/dev/null || true)"
         [ -n "$health" ] && break
         sleep 2
     done
@@ -341,10 +386,10 @@ cat <<EOF
 
     Useful commands (run them in $APP):
       sudo docker compose logs -f --tail 50      # live log (Ctrl-C to leave)
-      curl -s 127.0.0.1:8080/health              # status
+      curl -s 127.0.0.1:$HEALTH_PORT/health              # status
       sudo docker compose restart ceoscan        # restart after editing .env or config/
       sudo docker compose down                   # stop
-      bash deploy/install-server.sh --dir $INSTALL_DIR   # update to the newest version later
+      bash deploy/install-server.sh --dir "$INSTALL_DIR"   # update to the newest version later
 
     ceoscan restarts by itself after a crash or a server reboot. It only makes outgoing
     connections, so no AWS firewall (security group) port has to be opened.
