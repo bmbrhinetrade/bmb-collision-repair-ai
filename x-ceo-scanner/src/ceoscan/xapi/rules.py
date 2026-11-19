@@ -96,6 +96,23 @@ def _normalize_ops(ops: str) -> str:
     return " ".join((ops or "").split())
 
 
+def render_term(term: str) -> str:
+    """One keyword-rule term in X rule syntax.
+
+    ``$apmd`` -> ``$APMD`` (cashtag); a single word made of letters/digits/underscores is written
+    bare (X matches it case-insensitively as a whole word); anything else (spaces, hyphens, dots)
+    becomes an exact phrase in double quotes. Terms are validated in config.py (no quotes, parens).
+    """
+    t = " ".join((term or "").split())
+    if not t:
+        return ""
+    if t.startswith("$"):
+        return "$" + t[1:].upper()
+    if t.replace("_", "").isalnum():
+        return t
+    return f'"{t}"'
+
+
 def build_rules(watchlist: Watchlist, settings: RulesSettings) -> RuleBuildResult:
     """Build every filtered-stream rule for ``watchlist``.
 
@@ -149,11 +166,16 @@ def build_rules(watchlist: Watchlist, settings: RulesSettings) -> RuleBuildResul
         for n, chunk in enumerate(chunks, start=1):
             emit(render_accounts(chunk), f"{prefix}:acct:r{int(replies)}t{int(retweets)}:{n}")
 
-    # ---- keyword rules: cashtags from large accounts
+    # ---- keyword rules: cashtags (and optional words/phrases) from large accounts
     for kw in watchlist.keyword_rules:
         tickers = list(dict.fromkeys(t.strip().upper().lstrip("$") for t in kw.tickers if t and t.strip()))
-        if not tickers:
-            warnings.append(f"keyword rule {kw.name!r} has no tickers; skipped")
+        items = [f"${t}" for t in tickers]
+        for term in getattr(kw, "terms", ()):
+            rendered = render_term(term)
+            if rendered and rendered not in items:
+                items.append(rendered)
+        if not items:
+            warnings.append(f"keyword rule {kw.name!r} has no tickers or terms; skipped")
             continue
         if kw.min_followers < LOW_MIN_FOLLOWERS_WARNING:
             warnings.append(
@@ -163,9 +185,9 @@ def build_rules(watchlist: Watchlist, settings: RulesSettings) -> RuleBuildResul
         tail = _with_tail(f"min_followers:{int(kw.min_followers)}", _normalize_ops(kw.extra_operators))
 
         def render_keywords(chunk: Sequence[str], _tail: str = tail) -> str:
-            return _with_tail(_or_group([f"${t}" for t in chunk]), _tail)
+            return _with_tail(_or_group(chunk), _tail)
 
-        chunks = _pack(tickers, render_keywords, max_len, f"keyword rule {kw.name!r}")
+        chunks = _pack(items, render_keywords, max_len, f"keyword rule {kw.name!r}")
         for n, chunk in enumerate(chunks, start=1):
             emit(render_keywords(chunk), f"{prefix}:kw:{kw.name}:{n}")
 

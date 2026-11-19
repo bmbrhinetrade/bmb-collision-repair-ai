@@ -529,3 +529,14 @@ async def test_sync_rules_propagates_http_errors() -> None:
             m.get(RULES_URL, status=401, payload={"title": "Unauthorized", "detail": "Unauthorized", "status": 401})
             with pytest.raises(NotAuthorized):
                 await sync_rules(client, DESIRED, RulesSettings())
+
+
+def test_render_term_cashtags_words_and_phrases():
+    from ceoscan.xapi.rules import render_term
+
+    assert render_term("$apmd") == "$APMD"
+    assert render_term("Apnimed") == "Apnimed"
+    assert render_term("AD109") == "AD109"
+    assert render_term("AD-109") == '"AD-109"'
+    assert render_term("  sleep   apnea pill ") == '"sleep apnea pill"'
+    assert render_term("") == ""
