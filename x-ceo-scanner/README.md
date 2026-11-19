@@ -480,6 +480,26 @@ python -m ceoscan rules                   # show the filtered-stream rules built
 
 ### 8. Deploy to a Linux server
 
+#### Quickest: the one-command installer (Amazon EC2 / Lightsail, Ubuntu, Debian)
+
+`deploy/install-server.sh` does all of Option A for you on Amazon Linux 2023/2, Ubuntu or Debian:
+it installs git, Docker and the Compose plugin, adds 1 GB of swap on small servers (under 1.8 GB of
+RAM), downloads ceoscan into `~/ceoscan`, asks for your three secrets (X bearer token, Anthropic
+key, Gmail App Password - typed hidden, saved only in `x-ceo-scanner/.env` with permissions 600),
+builds the image, sends a test push and a test Claude Duet email, and starts the service. Open a
+terminal on the server (in the AWS console: EC2 > Instances > your instance > **Connect** > EC2
+Instance Connect, or Lightsail > your instance > **Connect using SSH**) and paste:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bmbrhinetrade/bmb-collision-repair-ai/claude/x-ceo-post-scanner-61tt30/x-ceo-scanner/deploy/install-server.sh -o install-ceoscan.sh
+bash install-ceoscan.sh --email you@yourdomain.com
+```
+
+It is safe to run again: it updates the code and keeps your `.env` (and refuses to overwrite files
+you changed on the server). No AWS security-group port needs opening: ceoscan only makes outgoing
+connections, and its health page listens on the server's 127.0.0.1 only. Email goes out on port 587,
+which AWS does not block (only port 25 is restricted). Options: `--help`.
+
 #### Option A: Docker Compose (recommended)
 
 ```bash
