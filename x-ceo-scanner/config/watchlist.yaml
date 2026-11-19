@@ -296,6 +296,212 @@ accounts:
     tickers: [AMZN, "@ai_capex"]
     est_posts_per_day: 0.5
 
+  # --- 20 quality companies (added 2026-11-19) ---------------------------------------------------
+  # Picked by a financial screen on the latest reported quarter (GAAP profit, positive free cash flow,
+  # revenue growth >= 8% or mega-cap margins, net cash or modest debt, no recent guidance cut or
+  # serious red flag) AND an active, verified official/CEO X account. Numbers re-checked against
+  # current results by independent reviewers. This is a watchlist for alerts, not buy advice.
+  # Cisco - Q1 FY27: revenue +24%, GAAP net income +59%, $15.8B cash
+  - handle: ChuckRobbins
+    user_id: "16810559"
+    kind: person
+    expect_name: Chuck Robbins
+    tickers: [CSCO]
+    est_posts_per_day: 0.4
+  - handle: Cisco
+    user_id: "15749983"
+    kind: company
+    expect_name: Cisco
+    tickers: [CSCO]
+    include_replies: false
+    est_posts_per_day: 3
+  # ASML - Q3: record EUR 11.7B sales, 57.5% gross margin, net cash; EUV monopoly
+  - handle: ASMLcompany
+    user_id: "80513844"
+    kind: company
+    expect_name: ASML
+    tickers: [ASML]
+    include_replies: false
+    est_posts_per_day: 0.5
+  # Texas Instruments - Q3: revenue +28%, net income +78%, TTM FCF $8.4B
+  - handle: TXInstruments
+    user_id: "13613292"
+    kind: company
+    expect_name: Texas Instruments
+    tickers: [TXN]
+    include_replies: false
+    est_posts_per_day: 1
+  # Dell - Q2 FY27: revenue +58%, GAAP net income +255%, $95B AI backlog
+  - handle: MichaelDell
+    user_id: "58560480"
+    kind: person
+    expect_name: Michael Dell
+    tickers: [DELL]
+    est_posts_per_day: 1
+  - handle: Dell
+    user_id: "58561993"
+    kind: company
+    expect_name: Dell Technologies
+    tickers: [DELL]
+    include_replies: false
+    est_posts_per_day: 3
+  # Seagate - Q1 FY27: revenue +61%, GAAP EPS $7.59, $1.48B FCF, debt being repaid
+  - handle: Seagate
+    user_id: "14762127"
+    kind: company
+    expect_name: Seagate
+    tickers: [STX]
+    include_replies: false
+    est_posts_per_day: 2
+  # GE Vernova - Q3: orders +96% organic, $197B backlog, $5.4B quarterly FCF
+  - handle: GEVernova
+    user_id: "267399199"
+    kind: company
+    expect_name: GE Vernova
+    tickers: [GEV]
+    include_replies: false
+    est_posts_per_day: 0.3
+  # Palantir - Q3: revenue +96%, 49% net margin, $10.4B cash, no debt (valuation very high)
+  - handle: PalantirTech
+    user_id: "37959591"
+    kind: company
+    expect_name: Palantir
+    tickers: [PLTR]
+    include_replies: false
+    est_posts_per_day: 3
+  # AppLovin - Q3: revenue +55%, 66% net margin, ~$1.4B quarterly FCF
+  - handle: AppLovin
+    user_id: "334906910"
+    kind: company
+    expect_name: AppLovin
+    tickers: [APP]
+    include_replies: false
+    est_posts_per_day: 2
+  # ServiceNow - Q3: subscription revenue +21%, FY guidance raised (GAAP margin down after Armis deal)
+  - handle: BillRMcDermott
+    user_id: "1703007992"
+    kind: person
+    expect_name: Bill McDermott
+    tickers: [NOW]
+    include_replies: false
+    est_posts_per_day: 0.2
+  - handle: ServiceNow
+    user_id: "15766070"
+    kind: company
+    expect_name: ServiceNow
+    tickers: [NOW]
+    include_replies: false
+    est_posts_per_day: 4
+  # Shopify - Q3: revenue +32%, operating income +66%, 22% FCF margin, net cash
+  - handle: tobi
+    user_id: "676573"
+    kind: person
+    expect_name: Tobi Lutke
+    tickers: [SHOP]
+    include_replies: false
+    est_posts_per_day: 8
+  - handle: Shopify
+    user_id: "17136315"
+    kind: company
+    expect_name: Shopify
+    tickers: [SHOP]
+    include_replies: false
+    est_posts_per_day: 5
+  # Uber - Q3: gross bookings +20%, non-GAAP net income +29%, ~$10B TTM FCF
+  - handle: dkhos
+    user_id: "41642329"
+    kind: person
+    expect_name: Dara Khosrowshahi
+    tickers: [UBER]
+    include_replies: false
+    est_posts_per_day: 0.5
+  - handle: Uber
+    user_id: "19103481"
+    kind: company
+    expect_name: Uber
+    tickers: [UBER]
+    include_replies: false
+    est_posts_per_day: 5
+  # Airbnb - Q3: revenue +19%, ~39% net margin, 29% FCF margin, net cash
+  - handle: bchesky
+    user_id: "12901712"
+    kind: person
+    expect_name: Brian Chesky
+    tickers: [ABNB]
+    include_replies: false
+    est_posts_per_day: 1
+  - handle: Airbnb
+    user_id: "17416571"
+    kind: company
+    expect_name: Airbnb
+    tickers: [ABNB]
+    include_replies: false
+    est_posts_per_day: 2
+  # Eli Lilly - Q3: revenue +39% (Mounjaro +65%, Zepbound +49%), FY guidance raised 3 times
+  - handle: EliLillyandCo
+    user_id: "172496840"
+    kind: company
+    expect_name: Eli Lilly and Company
+    tickers: [LLY]
+    include_replies: false
+    est_posts_per_day: 2
+  # AstraZeneca - 9M: revenue +8%, core EPS +14%, guidance reconfirmed
+  - handle: AstraZeneca
+    user_id: "62465691"
+    kind: company
+    expect_name: AstraZeneca
+    tickers: [AZN]
+    include_replies: false
+    est_posts_per_day: 1.5
+  # AbbVie - Q3: revenue +10.3% (Skyrizi/Rinvoq +23%), guidance raised; note ~$18B new debt in 2026
+  - handle: abbvie
+    user_id: "531892451"
+    kind: company
+    expect_name: AbbVie
+    tickers: [ABBV]
+    include_replies: false
+    est_posts_per_day: 1.5
+  # Amgen - Q3: revenue +8%, GAAP EPS +19%, guidance raised
+  - handle: Amgen
+    user_id: "28436760"
+    kind: company
+    expect_name: Amgen
+    tickers: [AMGN]
+    include_replies: false
+    est_posts_per_day: 1.5
+  # Monster Beverage - Q3: sales +16.7%, 22% net margin, historically net cash (account is marketing)
+  - handle: MonsterEnergy
+    user_id: "63253045"
+    kind: company
+    expect_name: Monster Energy
+    tickers: [MNST]
+    include_replies: false
+    est_posts_per_day: 3
+  # Visa - FY26: net revenue +15%, non-GAAP EPS +16%, dividend +16% (DOJ debit case pending)
+  - handle: Visa
+    user_id: "551373363"
+    kind: company
+    expect_name: Visa
+    tickers: [V]
+    include_replies: false
+    est_posts_per_day: 1
+  # Interactive Brokers - Q3: net revenue +15%, 78% pretax margin, accounts +35%
+  - handle: IBKR
+    user_id: "264153788"
+    kind: company
+    expect_name: Interactive Brokers
+    tickers: [IBKR]
+    include_replies: false
+    est_posts_per_day: 3
+  # CME Group - Q3: revenue +13%, ~69% adjusted operating margin, record volumes
+  - handle: CMEGroup
+    user_id: "15935591"
+    kind: company
+    expect_name: CME Group
+    tickers: [CME]
+    include_replies: false
+    est_posts_per_day: 4
+
 # Handle-less keyword rules: posts from accounts with at least min_followers that mention any
 # of the tickers (as $CASHTAGS) or terms (words, or "exact phrases" when they contain spaces).
 keyword_rules:
@@ -303,7 +509,7 @@ keyword_rules:
     tickers: all                     # "all" = every ticker above; or a list like [TSLA, NVDA]
     min_followers: 1000000
     extra_operators: "-is:retweet -is:reply lang:en"
-    est_posts_per_day: 60
+    est_posts_per_day: 100              # raised from 60 when 20 more (popular) tickers were added
   # Small-cap biotech: news comes from biotech/FDA trackers and trade press with 1K-100K followers
   # (fda_tracker, FierceBiotech, Endpoints, HME News, Boston Business Journal...). Every term is unique
   # to Apnimed; generic words (OSA, sleep apnea, atomoxetine) are left out on purpose. Expect spikes
@@ -351,3 +557,23 @@ company_names:
   TLN: ["Talen Energy", Talen]
   TWLO: [Twilio]
   APMD: [Apnimed, AD109, Oxnimbi, aroxybutynin, LunAIRo, SynAIRgy]
+  CSCO: [Cisco, Splunk, Webex, Meraki, "Silicon One", "Chuck Robbins"]
+  ASML: [ASML, "High-NA", EUV, Twinscan, "Christophe Fouquet"]
+  TXN: ["Texas Instruments", Sitara, MSPM0, "Sherman fab", "Haviv Ilan"]
+  DELL: ["Dell Technologies", PowerEdge, "Dell AI Factory", Alienware, "Michael Dell"]
+  STX: [Seagate, Mozaic, HAMR, Exos, IronWolf, "Dave Mosley"]
+  GEV: ["GE Vernova", Vernova, "7HA", LM6000, "Trench Group", "BWRX-300", "Scott Strazik"]
+  PLTR: [Palantir, "Palantir AIP", "Palantir Foundry", "Palantir Gotham", "Maven Smart System", "Alex Karp"]
+  APP: [AppLovin, "Axon Ads", "Axon Ads Manager", "AppLovin Axon", "Adam Foroughi"]
+  NOW: [ServiceNow, "Now Assist", "Now Platform", "AI Control Tower", Armis, "Bill McDermott"]
+  SHOP: [Shopify, "Shop Pay", "Shopify Plus", "Shopify Payments", "Tobi Lutke"]
+  UBER: ["=Uber", "Uber Eats", "Uber Freight", "Uber One", "Dara Khosrowshahi"]
+  ABNB: [Airbnb, "Airbnb Experiences", "Airbnb Services", "Brian Chesky"]
+  LLY: ["Eli Lilly", Mounjaro, Zepbound, orforglipron, retatrutide, Kisunla]
+  AZN: [AstraZeneca, Enhertu, Tagrisso, Imfinzi, Farxiga, baxdrostat]
+  ABBV: [AbbVie, Skyrizi, Rinvoq, Humira, Vraylar, Botox]
+  AMGN: [Amgen, Repatha, MariTide, Tezspire, Evenity, Imdelltra]
+  MNST: ["Monster Beverage", "Monster Energy", "Bang Energy", "Reign Total Body Fuel"]
+  V: ["=Visa", VisaNet, "Visa Direct", Cybersource, "Visa Inc"]
+  IBKR: ["Interactive Brokers", IBKR, ForecastEx, ForecastTrader, "IBKR Pro"]
+  CME: ["CME Group", "Chicago Mercantile Exchange", CBOT, NYMEX, "Terry Duffy"]
