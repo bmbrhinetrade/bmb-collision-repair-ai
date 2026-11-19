@@ -32,10 +32,22 @@ when a post could move one of your tickers.
 - **Dedupes** every post (in memory and in SQLite) and stores it, its score and every alert in
   `data/ceoscan.db`.
 - **Fast rules** (microseconds) flag posts that mention a ticker or company name, or contain
-  earnings/guidance, M&A, executive changes (CEO steps down, new CFO), partnerships, layoffs,
-  product launches, regulatory news, corporate status (bankruptcy, delisting, bank charter),
-  incidents (outage, hack, recall, halted production), buybacks, dividends and stock splits,
-  offerings, bitcoin purchases or sales, or concrete numbers.
+  earnings/guidance, M&A, executive changes (CEO steps down, new CFO), partnerships and licensing
+  deals (a license agreement with a partner, "$150M upfront", "up to $400M in milestones"),
+  layoffs, product launches (including a prescription-drug launch), regulatory news,
+  clinical-trial readouts (primary endpoint met or missed, positive / negative topline results,
+  clinical hold, trial halted), FDA / EMA actions (approval, complete response letter, PDUFA date
+  set or extended, advisory-committee vote, newly granted Breakthrough Therapy / Fast Track
+  designation, priority review, label expansion, boxed warning added), corporate status
+  (bankruptcy, delisting, bank charter), incidents (outage, hack, recall, halted production),
+  buybacks, dividends and stock splits, offerings (including priced underwritten offerings and
+  lock-up expiries), bitcoin purchases or sales, or concrete numbers.
+  A clinical readout or FDA action is a binary catalyst: one such event in a news post naming one
+  of your companies, or in a watched company account's own post, reaches the alert threshold (7)
+  even rules-only. Person accounts stay at 6 (an FDA-cleared watch feature, Neuralink news), and
+  these only flag, as hints for Claude: label and safety text ("X is approved for adults with
+  ...", "has a Boxed Warning"), reminders ("PDUFA is Feb 28"), questions ("if the FDA issues a
+  CRL?"), plans ("expects topline data in Q2") and recaps ("met its primary endpoint last year").
 - **Claude** scores every post from a watched account (fast-rule hits are passed to it as hints)
   and every keyword-rule post the fast rules flag. It returns the affected tickers, the direction
   (bullish/bearish/unclear), an impact score from 1 to 10, a one-line reason, and whether the post

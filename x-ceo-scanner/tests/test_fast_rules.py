@@ -119,6 +119,8 @@ def test_categories_cover_contract_names() -> None:
         "layoffs",
         "product",
         "regulatory",
+        "clinical",
+        "fda_action",
         "corporate_status",
         "incident",
         "buyback",

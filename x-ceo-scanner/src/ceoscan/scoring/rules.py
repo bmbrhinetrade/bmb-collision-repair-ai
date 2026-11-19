@@ -13,6 +13,20 @@ Two jobs, kept apart on purpose:
   matched ("raised guidance", "convertible notes", "Q3 results"), not a broad word on its own
   ("outlook", "release notes", "amazing results").
 
+Biotech binary catalysts get their own strong categories: ``clinical`` (trial readouts: "met its
+primary endpoint", "positive topline results from the Phase 3 trial", clinical holds, halted
+trials) and ``fda_action`` (FDA / EMA events: approvals, complete response letters, a PDUFA date
+set or extended, advisory-committee votes, newly granted Breakthrough Therapy / Fast Track
+designations, label expansions). Their precise patterns are event-shaped: a label statement ("X
+is approved for adults with ..."), safety boilerplate ("has a Boxed Warning"), a reminder ("PDUFA
+is Feb 28") or generic English ("I stopped dosing", "free trial enrollment is paused") only flags.
+A precise match that is hedged - a question, a condition, a plan or a recap ("if the FDA issues a
+CRL?", "expects topline results ...", "met its primary endpoint back in 2025") - only flags too.
+A precise match adds a +1 "binary catalyst" bonus (once) for a news post or a company account,
+and the FDA token of the same event does not count again as regulatory news, so a post naming a
+watched company with one such match reaches the alert threshold (7) in rules-only mode, while a
+person account posting an FDA headline (a device clearance, Neuralink) stays at 6.
+
 The rules look at the post text plus the text of any quoted / replied-to / reposted post,
 because "Yes" in reply to "Will Tesla raise guidance?" is market relevant. The post's OWN text
 is also evaluated separately (``own_*`` fields) so the rules-only score is driven by what the
@@ -46,6 +60,8 @@ CAT_PARTNERSHIP = "partnership"
 CAT_LAYOFFS = "layoffs"
 CAT_PRODUCT = "product"
 CAT_REGULATORY = "regulatory"
+CAT_CLINICAL = "clinical"  # trial readouts: endpoints met / missed, topline data, clinical holds, halted trials
+CAT_FDA_ACTION = "fda_action"  # FDA / EMA drug decisions: approvals, CRLs, PDUFA dates, designations, AdComs
 CAT_CORPORATE_STATUS = "corporate_status"  # bankruptcy, delisting, bank charter, licenses
 CAT_INCIDENT = "incident"  # outage, hack, breach, recall, halted / paused production
 CAT_BUYBACK = "buyback"
@@ -65,6 +81,8 @@ CATEGORY_ORDER: tuple[str, ...] = (
     CAT_LAYOFFS,
     CAT_PRODUCT,
     CAT_REGULATORY,
+    CAT_CLINICAL,
+    CAT_FDA_ACTION,
     CAT_CORPORATE_STATUS,
     CAT_INCIDENT,
     CAT_BUYBACK,
@@ -84,6 +102,8 @@ STRONG_CATEGORIES: frozenset[str] = frozenset(
         CAT_EXEC_CHANGE,
         CAT_LAYOFFS,
         CAT_REGULATORY,
+        CAT_CLINICAL,
+        CAT_FDA_ACTION,
         CAT_CORPORATE_STATUS,
         CAT_INCIDENT,
         CAT_BUYBACK,
@@ -92,8 +112,17 @@ STRONG_CATEGORIES: frozenset[str] = frozenset(
         CAT_BITCOIN,
     }
 )
-# Categories that are often marketing / brand noise: worth a look, weaker signal (+1).
+# Categories that are often marketing / brand noise: worth a look, weaker signal (+1). A precise
+# match (a deal-size amount: "$150M upfront"; a prescription-drug launch) counts +2, but never
+# makes a watched account's post count as news about its own company (see `account_hit`).
 WEAK_CATEGORIES: frozenset[str] = frozenset({CAT_PARTNERSHIP, CAT_PRODUCT})
+#: A precise (unhedged) match in one of these is a binary biotech catalyst (trial readout, FDA
+#: decision): it adds BINARY_CATALYST_BONUS once on top of its +2 for a news post or a company
+#: account, so "<watched company> met its primary endpoint" scores 3 (company) + 2 + 1 (mine) + 1
+#: = 7, the alert threshold, in rules-only mode. A person account gets no bonus: its FDA headlines
+#: are mostly about devices or side projects ("Apple Watch is now FDA cleared", Neuralink).
+BINARY_CATALYST_CATEGORIES: frozenset[str] = frozenset({CAT_CLINICAL, CAT_FDA_ACTION})
+BINARY_CATALYST_BONUS = 1
 
 #: Only this much text is scanned: the post itself, and each quoted / parent / reposted post.
 #: (X posts can be 25,000 characters; Claude still sees the full text.)
@@ -123,6 +152,20 @@ def _words(*alternatives: str) -> str:
     return _LB + "(?:" + "|".join(alternatives) + ")" + _RB
 
 
+def _lead_words(first: str, *alternatives: str) -> str:
+    """`_words` for long alternation lists whose every alternative starts with a character in ``first``.
+
+    Same matches; the leading lookahead only makes every other position (spaces, digits,
+    punctuation) fail at once instead of trying each alternative there.
+    """
+    return r"(?=" + first + r")" + _words(*alternatives)
+
+
+def _alpha_words(*alternatives: str) -> str:
+    """`_lead_words` for alternation lists whose every alternative starts with a letter."""
+    return _lead_words(r"[A-Za-z]", *alternatives)
+
+
 # --------------------------------------------------------------------------- keyword categories
 
 # For each category: (broad case-insensitive, broad case-sensitive, precise case-insensitive,
@@ -139,6 +182,79 @@ _PRIVATE_NOT_NOUN = (
     r"time|event|events|tour|tours|chat|chats|dinner|meeting|meetings)\b)"
 )
 _LICENSE = r"licen[cs]es?"
+# A licence in the corporate-status sense (bank / exchange / operating licence), not a drug or
+# technology licensing deal ("an exclusive license", "license agreement"): those are partnerships.
+# ("an exclusive license to operate in Singapore" is still an operating licence.)
+_STATUS_LICENSE = (
+    r"(?:(?<!exclusive\s)(?<!global\s)(?<!worldwide\s)|(?=licen[cs]es?\s+to\s+operate))" + _LICENSE
+    + r"(?!\s+(?:agreements?|deals?|pacts?)\b)"
+)
+# "$150M", "$1.2 billion" inside a longer phrase (the match can only start at the "$")
+_DEAL_AMOUNT = r"\$\s?\d[\d,.]*\s?(?:[MB]|mn|bn|million|billion)"
+
+# --- biotech building blocks (all bounded; no quantifier nests over overlapping classes)
+# "Phase 3", "phase III", "Ph. 2b", "Phase 1/2a", "Phase IIb/III"
+_PHASE = r"(?:phase|ph\.?)\s?(?:[1-4][ab]?(?:/[1-4][ab]?)?|(?:IV|I{1,3})[ab]?(?:/(?:IV|I{1,3})[ab]?)?)"
+# "primary endpoint", "co-primary endpoints", "primary and key secondary endpoints"
+_ENDPOINT = (
+    r"(?:(?:co-?)?primary|key\s+secondary|secondary)\s+(?:and\s+(?:key\s+)?secondary\s+)?(?:efficacy\s+)?end-?points?"
+)
+# ("robust" is left out: "robust topline results" is an earnings call - topline means revenue in finance)
+_OUTCOME = r"(?:positive|negative|mixed|disappointing|encouraging|favou?rable)"
+_OUTCOME_TOPLINE = r"(?:positive|negative|disappointing|encouraging|favou?rable)"  # not "mixed topline results"
+_TRIAL_STOPPED = r"(?:halted|paused|suspended|stopped|discontinued|terminated)"
+# a trial or study, but not a "free trial" (FSD, Starlink and app trials)
+_TRIAL = r"(?<!free\s)(?<!free-)(?:trials?|stud(?:y|ies))"
+# Words that make a generic phrase clinical. They are only looked for AHEAD of a match, inside the same sentence
+# and at most 80 characters away: "positive Phase 2 results for AD109 in patients with OSA" counts, "Encouraging
+# Phase 2 results from the Optimus factory deployment" and "Positive trial results for Robotaxi" do not.
+_CLINICAL_WORD = (
+    r"(?:patients?|participants|subjects|placebo|end-?points?|efficacy|tolerab(?:le|ility)|adverse|drugs?"
+    r"|therap(?:y|ies|eutic)|treatments?|doses?|dosing|cohorts?|diseases?|clinical|randomi[sz]ed|double-blind"
+    r"|statistical(?:ly)?)"
+)
+_CLINICAL_AHEAD = r"(?=[^.!?\n]{0,80}?" + _LB + _CLINICAL_WORD + _RB + r")"
+# Regulators are matched case-sensitively ("the 50 ema rejected price again" is a moving average), and EMA never
+# right after a number or a period word ("the 200-day EMA rejected bitcoin").
+_EMA = r"(?<![0-9]\s)(?<!day\s)(?<!period\s)(?<!week\s)EMA"
+_REGULATOR_CS = r"(?:FDA|" + _EMA + r"|MHRA|PMDA|NMPA|Health\s+Canada)"
+_DRUG_APP = r"(?:new\s+drug\s+application|biologics\s+license\s+application|marketing\s+authori[sz]ation\s+application)"
+# Acronyms stay case-sensitive, and "NDA" is also a non-disclosure agreement in upper case ("NDA was approved by
+# legal", "they accepted our NDA"): an NDA only counts with drug context (see the fda_action patterns).
+_DRUG_APP_CS = r"(?:NDA|BLA|sNDA|sBLA|MAA)"
+_DRUG_APP_CS_NO_NDA = r"(?:BLA|sNDA|sBLA|MAA)"
+# a verb, not a noun: "Apnimed's NDA accepted" is news, "Apnimed's NDA submission came in January" a recap
+_APP_EVENT = r"(?:accepted|approved|submitted|filed|resubmitted|under\s+review)"
+# Permission to START a trial is not a drug decision: "FDA approved Neuralink's Blindsight for its first human
+# implant", "receives FDA approval for its first human clinical trial", "FDA approves human trials".
+_TRIAL_PERMISSION = (
+    r"(?:(?:\s+[\w'’-]+){0,4}?\s+(?:for|to\s+(?:begin|start|launch|initiate|run|conduct))\s+"
+    r"(?:(?:its|a|an|the|our|their)\s+)?(?:(?:first[-\s]in[-\s]human|first\s+human|human|first)\s+)?"
+    r"(?:clinical\s+)?(?:trials?|stud(?:y|ies)|implants?|testing)"
+    r"|(?:\s+[\w'’-]+)?\s+(?:first[-\s]in[-\s]human|human|clinical)\s+(?:trials?|stud(?:y|ies)|testing))"
+)
+# "the FDA approved label", "FDA approved treatment for migraine": an adjective, not a decision
+_NOT_ADJECTIVE = (
+    r"(?!\s+(?:labels?|labell?ing|doses?|dosing|indications?|drugs?|treatments?|medicines?|medications?"
+    r"|therap(?:y|ies)|products?|devices?|uses?|versions?|formulations?|generics?|options?|biosimilars?"
+    r"|vaccines?|pills?)(?![A-Za-z0-9_]))"
+)
+# Expedited-program names that exist only for drugs. ("Fast Track" is handled apart: "fast-track designation
+# by the state" is a permit; "Breakthrough Device" is a device pathway and stays regulatory news.)
+_DESIG = (
+    r"(?:breakthrough\s+therapy|orphan[-\s]drug|rare\s+pediatric\s+disease|RMAT"
+    r"|regenerative\s+medicine\s+advanced\s+therapy)"
+)
+# A fresh grant, not the "AD109 has received Fast Track designation from the FDA" boilerplate that closes every
+# press release ("has received", "has been granted").
+_GRANT_VERB = (
+    r"(?<!\bhas\s)(?<!\bhave\s)(?<!\bhad\s)(?<!\bbeen\s)(?:grant(?:s|ed|ing)?|receiv(?:e|es|ed|ing)"
+    r"|award(?:s|ed|ing)?|earn(?:s|ed)?|wins?|won|secur(?:e|es|ed)|obtain(?:s|ed)|gets?|got)"
+)
+_VOTE_VERB = (
+    r"(?:votes?|voted|voting|recommends?|recommended|backs|backed|endorses|endorsed|rejects|rejected|supports"
+    r"|supported|split)"
+)
 
 _KEYWORDS: dict[str, _KwSpec] = {
     CAT_EARNINGS: (
@@ -223,9 +339,31 @@ _KEYWORDS: dict[str, _KwSpec] = {
             r"collaborat(?:e|es|ed|ing|ion|ions)",
             r"deals?",
             r"joint\s+venture",
+            # licensing (biopharma / tech): +1 like any partnership word. A licence agreement needs a counterparty
+            # ("license agreement with Shionogi"): "our new Enterprise License Agreement saves customers 30%" or
+            # "Llama ships under a new license agreement" is product licensing, not a deal.
+            r"(?<!user\s)(?<!user-)(?<!software\s)licen[cs](?:e|ing)\s+(?:agreements?|deals?|pacts?)\s+(?:with|between)",
+            r"(?:exclusive|global|worldwide)\s+(?:licen[cs]e(?!\s+to\s+operate)"
+            r"|(?:development\s+and\s+)?commerciali[sz]ation\s+rights)",
+            r"ex-U\.?S\.?\s+(?:rights|licen[cs]e)",
+            r"commerciali[sz]ation\s+(?:rights|agreements?)",
+            r"(?:tiered|double[-\s]digit|single[-\s]digit)\s+royalt(?:y|ies)",
+            r"royalt(?:y|ies)\s+on\s+(?:net\s+)?sales",
+            r"co-?promot(?:e|ion)\s+agreements?",
+            r"option\s+to\s+(?:in-?)?licen[cs]e",
         ),
         None,
-        None,
+        # deal economics with a deal-size amount ("$150M upfront", "up to $400 million in milestones"): a precise
+        # match counts +2 instead of +1. Consumer prices stay out ("an upfront payment of $299 for the kit",
+        # "milestone payments to our suppliers: $1 billion paid early").
+        _lead_words(
+            r"[A-Za-z$]",
+            _DEAL_AMOUNT + r"\s+(?:in\s+)?up[-\s]?front",
+            r"up[-\s]?front\s+(?:cash\s+)?(?:payments?|fees?|considerations?)\s+of\s+"
+            r"(?:US\s?|USD\s?|approximately\s+|about\s+)?" + _DEAL_AMOUNT,
+            r"milestone\s+payments?\s+of\s+(?:up\s+to\s+)?(?:US\s?|USD\s?|approximately\s+|about\s+)?" + _DEAL_AMOUNT,
+            r"(?:up\s+to\s+)?" + _DEAL_AMOUNT + r"\s+in\s+(?:[\w-]+\s+){0,4}?milestones?",
+        ),
         None,
     ),
     CAT_LAYOFFS: (
@@ -259,7 +397,12 @@ _KEYWORDS: dict[str, _KwSpec] = {
             r"roll(?:s|ed)?\s+out",
         ),
         None,
-        None,
+        # a prescription-drug launch: a precise match counts +2 instead of +1. A plain "commercial launch" is also
+        # a rocket launch ("SpaceX's 140th commercial launch") or a chip GA, and stays a broad "launch" (+1).
+        _alpha_words(
+            r"(?:now\s+)?(?:commercially\s+)?available\s+(?:by|with\s+a|via)\s+prescription",
+            r"(?:U\.?S\.?|EU|European|Japanese)\s+commercial\s+launch\s+of",
+        ),
         None,
     ),
     CAT_REGULATORY: (
@@ -286,8 +429,231 @@ _KEYWORDS: dict[str, _KwSpec] = {
         ),
         _words(r"FDA", r"SEC", r"FTC", r"DOJ", r"CFTC", r"NHTSA", r"FCC", r"FAA", r"EU\s+Commission"),
     ),
+    CAT_CLINICAL: (
+        # broad: a trial is mentioned, no outcome ("enrolling a Phase 3 trial", "topline data expected in Q2")
+        _alpha_words(
+            r"clinical\s+trials?",
+            _PHASE + r"\s+(?:clinical\s+)?(?:trials?|stud(?:y|ies)|programs?|data|results?|read-?outs?)",
+            r"(?:pivotal|registrational)\s+(?:trials?|stud(?:y|ies))",
+            _ENDPOINT,
+            r"top-?line\s+(?:results?|data)",
+            r"interim\s+analys[ie]s",
+            r"first\s+patients?\s+dosed",
+        ),
+        None,
+        # precise: an outcome or a stop, with clinical context inside the match. Generic English stays out: "I
+        # stopped dosing ketamine", "FSD free trial enrollment is paused", "Positive trial results for Robotaxi",
+        # "Robust Phase 1 results at Stargate", "topline data from the gpt-6 eval", "BFCM topline data: $14.6B".
+        _alpha_words(
+            # "met its primary endpoint", "failed to meet the primary endpoint", "missed both co-primary endpoints"
+            r"(?:met|meets|meeting|achieved|achieves|achieving|hit|hits|missed|miss(?:es|ing)?"
+            r"|fail(?:s|ed|ing)?\s+to\s+(?:meet|achieve|reach|hit)|did(?:\s+not|n['’]t)\s+(?:meet|achieve|reach|hit)"
+            r"|does(?:\s+not|n['’]t)\s+meet)\s+(?:(?:its|the|both|all|our|their|two|key|study['’]s|trial['’]s)\s+){0,2}"
+            + _ENDPOINT,
+            _ENDPOINT + r"\s+(?:was|were|has\s+been|have\s+been|is|are)\s+(?:not\s+)?(?:met|achieved|missed)",
+            # "statistically significant reduction in AHI on the primary endpoint"
+            r"(?:statistically|clinically)\s+significant\s+(?:[\w-]+\s+){0,5}?(?:on|in|for|across|at)\s+"
+            r"(?:(?:the|its|both|all|key|each)\s+){0,2}" + _ENDPOINT,
+            # "positive topline results", "positive top-line Phase 3 data" (not a bare "topline data": revenue in
+            # finance, or "topline data expected in 2026")
+            _OUTCOME_TOPLINE + r"\s+top-?line\s+(?:" + _PHASE + r"\s+)?(?:results?|data|read-?outs?)",
+            # "positive Phase 3 trial results"; "positive Phase 3 results" only with a clinical word later in the
+            # same sentence
+            _OUTCOME + r"\s+(?:(?:interim|final|pivotal)\s+)?" + _PHASE + r"\s+(?:clinical\s+)?" + _TRIAL
+            + r"\s+(?:results?|data|read-?outs?)",
+            _OUTCOME + r"\s+(?:(?:interim|final|pivotal)\s+)?" + _PHASE + r"\s+(?:results?|data|read-?outs?)"
+            + _CLINICAL_AHEAD,
+            _OUTCOME + r"\s+(?:(?:interim|final)\s+)?clinical\s+(?:results?|data|read-?outs?)",
+            # ("Encouraging pivotal data from NVIDIA's Rubin bring-up" stays out)
+            _OUTCOME + r"\s+(?:(?:interim|final)\s+)?(?:pivotal|trial)\s+(?:results?|data|read-?outs?)"
+            + _CLINICAL_AHEAD,
+            # "topline results from SynAIRgy Phase 3 Trial", "topline data from its pivotal study"
+            r"top-?line\s+(?:results?|data|read-?outs?)\s+(?:from|of|in)\s+"
+            r"(?:(?:the|its|our|an?|two|both|first|second)\s+)?(?:[\w-]+\s+){0,4}?" + _TRIAL,
+            # "positive results from the Phase 3 trial"; a bare trial needs a clinical word later in the sentence
+            # ("positive results from the SynAIRgy trial in patients with OSA"), and a bare "study" never counts
+            # ("Encouraging results from our study of ChatGPT Health" is research news)
+            r"(?:" + _OUTCOME + r"|interim)\s+(?:results?|data|read-?outs?)\s+(?:from|of|in)\s+"
+            r"(?:(?:the|its|our|an?|two|both|first|second)\s+)?(?:[\w-]+\s+){0,3}?"
+            r"(?:(?:clinical|pivotal|registrational|late-stage|" + _PHASE + r")\s+(?:[\w-]+\s+){0,2}?" + _TRIAL
+            + r"|(?<!free\s)(?<!free-)trials?" + _CLINICAL_AHEAD + r")",
+            # "Phase 3 trial met", "Phase 2b study of AD109 failed"
+            _PHASE + r"\s+(?:clinical\s+)?" + _TRIAL + r"\s+(?:(?:of|for|in|evaluating)\s+[\w-]+\s+)?"
+            # (not "showed": "Phase 2 trials of FSD showed a big improvement")
+            r"(?:met|meets|succeeded|succeeds|failed|fails|missed|misses|achieved|achieves"
+            r"|was\s+" + _TRIAL_STOPPED + r"|" + _TRIAL_STOPPED + r")",
+            r"clinical\s+holds?",
+            # "stopped early for efficacy", "halted the AD109 trial for futility"
+            r"(?:stop(?:s|ped|ping)?|halt(?:s|ed|ing)?|terminat(?:e|es|ed|ing)|end(?:s|ed)?|unblind(?:s|ed|ing)?)\s+"
+            r"(?:(?:the|its|our|a)\s+)?(?:(?:[\w-]+\s+){0,2}?" + _TRIAL + r"\s+)?(?:early\s+)?"
+            r"(?:for|due\s+to|because\s+of|on)\s+(?:overwhelming\s+)?(?:futility|efficacy)",
+            r"(?:for|due\s+to)\s+futility",
+            r"futility\s+(?:analysis|analyses|boundary|stop|stopping|criteria)",
+            # "dosing in the AD109 Phase 2 trial has been paused", "patient enrollment suspended" (not "I stopped
+            # dosing ketamine", "free trial enrollment is paused", "study enrollment paused for the summer")
+            r"(?:patient\s+(?:dosing|enrol{1,2}ment)|(?:dosing|enrol{1,2}ment)\s+(?:in|of)\s+"
+            r"(?:(?:the|all|its|our)\s+)?(?:[\w-]+\s+){0,3}?(?:" + _TRIAL + r"|patients))\s+"
+            r"(?:(?:is|was|has\s+been|have\s+been)\s+)?(?:(?:temporarily|voluntarily)\s+)?" + _TRIAL_STOPPED,
+            # "Phase 3 trial of AD109 has been halted", "clinical program discontinued" (not "Phase 2 program paused")
+            r"(?:(?:clinical|pivotal|registrational|late-stage|" + _PHASE + r")\s+" + _TRIAL + r"|clinical\s+programs?)"
+            r"\s+(?:(?:of|for|in)\s+[\w-]+\s+)?(?:(?:is|was|were|has\s+been|have\s+been)\s+)?"
+            r"(?:(?:temporarily|voluntarily)\s+)?" + _TRIAL_STOPPED,
+            # "halts the Phase 3 trial", "pauses dosing in the AD109 trial"
+            r"(?:halt|paus|suspend|stop|discontinu|terminat)(?:e|es|ed|ing|s|ped|ping)?\s+(?:(?:the|its|our|a|all)\s+)?"
+            r"(?:[\w-]+\s+){0,2}?(?:clinical\s+trials?|" + _PHASE + r"\s+" + _TRIAL + r"|patient\s+dosing"
+            r"|dosing\s+(?:in|of)\s+(?:(?:the|all|its|our)\s+)?(?:[\w-]+\s+){0,3}?(?:" + _TRIAL + r"|patients))",
+            r"data\s+(?:and\s+)?safety\s+monitoring\s+(?:board|committee)",
+            r"data\s+monitoring\s+committee",
+        ),
+        # case-sensitive: "Run-DMC" / "DeLorean DMC" are not a data monitoring committee
+        _alpha_words(
+            r"DSMB",
+            r"IDMC",
+            r"iDMC",
+            r"DMC(?=\s+(?:has\s+|have\s+)?(?:recommend|review|conclud|found|determin))",
+        ),
+    ),
+    CAT_FDA_ACTION: (
+        # broad (a hint for Claude, no score): a mention without an event - "PDUFA is Feb 28", "on track for its
+        # PDUFA date", "has a Boxed Warning", "Breakthrough Therapy designation", "FDA advisory committee"
+        _alpha_words(
+            r"FDA\s+(?:decision|review|filing|submission)",
+            r"(?:FDA|target|regulatory)\s+action\s+dates?",
+            r"boxed\s+warnings?",
+            _DESIG + r"\s+(?:designations?|status)",
+            r"FDA\s+(?:[\w-]+\s+){0,3}?advisory\s+(?:committee|panel)",
+            r"FDA\s+panel",
+            _DRUG_APP,
+        ),
+        _alpha_words(r"PDUFA", r"AdCom", r"ODAC", r"REMS", r"CHMP", r"Fast\s+Track\s+designation"),
+        # precise: an FDA / EMA EVENT on a drug. Label statements ("Zepbound is approved for adults with obesity"),
+        # safety boilerplate ("has a Boxed Warning", "the REMS program"), device pathways ("FDA cleared",
+        # "authorized", "Breakthrough Device") and look-alikes ("priority review for your mortgage application",
+        # "fast-track designation by the state", "court panel voted 2-1") stay out.
+        _alpha_words(
+            r"complete\s+response\s+letters?",
+            # "refuse-to-file letter" (not "I refuse to file my taxes late")
+            r"refus(?:e|al)-to-file",
+            r"refus(?:e|al)\s+to\s+file\s+(?:letter|notice|decision)",
+            # PDUFA events (a bare "PDUFA is Feb 28" is a reminder: broad)
+            r"PDUFA\s+(?:(?:goal|target|action)\s+)?dates?\s+(?:(?:has\s+been|have\s+been|was|is|were)\s+)?"
+            r"(?:set|assigned|extended|moved|pushed|delayed|postponed|changed|reset)",
+            r"new\s+PDUFA\s+(?:(?:goal|target|action)\s+)?dates?",
+            r"PDUFA\s+(?:(?:goal|target|action)\s+)?(?:dates?\s+)?extensions?",
+            # "receives FDA approval" (an FDA "clearance" / "authorization" is a device: regulatory only)
+            r"(?:receiv(?:e|es|ed|ing)|wins?|won|gain(?:s|ed|ing)?|secur(?:e|es|ed|ing)|obtain(?:s|ed|ing)?|granted"
+            r"|earn(?:s|ed)?|gets?|got)\s+(?:(?:full|conditional|accelerated|traditional|U\.?S\.?|EU|European"
+            r"|Japanese)\s+)?(?:(?:FDA|EMA|MHRA|PMDA|NMPA)\s+approvals?|marketing\s+(?:approvals?|authori[sz]ations?))"
+            r"(?!" + _TRIAL_PERMISSION + r")",
+            # "Apnimed announces U.S. FDA approval of Oxnimbi" (not "seeks FDA approval of")
+            r"(?:announc(?:es|ed|ing)|celebrat(?:es|ed|ing)|confirm(?:s|ed)|reports?|reported)\s+(?:(?:the|its)\s+)?"
+            r"(?:U\.?S\.?\s+)?(?:FDA|EMA)\s+approval\s+(?:of|for)(?!" + _TRIAL_PERMISSION + r")",
+            # "FDA grants accelerated approval / priority review / Breakthrough Therapy designation"
+            r"(?:FDA|EMA)\s+(?:has\s+)?(?:grant(?:s|ed)|award(?:s|ed))\s+(?:(?:an?|the|its)\s+)?(?:"
+            r"(?:full|conditional|accelerated|traditional)\s+approval|priority\s+review|(?:" + _DESIG
+            + r"|fast[-\s]track)\s+(?:designations?|status))",
+            r"(?:approv(?:ed|es|al)|accept(?:s|ed|ance))\s+(?:of\s+)?(?:(?:the|its|our|an?)\s+)?(?:[\w'’-]+\s+){0,2}?"
+            + _DRUG_APP,
+            r"(?:submit(?:s|ted|ting)|submission\s+of|files|filed|filing\s+of|resubmit(?:s|ted|ting)|resubmission\s+of)"
+            r"\s+(?:(?:an?|the|its|our)\s+)?(?:[\w'’-]+\s+){0,2}?" + _DRUG_APP,
+            # "approved with a boxed warning", "FDA adds a boxed warning"
+            r"(?<!\bis\s)(?<!\bare\s)approv(?:ed|es|al)\s+with\s+(?:an?\s+)?(?:boxed|black[-\s]box)\s+warnings?",
+            r"(?:add(?:s|ed|ing)?|requir(?:e|es|ed|ing)|impos(?:e|es|ed|ing)|mandat(?:e|es|ed|ing)|issu(?:e|es|ed|ing))"
+            r"\s+(?:(?:an?|the|its)\s+)?(?:new\s+)?(?:boxed|black[-\s]box)\s+warnings?",
+            # advisory committees: a vote or a scheduled meeting of an FDA / drug committee ("No FDA advisory
+            # committee is planned", "the White House AI advisory committee recommends" stay out)
+            r"(?:FDA|FDA['’]s|ODAC|agency['’]s|drugs?|therap(?:y|ies))\s+(?:[\w-]+\s+){0,3}?advisory\s+"
+            r"(?:committee|panel)\s+(?:meeting\s+)?" + _VOTE_VERB,
+            r"(?:FDA|agency)\s+(?:has\s+|will\s+)?(?:schedul(?:es|ed|ing)|conven(?:e|es|ed|ing)|plans|planned|calls"
+            r"|called|sets)\s+(?:(?:an?|its|the)\s+)?(?:[\w-]+\s+){0,2}?advisory\s+(?:committee|panel)",
+            r"FDA\s+(?:advisory\s+|expert\s+)?panel\s+" + _VOTE_VERB,
+            # "Panel votes 9-4 in favor of Apnimed's sleep apnea pill" (not "Senate panel votes 12-10 ..." or "the
+            # appeals court panel voted 2-1 in favor of Tesla")
+            r"(?<!senate\s)(?<!house\s)panel\s+vot(?:e|es|ed)\s+\d{1,2}\s?(?:-|–|to)\s?\d{1,2}\s+"
+            r"(?:in\s+favou?r\s+of|against|to\s+(?:recommend|support|approve|back))\s+(?:[\w'’-]+\s+){0,5}?"
+            r"(?:drugs?|pills?|therap(?:y|ies)|treatments?|medicines?|medications?|vaccines?|approval)",
+            # a fresh designation ("AD109 granted Breakthrough Therapy designation")
+            _GRANT_VERB + r"\s+(?:(?:an?|the|its|U\.?S\.?|EU)\s+)?(?:(?:FDA|EMA)\s+(?:" + _DESIG
+            + r"|fast[-\s]track)|" + _DESIG + r")\s+(?:designations?|status)",
+            _DESIG + r"\s+designations?\s+(?:granted|awarded)\s+(?:to|for)",
+            # priority review of a drug application
+            r"priority\s+review\s+vouchers?",
+            r"priority\s+review\s+(?:to|for|of)\s+(?:(?:the|its|our|an?)\s+)?(?:[\w'’-]+\s+){0,2}?" + _DRUG_APP,
+            r"(?:receiv(?:e|es|ed|ing)|wins?|won|gain(?:s|ed)?|secur(?:e|es|ed)|obtain(?:s|ed)|gets?|got|granted)\s+"
+            r"(?:FDA|EMA)\s+priority\s+review",
+            # accelerated approval of a drug ("the NRC's accelerated approval pathway", "Texas granted accelerated
+            # approval of the permits" stay out)
+            r"(?:FDA|EMA)\s+(?:[\w-]+\s+){0,2}?accelerated\s+approval"
+            r"(?!\s+(?:pathways?|programs?|programmes?|process|rules?|framework))",
+            r"approv(?:ed|al)\s+under\s+(?:the\s+)?accelerated\s+approval",
+            r"accelerated\s+approval\s+from\s+(?:the\s+)?(?:U\.?S\.?\s+)?(?:FDA|EMA)",
+            r"conditional\s+marketing\s+authori[sz]ation",
+            # label expansions of a drug ("Monster Energy Records label expansion", "Reign label extension" stay out)
+            r"indication\s+(?:expansion|extension)",
+            r"(?:FDA|EMA|sNDA|sBLA|supplemental)\s+(?:[\w-]+\s+){0,3}?(?:label|indication)\s+(?:expansion|extension"
+            r"|update)",
+            r"(?:label|indication)\s+(?:expansion|extension)\s+(?:of\s+[\w'’-]+\s+)?to\s+include",
+            r"expand(?:s|ed|ing)?\s+(?:(?:the|its)\s+)?(?:label|indication)\s+(?:of\s+[\w'’-]+\s+)?to\s+include",
+            r"(?:FDA|EMA)\s+(?:has\s+)?(?:expand(?:s|ed)|broaden(?:s|ed))\s+(?:(?:the|its)\s+)?(?:[\w'’-]+\s+){0,2}?"
+            r"(?:approval|label|indication)",
+            # review extensions ("extending the review period for Copilot feedback", "pushed back the goal date for
+            # Optimus V3", "FERC extended the review of the interconnection application" stay out)
+            r"(?:extend(?:s|ed|ing)?|extension\s+of|delay(?:s|ed|ing)?|push(?:es|ed)?\s+back)\s+(?:(?:the|its)\s+)?"
+            r"(?:PDUFA|FDA\s+review)",
+            r"extend(?:s|ed|ing)?\s+(?:(?:the|its)\s+)?review\s+of\s+(?:(?:the|its)\s+)?(?:[\w'’-]+\s+){0,2}?"
+            + _DRUG_APP,
+            r"major\s+amendment\s+to\s+(?:(?:the|its)\s+)?(?:[\w'’-]+\s+)?" + _DRUG_APP,
+        ),
+        _alpha_words(
+            # "FDA approves", "EMA has accepted" (not "is FDA approved to prevent headaches", "an FDA approved
+            # treatment", "the 200-day EMA rejected bitcoin", "FDA approved ... for its first human implant")
+            r"(?<!\b[Ii]s\s)(?<!\bare\s)(?<!\b[Aa]n\s)(?<!\bonly\s)(?<!\bfirst\s)(?<!\bbe\s)(?<!\bbeen\s)"
+            + _REGULATOR_CS + r"\s+(?i:has\s+|have\s+)?(?i:approves|approved" + _NOT_ADJECTIVE
+            + r"|accept(?:s|ed)|reject(?:s|ed))(?!(?i:" + _TRIAL_PERMISSION + r"))",
+            # complete response letters ("$CRL beats Q3 estimates", "update your CRL distribution points" stay out)
+            r"(?:FDA\s+(?i:issu(?:e|es|ed|ing)|sends?|sent|hands?|handed)|(?i:receiv(?:e|es|ed|ing)|gets?|got))\s+"
+            r"(?:(?i:an?|the|its|a\s+second)\s+)?(?<!\$)CRL",
+            r"(?<!\$)CRL\s+(?i:from\s+(?:the\s+)?)FDA",
+            r"(?:AdCom|ODAC)\s+(?i:" + _VOTE_VERB + r")",
+            r"(?i:schedul(?:es|ed|ing)|conven(?:e|es|ed|ing)|plans|planned|calls|called|sets)\s+(?:(?i:an?|its|the)\s+)?"
+            r"(?:AdCom|ODAC)",
+            r"sNDA",
+            r"sBLA",
+            # a drug application with drug context: "NDA for AD109 accepted", "Apnimed's NDA accepted", "submits the
+            # NDA for AD109" (not "NDA was approved by legal", "they accepted our NDA", "signed an NDA")
+            r"(?:NDA|BLA|MAA)\s+(?i:for|of)\s+[\w'’-]+\s+(?:(?i:is|was|has\s+been|have\s+been)\s+)?(?i:" + _APP_EVENT
+            + r")",
+            r"[A-Za-z][A-Za-z0-9]{0,30}['’]s\s+(?:NDA|BLA|MAA)\s+(?:(?i:for|of)\s+[\w-]+\s+)?"
+            r"(?:(?i:is|was|has\s+been)\s+)?(?i:" + _APP_EVENT + r")",
+            r"(?:BLA|MAA)\s+(?:(?i:is|was|has\s+been)\s+)?(?i:" + _APP_EVENT + r")",
+            r"(?i:submit(?:s|ted|ting)|submission\s+of|files|filed|filing\s+of|resubmit(?:s|ted|ting)|resubmission\s+of)"
+            r"\s+(?:(?i:an?|the|its|our)\s+)?(?:[\w'’-]+\s+){0,2}?(?:" + _DRUG_APP_CS_NO_NDA
+            + r"|NDA(?=\s+(?i:for\s|to\s+(?:the\s+)?FDA|with\s+(?:the\s+)?FDA|seeking)))",
+            r"(?i:approv(?:ed|es|al)|accept(?:s|ed|ance))\s+(?i:of\s+)?(?:(?i:the|its|our|an?)\s+)?(?:[\w'’-]+\s+){0,2}?"
+            r"(?:" + _DRUG_APP_CS_NO_NDA + r"|NDA(?=\s+(?i:for|of)\s))",
+            _DRUG_APP_CS + r"\s+(?:[\w'’-]+\s+){0,4}?(?i:under\s+priority\s+review)",
+            r"(?i:priority\s+review\s+(?:to|for|of)\s+(?:(?:the|its|our|an?)\s+)?)(?:[\w'’-]+\s+){0,2}?" + _DRUG_APP_CS,
+            r"(?i:extend(?:s|ed|ing)?\s+(?:(?:the|its)\s+)?review\s+of\s+(?:(?:the|its)\s+)?)(?:[\w'’-]+\s+){0,2}?"
+            + _DRUG_APP_CS,
+            r"(?i:major\s+amendment\s+to\s+(?:(?:the|its)\s+)?)(?:[\w'’-]+\s+)?" + _DRUG_APP_CS,
+            # a fresh "Fast Track" designation, written as the FDA writes it ("Fast-track designation for H-1B
+            # renewals" and "granted fast-track designation by the state" are permits)
+            r"(?i:" + _GRANT_VERB + r")\s+(?:(?i:an?|the|its)\s+)?(?:FDA\s+)?Fast\s+Track\s+(?i:designations?|status)",
+            # EU opinions
+            r"(?:CHMP|" + _EMA + r")\s+(?i:(?:positive|negative|favou?rable)\s+)?(?i:opinion)",
+            r"(?i:positive|negative|favou?rable)\s+(?:CHMP|EMA)\s+(?i:opinion)",
+            r"CHMP\s+(?i:recommends?|recommended|adopt(?:s|ed)|backs|backed)",
+            r"(?i:approv(?:ed|es|al))\s+with\s+(?:(?i:an?)\s+)?REMS",
+        ),
+    ),
     CAT_CORPORATE_STATUS: (
-        _words(r"licen[cs](?:e|es|ed|ing)", r"charter"),
+        # not "licensing deal" / "license agreement" / "exclusive license" (partnership) or "in-licensing";
+        # "an exclusive license to operate" is an operating licence
+        _words(
+            r"(?<!in-)(?<!out-)(?<!cross-)(?:(?<!exclusive\s)licen[cs](?:e|es|ed|ing)|licen[cs]es?(?=\s+to\s+operate))"
+            r"(?!\s+(?:agreements?|deals?|pacts?|partners?|partnerships?|fees?|payments?|rights|revenues?)\b)",
+            r"charter",
+        ),
         None,
         _words(
             r"bankrupt(?:cy|cies)?",
@@ -303,7 +669,7 @@ _KEYWORDS: dict[str, _KwSpec] = {
             r"|crypto|e-?money|payments?|insurance|lending)\s+" + _LICENSE,
             _LICENSE + r"\s+(?:approved|granted|revoked|suspended|renewed)",
             r"(?:granted|received|obtained|secured|won|revoked|suspended|lost)\s+(?:a|an|our|the|its|their)?\s*"
-            r"(?:[\w-]+\s+){0,2}?" + _LICENSE,
+            r"(?:[\w-]+\s+){0,2}?" + _STATUS_LICENSE,
             r"bitlicense",
             r"defaulted\s+on",
         ),
@@ -388,6 +754,15 @@ _KEYWORDS: dict[str, _KwSpec] = {
             r"dilutive",
             r"at-the-market",
             r"priced\s+(?:an?\s+|its\s+|our\s+)?(?:[\w$.,%-]+\s+){0,4}?offering",
+            # "prices $200 million offering" (a dollar amount: not "lower prices on our cloud offering")
+            r"(?:prices|pricing\s+of)\s+(?:an?\s+|its\s+|our\s+|the\s+)?(?:upsized\s+)?" + _DEAL_AMOUNT
+            + r"\s+(?:[\w-]+\s+){0,3}?offerings?",
+            r"underwritten\s+(?:public\s+|registered\s+direct\s+)?offerings?",
+            # lock-up expiry: insider shares become sellable ("lock-up", "lockup" or "IPO lock up"; a spaced "lock
+            # up ends at 6pm" is closing time)
+            r"(?:lock-ups?|lockups?|(?:IPO|insider|shareholder|share)\s+lock[-\s]?ups?)\s+"
+            r"(?:expir(?:y|ation|ations|es|ed|ing)|release|ends?|ending|period\s+(?:ends?|ending|expir(?:y|ation|es|ed|ing)))",
+            r"(?:expir(?:y|ation|es|ing)|end)\s+of\s+(?:the\s+|its\s+|their\s+)?(?:[\w-]+\s+){0,2}?(?:lock-ups?|lockups?)",
         ),
         _words(r"ATM", r"IPO", r"IPOs"),
     ),
@@ -485,15 +860,22 @@ class _Scan:
 
     reasons: list[str] = field(default_factory=list)
     categories: list[str] = field(default_factory=list)
-    strong: set[str] = field(default_factory=set)  # categories with a precise match
+    strong: set[str] = field(default_factory=set)  # categories with a precise match (or no precise patterns)
+    precise: set[str] = field(default_factory=set)  # categories where a precise pattern matched
     tickers: list[str] = field(default_factory=list)
     has_numbers: bool = False
 
-    def add_category(self, cat: str, strong: bool = True) -> None:
+    def add_category(self, cat: str, strong: bool = True, precise: bool = False) -> None:
         if cat not in self.categories:
             self.categories.append(cat)
         if strong:
             self.strong.add(cat)
+        if precise:
+            self.precise.add(cat)
+
+    def scored_strong(self) -> set[str]:
+        """Categories worth +2: strong ones with a precise match, and weak ones with a precise match (a new set)."""
+        return (self.strong & STRONG_CATEGORIES) | (self.precise & WEAK_CATEGORIES)
 
     def add_ticker(self, ticker: str) -> None:
         if len(self.tickers) < MAX_TICKERS and ticker not in self.tickers:
@@ -537,6 +919,81 @@ def _compile_keyword(spec: _KwSpec) -> _CompiledKeyword:
 
 
 _COMPILED_KEYWORDS: dict[str, _CompiledKeyword] = {cat: _compile_keyword(spec) for cat, spec in _KEYWORDS.items()}
+
+# "positive topline results", "Phase 3 results", "results from the pivotal trial" are clinical
+# results, not earnings: these phrases are blanked out of the text the BROAD earnings patterns see
+# (the "results" hint). Precise earnings patterns see the original text, so "AbbVie Q3 results in
+# clinical immunology up 23%" keeps its precise "q3 results". ("Robust topline results" is revenue.)
+_CLINICAL_RESULTS_RE = re.compile(
+    _alpha_words(
+        r"(?:clinical|trial|study|pivotal|registrational|" + _PHASE + r")\s+(?:(?:trial|study)\s+)?"
+        r"(?:results?|data|read-?outs?)",
+        _OUTCOME_TOPLINE + r"\s+top-?line\s+(?:results?|data|read-?outs?)",
+        r"results?\s+(?:from|of|in)\s+(?:(?:the|its|our|an?|two|both)\s+)?(?:[\w-]+\s+){0,2}?"
+        r"(?:" + _PHASE + r"|clinical|pivotal|registrational|trials?|stud(?:y|ies))",
+    ),
+    re.IGNORECASE,
+)
+
+# A precise clinical / fda_action match only counts when it reports an event. These cues, in the
+# same sentence just before the match, mark a question, a condition, a plan, a negation or a recap:
+# "What happens to $APMD if the FDA issues a CRL?", "Apnimed expects topline results from the
+# Phase 3 trial in Q2", "10 years ago today the FDA approved Trulicity", "Recall: ... met its
+# primary endpoint". ("pleased to announce" / "as expected" / "once again" are not cues.)
+_HEDGE_BEFORE_RE = re.compile(
+    r"(?=[A-Za-z])"
+    + _LB
+    + r"(?:if|whether|unless|will|would|could|might|should|hypothetical(?:ly)?|imagine|assum(?:e|es|ing)"
+    r"|(?<!as\s)(?<!than\s)expect(?:s|ed|ing)?|anticipat(?:e|es|ed|ing)|await(?:s|ing)?|ahead\s+of"
+    r"|plan(?:s|ned|ning)?\s+to|hop(?:e|es|ed|ing)\s+to|aim(?:s|ed|ing)?\s+to"
+    r"|(?<!pleased\s)(?<!proud\s)(?<!excited\s)(?<!happy\s)(?<!thrilled\s)(?<!delighted\s)(?<!glad\s)"
+    r"to\s+(?:report|announce|present|release|share|unveil)"
+    r"|on\s+track|upcoming|potential(?:ly)?|possibl[ey]|odds|chances?|likel(?:y|ihood)|unlikely"
+    r"|predict(?:s|ed|ing|ions?)?|rumou?r(?:s|ed)?|reportedly|speculat(?:e|es|ed|ing|ion)"
+    r"|no(?!\s+surprise)|not|never|without|[a-z]{1,8}n['’]t"
+    r"|recall|remember(?:s|ed)?|ago|anniversary|previously|once(?!\s+again)"
+    r"|last\s+(?:year|month|week|quarter|time)|back\s+in|in\s+(?:19|20)\d\d"
+    r"|what\s+(?:if|happens|would|will|could|is|are)|why|how|when)"
+    + r"(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+# ... and right after it: "topline results from the Phase 3 trial are expected in Q2", "met its
+# primary endpoint back in 2025", "the FDA approved Trulicity 10 years ago".
+_HEDGE_AFTER_RE = re.compile(
+    r"\s*(?:(?:is|are|was|were|has\s+been|have\s+been|remains?|now)\s+)?(?:expected|anticipated|planned|due|pending"
+    r"|possible|likely|unlikely)(?![A-Za-z0-9_])"
+    r"|[^,;:]{0,40}?" + _LB + r"(?:back\s+in|(?:years?|months?|weeks?)\s+ago|ago|last\s+(?:year|month|week|quarter)"
+    r"|previously|in\s+(?:19|20)\d\d)" + _RB,
+    re.IGNORECASE,
+)
+_HEDGE_BEFORE_CHARS = 60
+_HEDGE_AFTER_CHARS = 80
+_SENTENCE_BREAK_BEFORE = ".!?;\n"
+_CLAUSE_BREAK_AFTER_RE = re.compile(r"[.!\n,;:]")
+#: at most this many matches per precise pattern are checked for hedges (bounded work per post)
+_MAX_HEDGE_CHECKS = 8
+
+
+def _hedged(text: str, start: int, end: int) -> bool:
+    """True if the match ``text[start:end]`` is framed as a question, condition, plan, negation or recap."""
+    before = text[max(0, start - _HEDGE_BEFORE_CHARS) : start]
+    cut = max(before.rfind(c) for c in _SENTENCE_BREAK_BEFORE)
+    if cut >= 0:
+        before = before[cut + 1 :]
+    if _HEDGE_BEFORE_RE.search(before):
+        return True
+    after = text[end : end + _HEDGE_AFTER_CHARS]
+    if _HEDGE_AFTER_RE.match(after):
+        return True
+    m = _CLAUSE_BREAK_AFTER_RE.search(after)
+    return "?" in (after[: m.start()] if m else after)
+
+
+def _blank(rx: Pattern[str], text: str) -> str:
+    """``text`` with every match of ``rx`` replaced by spaces (same length; no copy if none)."""
+    if rx.search(text) is None:
+        return text
+    return rx.sub(lambda m: " " * (m.end() - m.start()), text)
 
 
 def _alias_pattern(alias: str) -> str:
@@ -646,6 +1103,7 @@ class FastRules:
 
         # A watched account posting a strong own-text category ("we acquired 1,000 BTC", "I'm
         # stepping down") is about its own company: count its mapped tickers as a ticker hit.
+        # (A precise weak category - "commercial launch", "$1B upfront" - does not: brand news.)
         account_hit = bool(account is not None and account.tickers and (own.strong & STRONG_CATEGORIES))
 
         own_categories = own.ordered_categories()
@@ -770,23 +1228,47 @@ class FastRules:
         return masked
 
     def _scan_keywords(self, text: str, scan: _Scan) -> None:
+        # "positive topline results" is not earnings: the broad "results" hint skips clinical results
+        earnings_broad_text = _blank(_CLINICAL_RESULTS_RE, text)
         for cat, kw in _COMPILED_KEYWORDS.items():
-            precise_word = self._first_match(kw.precise, text)
-            word = precise_word or self._first_match(kw.broad, text)
+            hedged_word = None
+            if cat in BINARY_CATALYST_CATEGORIES:
+                # "if the FDA issues a CRL?" / "met its primary endpoint last year": a hint, not an event
+                precise_word, hedged_word = self._first_unhedged(kw.precise, text)
+            else:
+                precise_word = self._first_match(kw.precise, text)
+            broad_text = earnings_broad_text if cat == CAT_EARNINGS else text
+            word = precise_word or self._first_match(kw.broad, broad_text) or hedged_word
             if word:
                 strong = precise_word is not None or not kw.precise_defined
-                scan.add_category(cat, strong=strong)
+                scan.add_category(cat, strong=strong, precise=precise_word is not None)
                 scan.add_reason(f"keyword: {word}")
 
     @staticmethod
-    def _first_match(patterns: tuple[Pattern[str], ...], text: str) -> str | None:
+    def _word(rx: Pattern[str], m: re.Match[str]) -> str:
+        word = _norm_space(m.group(0))
+        # acronyms ("SEC", "EPS", "CEO") keep their case; everything else lowercase
+        return word.lower() if (rx.flags & re.IGNORECASE) else word
+
+    @classmethod
+    def _first_match(cls, patterns: tuple[Pattern[str], ...], text: str) -> str | None:
         for rx in patterns:
             m = rx.search(text)
             if m:
-                word = _norm_space(m.group(0))
-                # acronyms ("SEC", "EPS", "CEO") keep their case; everything else lowercase
-                return word.lower() if (rx.flags & re.IGNORECASE) else word
+                return cls._word(rx, m)
         return None
+
+    @classmethod
+    def _first_unhedged(cls, patterns: tuple[Pattern[str], ...], text: str) -> tuple[str | None, str | None]:
+        """(first match not framed as a question / plan / recap, first hedged match) - either may be None."""
+        hedged: str | None = None
+        for rx in patterns:
+            for m in itertools.islice(rx.finditer(text), _MAX_HEDGE_CHECKS):
+                if not _hedged(text, m.start(), m.end()):
+                    return cls._word(rx, m), hedged
+                if hedged is None:
+                    hedged = cls._word(rx, m)
+        return None, hedged
 
     def _scan_numbers(self, text: str, scan: _Scan) -> bool:
         spans: list[tuple[int, int, str]] = []
@@ -813,15 +1295,24 @@ class FastRules:
         """Rough 1-10 heuristic, used only when Claude is unavailable.
 
         +3 ticker / company mention (or a watched account's own strong news), +2 per strong
-        category with a precise match, +1 per weak category, +1 numbers, +1 if a detected
-        ticker is one of mine / the account's.
+        category with a precise match, +1 per weak category (+2 with a precise match), +1 once
+        for a binary biotech catalyst (precise clinical / fda_action) in a news post or from a
+        company account, +1 numbers, +1 if a detected ticker is one of mine / the account's.
+        With a binary catalyst, regulatory news does not count again: "FDA approves X" is one
+        event, not an FDA mention plus an approval.
         """
         categories = scan.categories
+        scored = scan.scored_strong()
+        binary = bool(scored & BINARY_CATALYST_CATEGORIES)
+        if binary:
+            scored.discard(CAT_REGULATORY)
         score = 0
         if CAT_TICKER in categories or CAT_COMPANY in categories or account_hit:
             score += 3
-        score += 2 * sum(1 for c in categories if c in STRONG_CATEGORIES and c in scan.strong)
-        score += sum(1 for c in categories if c in WEAK_CATEGORIES)
+        score += 2 * sum(1 for c in categories if c in scored)
+        score += sum(1 for c in categories if c in WEAK_CATEGORIES and c not in scored)
+        if binary and (account is None or account.kind == "company"):
+            score += BINARY_CATALYST_BONUS
         if CAT_NUMBERS in categories:
             score += 1
         tickers = set(scan.tickers)
