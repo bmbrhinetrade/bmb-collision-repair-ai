@@ -99,8 +99,10 @@ ceoscan sends the alert emails through your own email account, the same way an e
    - ceoscan treats these addresses as private: its logs show them masked, like `y***@g***.com`, and
      its status page (`/health`), its database and its pushes never show them (an error message from
      the email server shows `<address>` instead).
-4. **Turn the feed on.** Open `config/settings.yaml`, find the `claude_duet:` section near the end, and
-   change `enabled: false` to `enabled: true`. The other settings there have sensible defaults:
+4. **Check the feed is on.** The shipped `config/settings.yaml` already has `enabled: true` in its
+   `claude_duet:` section near the end (until the email lines above are filled in, ceoscan only logs
+   one warning and leaves the feed off). If yours says `enabled: false`, change it to `enabled: true`.
+   The other settings there have sensible defaults:
    alerts with a score of 8 or more, alerts from your "always-alert" accounts, a daily review email at
    the daily-summary time (6 PM), and at most 30 emails an hour.
    If your `settings.yaml` has no `claude_duet:` section (an older copy you kept), add these two lines

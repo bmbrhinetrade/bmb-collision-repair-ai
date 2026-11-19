@@ -132,7 +132,7 @@ claude_desk:
 # nothing trades. The phone push stays the instant alert; Duet checks in every few hours and in its
 # morning brief (or right away when you ask it "analyze my latest ceoscan alert").
 claude_duet:
-  enabled: false                      # needs SMTP_* in .env and DUET_FEED_TO (or ALERT_EMAIL_TO); works even
+  enabled: true                       # needs SMTP_* in .env and DUET_FEED_TO (or ALERT_EMAIL_TO); works even
                                       # while alerts.email.enabled is false (it is its own channel)
   min_score: 8                        # email post alerts with impact >= this (same semantics as claude_desk:
                                       # with include_rules_only, rules-only alerts qualify from

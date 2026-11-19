@@ -416,7 +416,7 @@ all stop the start with a message naming the setting, instead of failing later o
 | `claude_desk.timeout_seconds` | `15` | one fire request; 5xx / network errors are retried (3 attempts in about 70 s) |
 | `claude_desk.notify_link` | `false` | `true` = a low-priority push with the analysis session link after each fire |
 | `claude_desk.queue_max` | `200` | at most this many alerts wait for the desk, also while fires are held; when full, the lowest-scored (oldest first) is dropped and recorded |
-| `claude_duet.enabled` | `false` | the [Claude Duet feed](#claude-duet-recommended): email strong alerts to the inbox your Claude Duet agent reads; needs `SMTP_*`, `ALERT_EMAIL_FROM` and `DUET_FEED_TO` (or `ALERT_EMAIL_TO`) in `.env`. Works while `alerts.email.enabled` is false. |
+| `claude_duet.enabled` | `false` (the shipped `settings.yaml` sets `true`) | the [Claude Duet feed](#claude-duet-recommended): email strong alerts to the inbox your Claude Duet agent reads; needs `SMTP_*`, `ALERT_EMAIL_FROM` and `DUET_FEED_TO` (or `ALERT_EMAIL_TO`) in `.env`. Works while `alerts.email.enabled` is false. |
 | `claude_duet.min_score` / `include_always_alert` / `include_rules_only` | `8` / `true` / `false` | the same score rules as the desk: impact at or above `min_score`, or an always-alert account; rules-only alerts only with `include_rules_only: true` (then from `min(min_score, scoring.fallback_max_impact)`) |
 | `claude_duet.include_late` | `true` | Duet is not real time, so late "Missed during outage" alerts are still emailed, with `LATE` in the subject |
 | `claude_duet.batch_window_seconds` | `60` | alerts arriving within this window share one email (kind `batch`, at most 10 alerts) |

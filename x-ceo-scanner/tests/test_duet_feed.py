@@ -345,10 +345,13 @@ def test_invalid_duet_settings_fail_at_load_time(tmp_path: Path, yaml_text: str,
     assert needle in str(info.value)
 
 
-def test_shipped_settings_keep_the_feed_off_with_the_documented_defaults() -> None:
+def test_shipped_settings_turn_the_feed_on_with_the_documented_defaults() -> None:
+    # The code default is off; the shipped settings.yaml turns the feed on (it stays idle, with one
+    # warning, until SMTP_* and a recipient are in .env).
     shipped = load_settings(ROOT / "config" / "settings.yaml").claude_duet
-    assert shipped == ClaudeDuetSettings()
-    assert shipped.enabled is False and shipped.min_score == 8 and shipped.include_late is True
+    assert ClaudeDuetSettings().enabled is False
+    assert shipped == ClaudeDuetSettings(enabled=True)
+    assert shipped.enabled is True and shipped.min_score == 8 and shipped.include_late is True
     assert shipped.batch_window_seconds == 60 and shipped.max_emails_per_hour == 30
     assert shipped.subject_prefix == "[ceoscan]" and shipped.max_text_chars == 60_000
 
