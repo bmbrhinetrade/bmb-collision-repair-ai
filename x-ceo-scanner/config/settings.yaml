@@ -101,3 +101,27 @@ ops:
   #   wait = stay up idle, /health 503 with state config_error (the Docker image sets
   #          CEOSCAN_CONFIG_ERROR_ACTION=wait so its restart policy cannot loop)
   config_error_action: exit
+
+# Claude analyst desk: a Claude Code scheduled task that analyzes strong alerts (decision support only;
+# it never trades). Set up once at claude.ai/code/routines with the prompt in claude/desk_prompt.md, an
+# API trigger, and CLAUDE_DESK_FIRE_URL + CLAUDE_DESK_TOKEN in .env (README: "Claude analyst desk").
+# Each run uses your Claude subscription; limits: 30 fires/hour per task, 100/hour per account.
+claude_desk:
+  enabled: false                      # needs CLAUDE_DESK_FIRE_URL and CLAUDE_DESK_TOKEN in .env
+  min_score: 8                        # fire for post alerts with a Claude impact score >= this
+  include_always_alert: true          # also fire for alerts from always_alert accounts, whatever the score
+  include_rules_only: false           # rules-only scores (Claude failed / offline) do not fire by default;
+                                      # true = they fire from min(min_score, scoring.fallback_max_impact),
+                                      # because rules-only scores are capped at fallback_max_impact (7)
+  skip_late: true                     # never fire for late "Missed during outage" catch-up alerts
+  batch_window_seconds: 45            # alerts arriving within this window share one fire (one run)
+  max_fires_per_hour: 20              # stays below the 30/hour per-task limit; extra alerts roll into the next fire
+  daily_review: true                  # one review run per day at ops.daily_summary.time, after the summary
+  context_days: 7                     # recent alerts for the same tickers / accounts sent along as context
+  max_text_chars: 60000               # fire text limit (the API accepts up to 65,536 characters)
+  timeout_seconds: 15                 # one fire request; 5xx / network errors are retried (3 attempts)
+  beta: experimental-cc-routine-2026-04-01   # anthropic-beta header ("" = do not send it)
+  api_version: "2023-06-01"           # anthropic-version header
+  notify_link: false                  # true = extra low-priority push with the analysis session link
+  queue_max: 200                      # alerts waiting for the desk (also while held); when full, the
+                                      # lowest-scored is dropped and recorded. One fire takes at most 10.

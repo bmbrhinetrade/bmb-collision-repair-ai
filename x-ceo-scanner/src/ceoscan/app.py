@@ -10,6 +10,8 @@
   ``x_api.recovery.max_age_seconds``;
 * the pipeline workers (fast rules -> Claude -> decision -> push), ``ops.pipeline_workers`` of them;
 * the health server (``GET /health``) and the ops scheduler (stream-down alerts, daily summary);
+* the optional Claude analyst desk (``claude_desk``: a Claude Code scheduled task fired for strong
+  alerts, plus a daily review), sharing the HTTP session; stopped after the pipeline has drained;
 * housekeeping: the "last alive" time (kv ``ingest_last_alive``, every ~30 s and at shutdown) that
   the next start catches up from, and a throttled alert when Claude rejects our requests.
 
@@ -49,6 +51,7 @@ import aiohttp
 
 from .http import new_session
 from . import __version__
+from .alerts.claude_desk import ClaudeDesk, build_desk
 from .alerts.dispatcher import AlertDispatcher, build_dispatcher
 from .alerts.format import format_system_alert
 from .config import AppConfig
@@ -171,6 +174,8 @@ class Service:
         self.stream: FilteredStream | None = None
         self.scorer: ClaudeScorer | OfflineScorer | None = None
         self.events: IngestEventLog | None = None
+        self.desk: ClaudeDesk | None = None
+        self.desk_problem: str | None = None  # why claude_desk.enabled is true but the desk is off
         self.config_problem: str | None = None
         self.warmup_error: str | None = None
         self._exit_code = EXIT_OK
@@ -435,8 +440,9 @@ class Service:
         self._spawn_background(self._startup_alert(report, build, len(verified)), "startup-alert")
         self._spawn_background(self._housekeeping(), "housekeeping")
 
-        pipeline = Pipeline(cfg, store, scorer, self.dispatcher, self.status)
-        scheduler = OpsScheduler(cfg, store, self.status, self.dispatcher)
+        desk = self._start_desk(stack, store, session)
+        pipeline = Pipeline(cfg, store, scorer, self.dispatcher, self.status, desk=desk)
+        scheduler = OpsScheduler(cfg, store, self.status, self.dispatcher, desk=desk)
         return await self._supervise(
             {
                 "ingest": self._ingest(mode, client, session, token, build.rules, poller, queue, last_alive),
@@ -444,6 +450,34 @@ class Service:
                 "scheduler": scheduler.run(self.stop),
             }
         )
+
+    def _start_desk(
+        self, stack: contextlib.AsyncExitStack, store: Store, session: aiohttp.ClientSession
+    ) -> ClaudeDesk | None:
+        """The Claude analyst desk when enabled and configured; otherwise None (one warning, never fatal)."""
+        try:
+            desk, problem = build_desk(self.cfg, store, session, self.dispatcher)
+        except Exception as exc:  # the desk is optional: never keep the scanner from running
+            logger.exception("claude_desk: could not be set up; continuing without it")
+            desk, problem = None, f"could not be set up: {_describe_exc(exc)}"
+        self.desk, self.desk_problem = desk, problem
+        if self.health is not None:
+            self.health.desk, self.health.desk_problem = desk, problem
+        if desk is None:
+            if problem:
+                self.out(f"WARNING: the Claude analyst desk is off: {problem}. Phone alerts are not affected.")
+            return None
+        desk.start()
+        stack.push_async_callback(desk.stop)  # runs after the pipeline drained (it may still submit)
+        d = self.settings.claude_desk
+        self.out(
+            f"Claude analyst desk: on (alerts with score >= {d.min_score}"
+            + (" or from always-alert accounts" if d.include_always_alert else "")
+            + f", at most {d.max_fires_per_hour} runs/hour"
+            + (", daily review" if d.daily_review else "")
+            + ")"
+        )
+        return desk
 
     # ------------------------------------------------------------------ ingest
 

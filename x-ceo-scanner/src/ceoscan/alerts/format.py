@@ -7,6 +7,7 @@ Post alert layout (push body)::
     "<first snippet_chars characters of the post>…"
     Posted Nov 19, 8:41:07 PM PT
     <optional tag lines: late, joke/meme, edited, reply/quote, quiet hours, rules-only, ...>
+    🧠 Claude analyst brief on the way     (only when the Claude analyst desk will look at it)
     https://x.com/elonmusk/status/...
 
 Title: ``🟢 TSLA +8/10 @elonmusk``, with markers for what makes an alert less reliable or not live:
@@ -43,6 +44,8 @@ TITLE_MAX_TICKERS = 3
 RULES_ONLY_SOURCES: frozenset[str] = frozenset({"rules_fallback", "offline", "skipped"})
 RULES_ONLY_MARKER = "rules-only"
 EDITED_MARKER = "edited"
+#: Body line for alerts the Claude analyst desk (alerts/claude_desk.py) will analyze.
+BRIEF_LINE = "🧠 Claude analyst brief on the way"
 _RULES_ONLY_WHY: dict[str, str] = {
     "rules_fallback": "Claude unavailable",
     "offline": "Claude scoring not configured",
@@ -180,11 +183,14 @@ def format_post_alert(
     settings: AlertSettings,
     *,
     edit_note: str | None = None,
+    desk_brief: bool = False,
 ) -> AlertMessage:
     """Build the push/SMS/email message for a post that passed ``decide``.
 
     ``edit_note`` (e.g. "was BULLISH, now BEARISH") marks a re-alert for an edited post. Lateness is
     derived from the post itself (received_at - created_at vs ``settings.max_post_age_seconds``).
+    ``desk_brief`` adds the :data:`BRIEF_LINE` (the Claude analyst desk is enabled, configured and will
+    analyze this alert).
     """
     handle = _handle(post, account)
     tickers = _tickers(score)
@@ -222,6 +228,8 @@ def format_post_alert(
         lines.append(f'"{snip}"')
     lines.append(f"Posted {format_local(post.created_at, settings.timezone)}")
     lines.extend(_tag_lines(post, account, score, decision, late_age, edit_note, settings))
+    if desk_brief:
+        lines.append(BRIEF_LINE)
     lines.append(post.url)
 
     tags = [*tickers, direction]

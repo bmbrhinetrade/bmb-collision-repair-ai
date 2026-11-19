@@ -38,6 +38,7 @@ import pytest
 from aiohttp import web
 
 import ceoscan.app as app_mod
+from ceoscan.alerts.claude_desk import BRIEF_LINE, ClaudeDesk
 from ceoscan.alerts.dispatcher import AlertDispatcher
 from ceoscan.alerts.notifiers import CaptureNotifier
 from ceoscan.app import (
@@ -607,6 +608,67 @@ async def test_pipeline_workers_and_stream_error_events(
     assert TOKEN not in json.dumps(events)
     # started once, after the first connect
     assert [t for t in titles(capture) if t.startswith("ceoscan started")] == ["ceoscan started (stream, 2 accounts, est. 4.5s)"]
+
+
+async def test_claude_desk_fires_for_a_strong_alert_without_delaying_it(
+    tmp_path: Path, fake_x: FakeX, capture: CaptureNotifier, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Claude analyst desk inside the real service: the alert is pushed first (with the brief line),
+    then one fire reaches the scheduled task's endpoint, is recorded, and shows up in /health."""
+    fires: list[dict[str, Any]] = []
+
+    async def fire(request: web.Request) -> web.Response:
+        fires.append({"headers": dict(request.headers), "json": await request.json()})
+        return web.json_response({"type": "routine_fire", "claude_code_session_id": "session_01E2E",
+                                  "claude_code_session_url": "https://claude.ai/code/session_01E2E"})
+
+    desk_app = web.Application()
+    desk_app.router.add_post("/v1/claude_code/routines/{rid}/fire", fire)
+    runner, port = await serve(desk_app)
+    desk_token = "sk-ant-oat01-e2e-desk-token-NOT-REAL-42"
+
+    def build_desk(cfg: AppConfig, store: Store, session: aiohttp.ClientSession, dispatcher: Any) -> Any:
+        # the real factory only accepts api.anthropic.com; point the same desk at the local fake
+        url = f"http://127.0.0.1:{port}/v1/claude_code/routines/trig_01E2E/fire"
+        return ClaudeDesk(cfg, store, session, dispatcher, fire_url=url, token=desk_token), None
+
+    monkeypatch.setattr(app_mod, "build_desk", build_desk)
+    cfg = make_cfg(tmp_path, fake_x.base_url)  # type: ignore[attr-defined]
+    cfg.secrets = Secrets(x_bearer_token=TOKEN, claude_desk_token=desk_token,
+                          claude_desk_fire_url="https://api.anthropic.com/v1/claude_code/routines/trig_01E2E/fire")
+    d = cfg.settings.claude_desk
+    d.enabled, d.include_rules_only, d.batch_window_seconds = True, True, 0.2  # scoring is offline in tests
+    store = Store(cfg.settings.ops.db_path)
+    store.kv_set(KV_LAST_ALIVE, (now_utc() - timedelta(minutes=10)).isoformat())
+    store.close()
+    post = make_post(ELON, "$TSLA guidance raised: record 500,000 deliveries", cashtags=("TSLA",), ms=ms_ago(120))
+    fake_x.timelines[ELON] = [post]
+    out: list[str] = []
+    svc = Service(cfg, out=out.append, install_signal_handlers=False)
+    task = asyncio.create_task(svc.run())
+    try:
+        await wait_until(lambda: len(fires) == 1, task)
+        await wait_until(lambda: svc.health is not None
+                         and svc.health.snapshot()["claude_desk"]["fires_today"] == 1, task)
+        health = svc.health.snapshot()["claude_desk"]  # type: ignore[union-attr]
+        assert await stop(svc, task) == EXIT_OK
+    finally:
+        await runner.cleanup()
+    (alert,) = [m for m in capture.sent if m.kind == "post"]
+    assert BRIEF_LINE in alert.body
+    text = fires[0]["json"]["text"]
+    assert "Kind: alert" in text and pid_of(post) in text and "$TSLA guidance raised" in text
+    assert fires[0]["headers"]["Authorization"] == f"Bearer {desk_token}"
+    assert health["configured"] is True and health["last_session_url"] == "https://claude.ai/code/session_01E2E"
+    assert any(line.startswith("Claude analyst desk: on") for line in out)
+    assert svc.desk is not None and not svc.desk.running  # stopped with the service
+    store = Store(cfg.settings.ops.db_path)
+    try:
+        (row,) = store.desk_fires()
+        assert row["status"] == "sent" and row["post_ids"] == [pid_of(post)]
+    finally:
+        store.close()
+    assert desk_token not in json.dumps(health) and desk_token not in text
 
 
 async def test_polling_repaces_to_the_real_rate_limit_and_tells_the_user(

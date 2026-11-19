@@ -16,6 +16,7 @@ when a post could move one of your tickers.
 [Setup](#setup-step-by-step) ·
 [Deploy](#8-deploy-to-a-linux-server) ·
 [Operations](#operations) ·
+[Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) ·
 [CLI](#cli-reference) ·
 [Tests](#running-the-tests) ·
 [Security](#security-notes) ·
@@ -52,6 +53,12 @@ when a post could move one of your tickers.
   meantime by reading their timelines (bounded: at most 1 hour back, see
   [catch-up](#catch-up-after-an-outage-or-a-restart)). Posts found that way alert as low-priority
   "Missed during outage" alerts.
+- **Optional: Claude analyst desk.** Strong alerts (score 8+ or always-alert accounts) can also go
+  to your own Claude Code cloud scheduled task. Within a few minutes it researches the post with
+  three parallel subagents (is it real and new, the market context, and the bear case) and answers
+  with a `VERDICT: ACT | WATCH | PASS` brief that helps you decide. This is decision support only,
+  and the phone alert never waits for it. See
+  [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task).
 
 ## Architecture
 
@@ -84,6 +91,8 @@ when a post could move one of your tickers.
 
  Side tasks:  health server   GET /health on 127.0.0.1:8080 (stream state, last post, today's stats)
               scheduler       stream-down / recovered alerts, daily 6 PM PT summary
+              claude desk     optional: strong alerts -> Claude Code scheduled task (API fire), queued
+                              after the push, batched, at most 20 fires/hour; daily review run
 ```
 
 Everything runs in one Python 3.12 asyncio process. The code lives in `src/ceoscan/`:
@@ -92,10 +101,11 @@ Everything runs in one Python 3.12 asyncio process. The code lives in `src/ceosc
 |---|---|
 | `xapi/` | X API client, stream rules, filtered stream, timeline poller, access check, handle verification |
 | `scoring/` | fast rules, Claude prompt and scorer |
-| `alerts/` | alert decision, message formatting, notifiers (ntfy, Pushover, Twilio, SMTP), dispatcher |
+| `alerts/` | alert decision, message formatting, notifiers (ntfy, Pushover, Twilio, SMTP), dispatcher, Claude analyst desk (`claude_desk.py`) |
 | `ops/` | health server, scheduler (stream-down alerts, daily summary), cost estimate |
 | `pipeline.py`, `app.py`, `__main__.py` | the pipeline, the service, and the CLI |
 | `config.py`, `store.py`, `models.py` | settings, watchlist and secrets loading; SQLite store; shared data types |
+| `claude/desk_prompt.md` | the saved prompt for the Claude analyst desk's scheduled task (pasted at claude.ai/code/routines) |
 
 ---
 
@@ -310,7 +320,9 @@ nano .env            # fill in what you use; leave the rest empty
 `.env.example` documents every variable: `X_BEARER_TOKEN`, `ANTHROPIC_API_KEY`,
 `PUSHOVER_APP_TOKEN`, `PUSHOVER_USER_KEY`, `NTFY_TOPIC`, `NTFY_TOKEN`, `TWILIO_ACCOUNT_SID`,
 `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`, `ALERT_SMS_TO`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`,
-`SMTP_PASSWORD`, `ALERT_EMAIL_FROM` and `ALERT_EMAIL_TO`. Write one `KEY=value` per line, with
+`SMTP_PASSWORD`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO`, and for the optional
+[Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) `CLAUDE_DESK_FIRE_URL` and
+`CLAUDE_DESK_TOKEN`. Write one `KEY=value` per line, with
 comments on their own lines only. Wrap values that contain spaces, `#`, `$` or quotes in single
 quotes. Variables that are already set in the environment win over `.env`. If `.env` exists but
 cannot be read (for example root-owned under systemd, which reads it itself), ceoscan prints a
@@ -379,6 +391,17 @@ all stop the start with a message naming the setting, instead of failing later o
 | `ops.health_host` / `health_port` | `127.0.0.1` / `8080` | health server bind address. The environment variable `CEOSCAN_HEALTH_HOST` overrides the host (the Docker image sets `0.0.0.0` inside the container). |
 | `ops.pipeline_workers` | `8` | posts scored and alerted in parallel |
 | `ops.config_error_action` | `exit` | on a configuration problem: `exit` (code 2, systemd does not restart) or `wait` (stay up idle, `/health` reports `config_error`). The environment variable `CEOSCAN_CONFIG_ERROR_ACTION` overrides it (the Docker image sets `wait`). |
+| `claude_desk.enabled` | `false` | the [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task); needs `CLAUDE_DESK_FIRE_URL` and `CLAUDE_DESK_TOKEN` in `.env` |
+| `claude_desk.min_score` | `8` | fire the desk for delivered post alerts with a Claude impact score at or above this |
+| `claude_desk.include_always_alert` / `include_rules_only` / `skip_late` | `true` / `false` / `true` | also fire for always-alert accounts at any score; rules-only scores (Claude failed) do not fire. With `include_rules_only: true` they fire from `min(min_score, scoring.fallback_max_impact)` (7 by default), because rules-only scores are capped at `fallback_max_impact`. Late "Missed during outage" alerts never fire. |
+| `claude_desk.batch_window_seconds` | `45` | alerts arriving within this window share one fire (one run, kind `batch`) |
+| `claude_desk.max_fires_per_hour` | `20` | sliding one-hour budget (the task's limit is 30/hour); extra alerts are held and the highest-scored go out in the next fire (at most 10 alerts per fire) |
+| `claude_desk.daily_review` | `true` | one review run per day at `ops.daily_summary.time`, after the summary |
+| `claude_desk.context_days` | `7` | recent alerts (max 10) for the same tickers or accounts sent along as context |
+| `claude_desk.max_text_chars` | `60000` | fire text limit (the API accepts 65,536); the longest fields are cut first |
+| `claude_desk.timeout_seconds` | `15` | one fire request; 5xx / network errors are retried (3 attempts in about 70 s) |
+| `claude_desk.notify_link` | `false` | `true` = a low-priority push with the analysis session link after each fire |
+| `claude_desk.queue_max` | `200` | at most this many alerts wait for the desk, also while fires are held; when full, the lowest-scored (oldest first) is dropped and recorded |
 
 ### 7. Verify handles, check access, preview rules and cost, send a test alert
 
@@ -583,6 +606,7 @@ line above and run `sudo systemctl daemon-reload`.
 | `stream` | `state` (connected, reconnecting, backoff, credits_depleted, polling, config_error, ...), `connected_since`, `last_heartbeat_at`, `heartbeat_seconds_ago`, `down_since`, `down_seconds`, `reconnects`, `last_error`, `poll_interval_seconds`, `estimated_latency_seconds` |
 | `last_post` | `id`, `at`, `handle`, `seconds_ago` of the last post received |
 | `today` | since local midnight: `posts`, `flagged`, `claude_scored`, `alerts`, `alerts_late`, `alerts_failed`, `avg_latency_ms` / `max_latency_ms` (live alerts only, late catch-up alerts excluded), `score_errors` (Claude failed, rules-only score used), `stream_errors`, `errors` |
+| `claude_desk` | the [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task): `enabled`, `configured`, `fires_today`, `failed_today`, `last_fire_at`, `last_status`, `last_session_url`, `last_error`, `queued`, `budget_left_this_hour`, `problem` (why it is off although enabled). It never changes `status`. |
 | `queue_size`, `uptime_seconds`, `version` | process info |
 
 `GET /health` answers 200 while the process is serving normally, whatever the stream does (the
@@ -617,8 +641,8 @@ publicly as-is.
 - **Daily summary at 6 PM PT** (`ops.daily_summary.time: "18:00"` in `alerts.timezone`): posts
   seen, flagged and Claude-scored; alerts sent, failed and late; average and max latency of live
   alerts; scoring errors (with the latest one); stream errors; errors (with the last error kinds);
-  ingest mode, state and reconnects; and the projected monthly X cost, based on the posts of the
-  last 24 hours (scaled up when the service has run for less than a day; shown as n/a for the
+  ingest mode, state and reconnects; "Claude desk: N analyses (M failed)" when the desk is enabled;
+  and the projected monthly X cost, based on the posts of the last 24 hours (scaled up when the service has run for less than a day; shown as n/a for the
   first hour). It is sent at low priority to push and (if enabled) email, once per day. If no
   channel delivers it, it is retried every 5 minutes. If the service was down at 18:00, it still
   sends the summary if it comes back within 60 minutes.
@@ -737,6 +761,176 @@ handle, whether it was flagged, the score and the decision, then a summary.
 
 ---
 
+## Claude analyst desk (Claude Code scheduled task)
+
+ceoscan's phone alert tells you *that* something was posted. The analyst desk helps you decide
+*whether it matters*. When an alert is strong, ceoscan also fires your own **Claude Code cloud
+scheduled task** (formerly called a "routine") through its API trigger. That starts a Claude Code
+session in the cloud that:
+
+1. reads the alert ceoscan sent: the account, tickers, score and reason, the full post text, the
+   quoted or parent post, recent alerts for the same tickers, and your `my_tickers`;
+2. starts **three subagents in parallel**:
+   - a **verifier**: is the post real, and what is new compared with what was already public?
+   - a **market context** agent: the price and move since the post, volume, market cap, trend, the
+     next earnings date, and what is already priced in;
+   - a **bear / risk** agent: why it might not matter, and how the stock reacted to similar posts;
+3. writes a short brief (under about 600 words) whose first line is
+   `VERDICT: ACT | WATCH | PASS - <TICKER> - confidence low/medium/high - <one sentence>`, followed
+   by the bull and bear cases, key levels, what would change the view, considerations if acting,
+   and sources.
+
+> **Decision support only.** The desk's prompt forbids trading, suggesting automated trades,
+> connecting to brokerages, asking for credentials, and changing any repository. ceoscan itself
+> still never trades and has no brokerage access. Every brief ends with "Decision support only -
+> not financial advice; you decide."
+
+**What gets fired, and when:**
+
+| Kind | When |
+|---|---|
+| `alert` | a delivered post alert with a Claude score at or above `claude_desk.min_score` (8), or from an `always_alert` account. Late "Missed during outage" alerts and rules-only scores are skipped by default (with `include_rules_only: true`, rules-only alerts fire from 7, the rules-only cap). |
+| `batch` | several such alerts within `batch_window_seconds` (45 s), sent in one fire and ranked by score: at most 10 per fire, and fewer if they would not fit in `max_text_chars` with at least 1,000 characters of each post. The rest go in the next fire. The desk ranks them, one line each, and deep-dives the top one. |
+| `daily_review` | once a day at `ops.daily_summary.time` (18:00), after the daily summary: today's numbers and every alert scoring 7+ (on a very heavy day, the highest-scored ones that fit in `max_text_chars`). The desk checks how each stock actually moved since its alert and lists watch items for tomorrow. |
+| `test` | `python -m ceoscan test-desk`: a clearly labelled synthetic alert. The desk answers with an example VERDICT line, then a confirmation. |
+
+**Latency:** the phone alert is not affected. ceoscan queues the alert for the desk only after the
+push went out, and the push gets one extra line: "🧠 Claude analyst brief on the way". The fire
+follows after the batch window (up to 45 s), and the run itself takes about 1-5 minutes. Expect
+the brief about 2-6 minutes after the alert.
+
+**Where the verdict appears:** in the session, at claude.ai/code and in the **Code** tab of the
+Claude app on your phone. The prompt asks Claude to send the VERDICT line as a push notification
+when the session offers a push-notification tool. If your scheduled task offers completion
+notifications, turn them on. You can also set `claude_desk.notify_link: true`: ceoscan then sends a
+low-priority push "Claude analyst on it: $TSLA" with the session link right after each fire, so one
+tap opens the run.
+
+### Set it up
+
+1. **Requirements:** a claude.ai **Pro, Max, Ultra, Team or Enterprise** plan with Claude Code on
+   the web. On Team and Enterprise plans, an Owner can turn scheduled tasks off for the whole
+   organization.
+2. Go to **[claude.ai/code/routines](https://claude.ai/code/routines)** (the page may still say
+   "Routines") and click **New task** (or **New routine**). If asked, choose **Set up manually**.
+3. **Name** it, for example "ceoscan analyst desk". For the **prompt**, paste everything below the
+   line `PROMPT STARTS HERE` in [`claude/desk_prompt.md`](claude/desk_prompt.md).
+4. **Trigger:** choose **API**. No schedule is needed, and **no repository is needed**. ceoscan fires
+   the task, and the daily review is one of those fires. (Without a repository, some versions of the
+   dialog hide the environment picker; step 7 covers that.)
+5. **Model:** pick a capable model. A higher effort level gives deeper research but makes runs
+   slower.
+6. **Connectors** (Advanced settings): all your connectors are included by default. Remove every
+   one the desk does not need. The prompt forbids writes, but least privilege is safer.
+7. **Network: give the desk its own cloud environment.** The **Default** environment has
+   **Limited** access, which reaches package registries, GitHub and cloud SDKs, but not finance or
+   news sites. **Do not widen the Default environment:** with only Default available, every cloud
+   session you run uses it, including sessions that work on your repositories, and the desk reads
+   untrusted post text. Instead:
+   1. At [claude.ai/code](https://claude.ai/code), open the environment selector under the message
+      box and choose **New environment**. Name it, for example, `ceoscan-desk`. Keep **Network
+      access** at **Limited** and list the finance and news sites you trust under **Allowed
+      domains**, one per line (for example `finance.yahoo.com`, `www.nasdaq.com`, `www.sec.gov`,
+      `www.reuters.com`; a leading `*.` matches subdomains). You can clear **Allow package
+      managers**, because the desk installs nothing. Add no environment variables or secrets. Choose
+      **Full** only as a last resort, and only for this environment. Click **Add environment**.
+   2. Select it for the task. In the version of the dialog that shows **Repositories** and
+      **Environment** in its main view, and in the full-page form, pick it there. In the version with
+      **Advanced settings**, **Cloud environment** appears only after a repository is selected: create
+      the task first, then open it, choose **Edit**, and look under **Advanced settings > General >
+      Cloud environment**.
+   3. If no picker is offered for a task without a repository, the task runs in your Default
+      environment. Leave Default as it is. The desk then says when it could not reach a price or
+      news source and lowers its confidence.
+8. Click **Create**. The **API token** dialog shows the token **once**: copy it now. It starts with
+   `sk-ant-oat01-`. To get the **Fire URL**, open the task, choose **Edit**, and look in the API
+   trigger panel. The URL looks like
+   `https://api.anthropic.com/v1/claude_code/routines/trig_.../fire`. (If you lose the token, click
+   **Regenerate** there. The old token stops working.)
+9. If notifications for the task are offered, turn them on. Install the Claude app on your phone
+   and sign in with the same account.
+10. Put both values in `.env` (see `.env.example`):
+    ```bash
+    CLAUDE_DESK_FIRE_URL=https://api.anthropic.com/v1/claude_code/routines/trig_.../fire
+    CLAUDE_DESK_TOKEN=sk-ant-oat01-...
+    ```
+11. Test it: `python -m ceoscan test-desk` (or `docker compose run --rm ceoscan test-desk`). It
+    prints `Session: https://claude.ai/code/session_...`. Open the link: after a minute or two the
+    session replies with an example VERDICT line and a confirmation. Exit code 0 means the run started,
+    1 means a failure such as 5xx, the network or the hourly limit, and 2 means a configuration
+    problem: a missing or invalid URL or token, or a 400/401/403/404 answer.
+12. Set `claude_desk.enabled: true` in `config/settings.yaml`, then restart
+    (`docker compose up -d --force-recreate` after editing `.env`, or
+    `sudo systemctl restart ceoscan`). At startup ceoscan prints "Claude analyst desk: on (...)", and
+    `/health` shows `"claude_desk": {"configured": true, ...}`.
+
+If `enabled: true` but a variable is missing or malformed, ceoscan logs one clear warning and runs
+**without** the desk. Your alerts are unaffected, and `/health` shows the reason in
+`claude_desk.problem`.
+
+### Limits, cost and failures
+
+- **Hourly limits** (from the scheduled task API docs, checked 2026-11-19): **30 fires per hour per
+  task**, shared with the **Run now** button, and **100 API fires per hour per account**. Over the
+  limit, the API answers 429; these fire limits have no overage. ceoscan keeps a sliding budget of
+  `max_fires_per_hour` (20), which leaves room for Run now. Alerts over the budget are held, never
+  silently dropped, and the highest-scored go out in the next allowed fire. On a 429, ceoscan waits
+  for `Retry-After`.
+- **Cost:** each run draws on your **Claude subscription usage**, like an interactive Claude Code
+  session (see [claude.ai/settings/usage](https://claude.ai/settings/usage)), and a busy day of
+  alerts uses a share of your plan. **When you reach your subscription usage limit**, scheduled-task
+  runs stop until the usage window resets, unless **usage credits** are turned on: then they keep
+  running on **metered overage**, which is billed. Check that setting at claude.ai/settings/usage
+  (on Team and Enterprise plans an admin sets it at claude.ai/admin-settings/usage) before you turn
+  the desk on. To use less, raise `min_score`, lengthen `batch_window_seconds` or lower
+  `max_fires_per_hour`.
+- **Text limit:** the API accepts up to 65,536 characters. ceoscan sends at most `max_text_chars`
+  (60,000) and cuts the longest fields first, with a visible marker. One fire carries at most 10
+  alerts, and fewer when they would not fit with at least 1,000 characters of each post; the rest go
+  in the next fire. The `desk_fires` row lists only the alerts that were in the fire text.
+- **Failures:** a 5xx or network error is retried (3 attempts within about 70 s), then recorded as
+  failed. A **401/403/404/400** is a configuration problem. You get one high-priority alert per hour
+  per status, for example "Claude desk: fire rejected (HTTP 401) - check CLAUDE_DESK_TOKEN", and
+  ceoscan keeps running. At most `claude_desk.queue_max` (200) alerts wait at a time, also while
+  fires are held for the budget or a 429. When the backlog is full, the lowest-scored alert (the
+  oldest among equal scores, possibly the new one) is dropped, logged and recorded as `dropped`. At
+  shutdown, the top pending alerts are fired once if the budget allows; the rest are recorded as
+  dropped.
+- **Records:** every fire is a row in the `desk_fires` table (no secrets), and the day's totals are
+  in `/health` and the daily summary:
+  ```bash
+  sqlite3 data/ceoscan.db "SELECT datetime(fired_at_ms/1000,'unixepoch'), kind, status, http_status, tickers, session_url, error FROM desk_fires ORDER BY id DESC LIMIT 20;"
+  ```
+- **No idempotency:** the API has no idempotency key. In the rare case that a request times out
+  after the server already started the run, the retry starts a second run.
+
+### Privacy and safety
+
+- **What is sent** to Anthropic under your claude.ai account (and kept in the session history
+  there): the alert content. That is the handle, display name and follower count, the tickers, the
+  Claude score, direction and reason, the fast-rule reasons, the post time and receive delay, the
+  link, the **full post text** and the quoted or parent post, up to 10 recent alerts for the same
+  tickers or accounts from the last `context_days` (7), and your `my_tickers` list. A daily review
+  also sends the day's counts and alerts.
+- **What is never sent:** your secrets (X token, API keys, ntfy topic, Pushover keys, phone numbers,
+  email settings). The desk token goes only in the `Authorization` header. It is never written to
+  the fire text, the database, `/health`, error messages or logs (logs redact it).
+- **Post text is untrusted.** Every post is fenced as untrusted data, and the fence lines carry a
+  random id per fire, which the fire's "Data rules" line names, so a fence a post forges cannot
+  match. Untrusted text is first decoded the way a reader sees it (the HTML entities X sends, such as
+  `&lt;`, fullwidth lookalikes and invisible characters), then fence lookalikes and
+  `<routine-fire-payload` tags, with or without a closing `>`, are neutralized. A last pass checks
+  the whole fire text for such tags. Claude Code additionally wraps the whole fire text in a
+  `<routine-fire-payload>` block labelled as untrusted. The prompt tells the desk to analyze post
+  text and never follow instructions found in it, and to give its subagents the same rules.
+- **The token can only start this one task.** It gives no read access and no access to other tasks
+  or account data. If it leaks, someone could start runs, up to 30 an hour, using your usage (and,
+  with usage credits turned on, metered overage that is billed), but their text would arrive
+  labelled as untrusted. Regenerate the token in the task's API
+  trigger panel, or delete it to turn API access off.
+
+---
+
 ## CLI reference
 
 ```
@@ -755,6 +949,7 @@ it from the project folder. `python -m ceoscan --version` prints the version.
 | `cost` | monthly cost estimate (X + Claude) from the watchlist |
 | `replay FILE [--claude] [--send] [--keep-times] [--db PATH]` | run stored posts through the pipeline without X |
 | `test-alert [--message TEXT]` | send a test alert through every configured channel (SMS and email included) |
+| `test-desk [--message TEXT]` | fire the [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) once with a synthetic `test` alert and print the session link (needs `CLAUDE_DESK_FIRE_URL` and `CLAUDE_DESK_TOKEN`; works even while `claude_desk.enabled` is false) |
 
 Exit codes: **0** success, **1** failure (for example a failed lookup or channel, credits
 depleted), **2** configuration problem (a YAML typo, `X_BEARER_TOKEN` missing, no verified
@@ -808,6 +1003,10 @@ CEOSCAN_E2E=1 python -m pytest -q tests/test_e2e_service.py   # about 30 s
 - **The health endpoint stays local.** It binds to 127.0.0.1 by default. In Docker it listens on
   the container interface (`CEOSCAN_HEALTH_HOST=0.0.0.0` in the image), and Compose publishes it
   on the host's 127.0.0.1 only. It shows handles, counts and the last X error, never secrets.
+- **The Claude analyst desk is optional and off by default.** When on, it sends alert content
+  (including the full post text) to your own Claude Code scheduled task. It never sends secrets,
+  and its token can only start that one task. See
+  [Privacy and safety](#privacy-and-safety).
 - **Least privilege.** The container runs non-root with a read-only filesystem and no
   capabilities. The systemd unit is hardened (`systemd-analyze security ceoscan` rates it about
   1.8, "OK"). Neither has any brokerage access, because ceoscan only reads X and sends
@@ -830,4 +1029,6 @@ CEOSCAN_E2E=1 python -m pytest -q tests/test_e2e_service.py   # about 30 s
 | **No alerts** | 1) `curl 127.0.0.1:8080/health`: is `stream.state` connected, and does `last_post.seconds_ago` grow? 2) `rules`: are your accounts in the rules? Accounts without a `user_id` are skipped and listed at startup. 3) `test-alert`: does your phone get it? Check the ntfy topic spelling, notification permissions and battery optimization. 4) The logs show each decision: the score may be below 7, quiet hours may require 9, the post may be a joke (needs 9), or the tickers are not yours (`require_my_ticker`). 5) `replay samples/sample_posts.jsonl` shows what alerts with your settings. 6) Is `ANTHROPIC_API_KEY` set? Without it, scores come from the rules only. |
 | **Alerts slower than 10 s** | Read the `latency` line. A high `x=` comes from X's side (or the poll interval). A high `scoring=` means Claude is slow: keep `effort: low` or lower `scoring.total_budget_seconds` (the rules-only score is used after it). A high `push=` points at a slow channel or network. Late "Missed during outage" alerts are expected to be old. |
 | **`Permission denied` on `data/` or `config/` (Docker)** | The container user does not own them. Set `CEOSCAN_UID`/`CEOSCAN_GID` in `.env` to your `id -u`/`id -g` and run `docker compose up -d --build`, or `sudo chown -R 1000:1000 data config`. Create `data/` yourself with `mkdir -p data`, because Docker would create it owned by root. |
+| **Claude desk: "fire rejected (HTTP 401) - check CLAUDE_DESK_TOKEN"** | The token was regenerated or copied wrong. Generate a new one in the task's API trigger panel at claude.ai/code/routines, update `.env`, recreate or restart, and run `test-desk`. A **404** means the Fire URL is wrong (or the task was deleted). A **400** usually means the task is paused. A **403** means the account or organization may not fire scheduled tasks. |
+| **Claude desk: no brief arrives** | Check `/health`: `claude_desk.configured` (and `problem`), `last_status`, `last_error`, `budget_left_this_hour`. The desk only fires for alerts with a score of `min_score` (8) or more, or from always-alert accounts, and it skips late alerts and (unless `include_rules_only` is on) rules-only alerts. Open `last_session_url` to see the run. If the run cannot fetch prices, allow those domains in the task's own cloud environment (setup step 7; do not widen Default). |
 | **`Permission denied` (systemd)** | `.env` should be readable by `ceoscan` (`root:ceoscan`, 640); the service also starts without it (systemd's `EnvironmentFile=` reads it as root), but CLI commands run with `sudo -u ceoscan` need it. `data/` and `config/` must be owned by `ceoscan`, and both directories must exist before the service starts. |

@@ -139,6 +139,8 @@ def global_flags(env: str) -> list[str]:
         ),
         (["test-alert"], {"command": "test-alert", "message": None}),
         (["test-alert", "--message", "hello phone"], {"command": "test-alert", "message": "hello phone"}),
+        (["test-desk"], {"command": "test-desk", "message": None}),
+        (["test-desk", "--message", "hello desk"], {"command": "test-desk", "message": "hello desk"}),
     ],
 )
 def test_parse_every_command(argv: list[str], expected: dict[str, Any]) -> None:

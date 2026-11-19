@@ -11,6 +11,9 @@ Overall status:
                  than ``ops.stream_down_alert_seconds`` (the same threshold as the stream-down alert);
 * ``degraded`` - reconnecting / backing off / starting, heartbeat stale, or the queue almost full;
 * ``ok``       - connected (stream) or polling, with fresh heartbeats.
+
+The ``claude_desk`` block reports the Claude analyst desk (enabled, configured, fires today, last fire,
+last error, queued, budget left this hour); it never affects the overall status.
 """
 
 from __future__ import annotations
@@ -21,15 +24,19 @@ import logging
 import sqlite3
 from datetime import datetime
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
 from .. import __version__
+from ..alerts.claude_desk import desk_health
 from ..config import Settings
 from ..models import IngestStatus
 from ..store import Store
 from ..timeutil import format_local, from_ms, local_day_start, now_utc
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..alerts.claude_desk import ClaudeDesk
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +124,8 @@ class HealthServer:
         settings: Settings,
         started_at: datetime,
         queue: asyncio.Queue | None = None,
+        desk: ClaudeDesk | None = None,
+        desk_problem: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -125,6 +134,9 @@ class HealthServer:
         self.settings = settings
         self.started_at = started_at
         self.queue = queue
+        #: the Claude analyst desk (set by the service once it exists) and why it is off, if it is
+        self.desk = desk
+        self.desk_problem = desk_problem
         self._runner: web.AppRunner | None = None
 
     # ------------------------------------------------------------------ snapshot
@@ -203,6 +215,10 @@ class HealthServer:
             },
             "last_post": self._last_post(now),
             "today": self._today(now),
+            "claude_desk": desk_health(
+                self.settings.claude_desk, self.store, self.desk, now, self.settings.alerts.timezone,
+                self.desk_problem,
+            ),
             "queue_size": queue_size,
             "uptime_seconds": round(max((now - self.started_at).total_seconds(), 0.0), 1),
             "version": __version__,

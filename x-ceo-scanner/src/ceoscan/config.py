@@ -224,12 +224,47 @@ class OpsSettings:
     config_error_action: str = "exit"
 
 
+#: The routine fire API's limit on the "text" field (platform.claude.com/docs/en/api/claude-code/routines-fire,
+#: checked 2026-11-19): longer text is a 400 invalid_request_error.
+DESK_TEXT_LIMIT = 65_536
+#: Per-scheduled-task API fire limit (shared with Run now); 100/hour per account across all tasks.
+DESK_TASK_FIRES_PER_HOUR = 30
+
+
+@dataclass
+class ClaudeDeskSettings:
+    """The Claude analyst desk: a Claude Code cloud scheduled task fired for strong post alerts.
+
+    Needs CLAUDE_DESK_FIRE_URL and CLAUDE_DESK_TOKEN in .env (see README "Claude analyst desk").
+    Decision support only: the desk never trades and ceoscan never connects to a brokerage.
+    """
+
+    enabled: bool = False
+    min_score: int = 8  # fire for post alerts whose Claude impact is >= this
+    include_always_alert: bool = True  # also fire for always-alert accounts, whatever the score
+    # rules-only scores (Claude failed / offline) do not fire by default; with True they fire from
+    # min(min_score, scoring.fallback_max_impact), since the pipeline caps rules-only scores there
+    include_rules_only: bool = False
+    skip_late: bool = True  # never fire for late ("Missed during outage") catch-up alerts
+    batch_window_seconds: float = 45.0  # alerts arriving within this window share one fire (one run)
+    max_fires_per_hour: int = 20  # below the 30/hour per-task limit; extra alerts roll into the next fire
+    daily_review: bool = True  # one review run per day at ops.daily_summary.time
+    context_days: int = 7  # recent alerts for the same tickers / account sent along as context
+    max_text_chars: int = 60_000  # the API accepts up to 65,536 characters of text
+    timeout_seconds: float = 15.0  # one fire request
+    beta: str = "experimental-cc-routine-2026-04-01"  # anthropic-beta header ("" = do not send it)
+    api_version: str = "2023-06-01"  # anthropic-version header (the endpoint accepts 2023-06-01 and later)
+    notify_link: bool = False  # true = extra low-priority push with the analysis session link per fire
+    queue_max: int = 200  # alerts waiting for the desk, also while held; when full the lowest-scored is dropped
+
+
 @dataclass
 class Settings:
     x_api: XApiSettings = field(default_factory=XApiSettings)
     scoring: ScoringSettings = field(default_factory=ScoringSettings)
     alerts: AlertSettings = field(default_factory=AlertSettings)
     ops: OpsSettings = field(default_factory=OpsSettings)
+    claude_desk: ClaudeDeskSettings = field(default_factory=ClaudeDeskSettings)
 
 
 def _did_you_mean(key: Any, allowed: typing.Iterable[str]) -> str:
@@ -465,6 +500,30 @@ def _settings_problems(s: Settings) -> list[str]:
     at_least(ops.pipeline_workers, 1, "ops.pipeline_workers")
     at_least(ops.queue_max, 0, "ops.queue_max")
     one_of(ops.config_error_action, ("exit", "wait"), "ops.config_error_action", env="CEOSCAN_CONFIG_ERROR_ACTION")
+
+    d = s.claude_desk
+    between(d.min_score, 1, 10, "claude_desk.min_score")
+    between(d.batch_window_seconds, 0, 600, "claude_desk.batch_window_seconds")
+    if not 1 <= d.max_fires_per_hour <= DESK_TASK_FIRES_PER_HOUR:
+        p.append(
+            f"claude_desk.max_fires_per_hour must be 1-{DESK_TASK_FIRES_PER_HOUR} (a scheduled task accepts "
+            f"{DESK_TASK_FIRES_PER_HOUR} fires per hour, shared with Run now; got {d.max_fires_per_hour!r})"
+        )
+    between(d.context_days, 0, 90, "claude_desk.context_days")
+    if not 2000 <= d.max_text_chars <= DESK_TEXT_LIMIT:
+        p.append(
+            f"claude_desk.max_text_chars must be 2000-{DESK_TEXT_LIMIT} (the fire API rejects text longer than "
+            f"{DESK_TEXT_LIMIT:,} characters; got {d.max_text_chars!r})"
+        )
+    if not 0 < d.timeout_seconds <= 120:
+        p.append(f"claude_desk.timeout_seconds must be > 0 and <= 120 (got {d.timeout_seconds!r})")
+    if not re.match(r"^[a-z0-9][a-z0-9._-]{0,99}$|^$", d.beta or ""):
+        p.append(f"claude_desk.beta must be a beta header value such as experimental-cc-routine-2026-04-01 or "
+                 f'"" (got {d.beta!r})')
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", d.api_version or "") or d.api_version < "2023-06-01":
+        p.append(f"claude_desk.api_version must be a date such as 2023-06-01 (2023-06-01 or later; got "
+                 f"{d.api_version!r})")
+    between(d.queue_max, 1, 10_000, "claude_desk.queue_max")
     return p
 
 
@@ -721,6 +780,8 @@ SECRET_ENV_VARS = (
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
     "SMTP_PASSWORD",
+    "CLAUDE_DESK_FIRE_URL",
+    "CLAUDE_DESK_TOKEN",
 )
 
 
@@ -742,6 +803,9 @@ class Secrets:
     smtp_password: str | None = None
     email_from: str | None = None
     email_to: str | None = None
+    # Claude analyst desk (a Claude Code scheduled task's API trigger): the Fire URL and its token
+    claude_desk_fire_url: str | None = None
+    claude_desk_token: str | None = None
 
     def __repr__(self) -> str:  # never print secret values
         present = [f.name for f in fields(self) if isinstance(getattr(self, f.name), str) and getattr(self, f.name)]
@@ -761,6 +825,9 @@ class Secrets:
             "twilio_account_sid",
             "twilio_auth_token",
             "smtp_password",
+            "claude_desk_token",
+            # Not a credential on its own, but it names the scheduled task: kept out of logs as well.
+            "claude_desk_fire_url",
         )
         return [v for n in names if (v := getattr(self, n)) and len(v) >= 6]
 
@@ -790,6 +857,8 @@ def load_secrets() -> Secrets:
         smtp_password=clean("SMTP_PASSWORD"),
         email_from=clean("ALERT_EMAIL_FROM"),
         email_to=clean("ALERT_EMAIL_TO"),
+        claude_desk_fire_url=clean("CLAUDE_DESK_FIRE_URL"),
+        claude_desk_token=clean("CLAUDE_DESK_TOKEN"),
     )
 
 

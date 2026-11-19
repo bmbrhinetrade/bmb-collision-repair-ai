@@ -11,6 +11,8 @@ Commands:
 * ``replay FILE [--claude] [--send] [--keep-times] [--db PATH]``  saved posts through the pipeline
                               without contacting X (offline, no secrets needed)
 * ``test-alert [--message TEXT]``  send a system alert through every configured channel
+* ``test-desk [--message TEXT]``   fire the Claude analyst desk once (kind "test") and print the
+                              session link (needs CLAUDE_DESK_FIRE_URL + CLAUDE_DESK_TOKEN)
 
 Global flags (before the command): ``--settings``, ``--watchlist``, ``--env``.
 
@@ -39,6 +41,7 @@ from typing import Any
 import aiohttp
 
 from . import __version__
+from .alerts.claude_desk import DeskClient, build_test_text, check_desk_secrets, fire_with_retries, rejection_hint
 from .alerts.dispatcher import AlertDispatcher, build_dispatcher
 from .alerts.format import format_system_alert
 from .alerts.notifiers import Notifier
@@ -60,7 +63,7 @@ from .ops.cost import estimate_monthly_cost, format_cost_estimate
 from .ops.health import HealthServer
 from .ops.scheduler import send_config_error_alert
 from .replay import run_replay
-from .store import Store
+from .store import DESK_FAILED, DESK_SENT, Store
 from .timeutil import now_utc
 from .xapi.access import AccessReport, check_access, format_access_report
 from .xapi.client import XApiError, XClient
@@ -92,6 +95,9 @@ TEST_ALERT_BODY = (
     "If you can read this, ceoscan alerts reach you on this channel. "
     "This is a test - not a market signal."
 )
+
+#: test-desk retries a 5xx / network failure after these pauses (the service uses 5 s and 20 s)
+TEST_DESK_RETRY_DELAYS = (2.0, 5.0)
 
 Handler = Callable[[AppConfig, argparse.Namespace], Coroutine[Any, Any, int]]
 
@@ -155,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("test-alert", help="send a test alert through every configured channel")
     p.add_argument("--message", metavar="TEXT", default=None, help="text of the test alert")
+
+    p = sub.add_parser(
+        "test-desk", help="fire the Claude analyst desk (Claude Code scheduled task) once with a test alert"
+    )
+    p.add_argument("--message", metavar="TEXT", default=None, help="a note to include in the test fire")
     return parser
 
 
@@ -444,6 +455,62 @@ async def cmd_test_alert(cfg: AppConfig, args: argparse.Namespace) -> int:
     return EXIT_OK if ok else EXIT_ERROR
 
 
+async def cmd_test_desk(cfg: AppConfig, args: argparse.Namespace) -> int:
+    """One fire of kind "test" now; prints the session link. 0 ok, 1 failure, 2 configuration problem."""
+    check = check_desk_secrets(cfg.secrets)
+    for warning in check.warnings:
+        print(f"warning: {warning}")
+    if check.problem is not None or not check.fire_url or not check.token:
+        _err(
+            f"error: {check.problem}. Put the scheduled task's Fire URL and token in .env as CLAUDE_DESK_FIRE_URL "
+            "and CLAUDE_DESK_TOKEN (see .env.example and the README section 'Claude analyst desk')."
+        )
+        return EXIT_CONFIG
+    d = cfg.settings.claude_desk
+    if not d.enabled:
+        print(
+            "note: claude_desk.enabled is false in the settings file - `run` does not fire the desk until you "
+            "set it to true. This test fires it anyway."
+        )
+    now = now_utc()
+    text = build_test_text(args.message, settings=d, tz=cfg.settings.alerts.timezone, now=now,
+                           my_tickers=cfg.watchlist.my_tickers)
+    print(f"Firing the Claude analyst desk once (kind test, {len(text):,} characters)...")
+    async with new_session() as session:
+        client = DeskClient(session, check.fire_url, check.token, d)
+        result, attempts = await fire_with_retries(client, text, TEST_DESK_RETRY_DELAYS)
+    try:  # best effort, like `verify`: the service's /health then shows the test as the last fire
+        store = Store(cfg.settings.ops.db_path)
+        try:
+            store.record_desk_fire(
+                "test", [], [], DESK_SENT if result.ok else DESK_FAILED, http_status=result.status,
+                session_id=result.session_id, session_url=result.session_url, error=result.error,
+                attempts=attempts, text_chars=len(text), fired_at=now,
+            )
+        finally:
+            store.close()
+    except (OSError, sqlite3.Error) as exc:
+        _err(f"warning: could not record the test fire in {cfg.settings.ops.db_path}: {_network_error(exc)}")
+    if result.ok:
+        print(f"OK: the scheduled task started a run (HTTP {result.status}, attempt {attempts}).")
+        print(f"Session: {result.session_url or '(the response had no session link)'}")
+        if result.error:
+            print(f"note: {result.error}")
+        print(
+            "The run takes about 1-5 minutes; its answer starts with a VERDICT line. Open the link to watch it. "
+            "Decision support only - ceoscan never trades."
+        )
+        return EXIT_OK
+    _err(f"error: the fire failed after {attempts} attempt(s): {result.error}")
+    if result.outcome == "rejected":
+        _err(f"  {rejection_hint(result.status)[1]}")
+        return EXIT_CONFIG if result.status in (400, 401, 403, 404) else EXIT_ERROR
+    if result.outcome == "rate_limited":
+        wait = f" in about {result.retry_after:.0f}s" if result.retry_after else " later"
+        _err(f"  The hourly fire limit was reached (30 per scheduled task, 100 per account); try again{wait}.")
+    return EXIT_ERROR
+
+
 def _config_problem_text(exc: BaseException) -> str:
     if isinstance(exc, ConfigError):
         return str(exc)
@@ -542,6 +609,7 @@ COMMANDS: dict[str, Handler] = {
     "cost": cmd_cost,
     "replay": cmd_replay,
     "test-alert": cmd_test_alert,
+    "test-desk": cmd_test_desk,
 }
 
 

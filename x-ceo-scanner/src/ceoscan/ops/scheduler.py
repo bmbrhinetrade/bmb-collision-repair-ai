@@ -11,6 +11,10 @@
   the evening does not send a stale summary. kv ``last_daily_summary`` is set only after a channel
   delivered it; a failed send is retried every 5 minutes while the window is open (the attempt
   time is kept in kv ``daily_summary_attempt``, so restarts do not resend on every start).
+* Claude analyst desk daily review (``claude_desk.daily_review``, only when the desk is running): in the
+  same window as the daily summary and after it (once it was sent or tried, or right away when the
+  summary is disabled), at most once per local date (kv ``last_daily_review``, set before the fire is
+  queued, so a restart never repeats it).
 * :func:`send_config_error_alert`: at most one "ceoscan stopped: configuration problem" alert per
   distinct problem for ``run`` when even the configuration cannot be loaded (kv
   ``config_problem_alert``, shared with ``app.Service``), so a restart loop can never spam the phone.
@@ -35,12 +39,14 @@ from ..store import Store
 from ..timeutil import format_local, local_day_start, now_utc, parse_hhmm
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..alerts.claude_desk import ClaudeDesk
     from ..alerts.dispatcher import AlertDispatcher
 
 logger = logging.getLogger(__name__)
 
 KV_LAST_DAILY_SUMMARY = "last_daily_summary"
 KV_DAILY_SUMMARY_ATTEMPT = "daily_summary_attempt"
+KV_LAST_DAILY_REVIEW = "last_daily_review"
 KV_CONFIG_ERROR_ALERT = "config_problem_alert"  # shared with app.Service (same {"hash", "at"} format)
 CONFIG_ERROR_ALERT_TITLE = "ceoscan stopped: configuration problem"
 CONFIG_ERROR_ALERT_REPEAT = timedelta(hours=24)
@@ -191,6 +197,7 @@ class OpsScheduler:
         dispatcher: AlertDispatcher,
         clock: Callable[[], datetime] = now_utc,
         started_at: datetime | None = None,
+        desk: ClaudeDesk | None = None,
     ) -> None:
         self.cfg = cfg
         self.settings = cfg.settings
@@ -198,6 +205,8 @@ class OpsScheduler:
         self.status = status
         self.dispatcher = dispatcher
         self.clock = clock
+        #: Claude analyst desk (None = off): gets the daily review fire after the daily summary
+        self.desk = desk
         #: when this service started collecting posts (the cost projection only uses data since then)
         self.started_at = started_at or clock()
         self._down_alert_since: datetime | None = None  # outage we alerted (or tried to alert) about
@@ -221,7 +230,7 @@ class OpsScheduler:
         )
         while not stop.is_set():
             now = self.clock()
-            for check in (self.check_stream_down, self.maybe_send_daily_summary):
+            for check in (self.check_stream_down, self.maybe_send_daily_summary, self.maybe_fire_daily_review):
                 try:
                     await check(now)
                 except asyncio.CancelledError:
@@ -473,6 +482,34 @@ class OpsScheduler:
             )
         return rec
 
+    async def maybe_fire_daily_review(self, now: datetime) -> bool:
+        """Queue the Claude desk's daily review once per local date, after the daily summary.
+
+        Same window as the summary (``ops.daily_summary.time`` + 60 min). It waits for today's summary to
+        be sent or at least tried (the review reads the same numbers); with the summary disabled it goes
+        at the scheduled time. kv ``last_daily_review`` is written before queueing: at most once a day,
+        even across restarts. True when the review was queued.
+        """
+        desk = self.desk
+        if desk is None or not self.settings.claude_desk.daily_review:
+            return False
+        scheduled = self._scheduled_at(now)
+        local = now.astimezone(scheduled.tzinfo)
+        if not scheduled <= local < scheduled + SUMMARY_WINDOW:
+            return False
+        day = local.date().isoformat()
+        if self.store.kv_get(KV_LAST_DAILY_REVIEW) == day:
+            return False
+        if self.settings.ops.daily_summary.enabled:
+            summary_done = self.store.kv_get(KV_LAST_DAILY_SUMMARY) == day
+            if not summary_done and self._summary_attempt().get("day") != day:
+                return False  # the summary goes first
+        self.store.kv_set(KV_LAST_DAILY_REVIEW, day)
+        queued = desk.submit_daily_review(now)
+        self._log_event("desk_daily_review", f"{day}: queued={queued}", "info" if queued else "warning")
+        logger.info("ops: Claude desk daily review for %s %s", day, "queued" if queued else "NOT queued")
+        return queued
+
     def _projection(self, now: datetime) -> tuple[float | None, str]:
         """Projected monthly X cost from the posts received in the last 24 h of this service's run.
 
@@ -509,6 +546,8 @@ class OpsScheduler:
         errors = int(stats.get("errors") or 0)
         score_errors = int(stats.get("score_errors") or 0)
         stream_errors = int(stats.get("stream_errors") or 0)
+        desk_fires = int(stats.get("desk_fires") or 0)
+        desk_errors = int(stats.get("desk_errors") or 0)
         avg_ms, max_ms = stats.get("avg_latency_ms"), stats.get("max_latency_ms")
 
         error_kinds: list[str] = []
@@ -547,6 +586,10 @@ class OpsScheduler:
             f"Latency: {latency}",
             score_line,
             f"Stream errors: {stream_errors}",
+        ]
+        if self.settings.claude_desk.enabled or desk_fires or desk_errors:
+            body_lines.append(f"Claude desk: {desk_fires} analyses ({desk_errors} failed)")
+        body_lines += [
             f"Errors: {errors_line}" if errors else "Errors: none",
             f"Ingest: {st.mode} / {st.state}, {st.reconnects} reconnect(s) since start",
             (

@@ -11,6 +11,7 @@ import json
 import sqlite3
 import threading
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -98,7 +99,28 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Claude analyst desk: one row per fire of the Claude Code scheduled task (or per dropped batch).
+-- Never holds secrets: no token, no fire URL, no request headers.
+CREATE TABLE IF NOT EXISTS desk_fires (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fired_at_ms INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    post_ids    TEXT,
+    tickers     TEXT,
+    status      TEXT NOT NULL,
+    http_status INTEGER,
+    session_id  TEXT,
+    session_url TEXT,
+    error       TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    text_chars  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_desk_fires_at ON desk_fires(fired_at_ms);
 """
+
+#: desk_fires.status values
+DESK_SENT, DESK_FAILED, DESK_DROPPED = "sent", "failed", "dropped"
 
 #: Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` does not touch an existing
 #: table, so databases created by an older version get these with ``ALTER TABLE ... ADD COLUMN`` on open.
@@ -114,6 +136,11 @@ INGEST_ERROR_KINDS: tuple[str, ...] = ("stream_error", "poll_error")
 #: posts.source of posts fetched by gap / restart catch-up: their alerts measure the catch-up, not the
 #: live post -> phone path, so they are left out of the latency statistics
 CATCH_UP_SOURCE = "recovery"
+
+
+def _like_escape(text: str) -> str:
+    """``text`` for a LIKE pattern with ESCAPE '\\': %, _ and the escape character match literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class Store:
@@ -374,6 +401,128 @@ class Store:
                 (key, value),
             )
 
+    # ------------------------------------------------------------------ Claude analyst desk
+
+    def record_desk_fire(
+        self,
+        kind: str,
+        post_ids: list[str],
+        tickers: list[str],
+        status: str,
+        *,
+        http_status: int | None = None,
+        session_id: str | None = None,
+        session_url: str | None = None,
+        error: str | None = None,
+        attempts: int = 0,
+        text_chars: int | None = None,
+        fired_at: datetime | None = None,
+    ) -> int:
+        with self._lock:
+            cur = self._db.execute(
+                """INSERT INTO desk_fires (fired_at_ms, kind, post_ids, tickers, status, http_status, session_id,
+                   session_url, error, attempts, text_chars) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    to_ms(fired_at or now_utc()),
+                    kind,
+                    json.dumps(list(post_ids)),
+                    json.dumps(list(tickers)),
+                    status,
+                    http_status,
+                    session_id,
+                    session_url,
+                    (error or None) and str(error)[:500],
+                    int(attempts),
+                    text_chars,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def desk_fires(self, since: datetime | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Desk fires (newest first), post_ids / tickers decoded."""
+        q = "SELECT * FROM desk_fires"
+        args: list[Any] = []
+        if since is not None:
+            q += " WHERE fired_at_ms >= ?"
+            args.append(to_ms(since))
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(int(limit))
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(q, args).fetchall()]
+        for row in rows:
+            for key in ("post_ids", "tickers"):
+                try:
+                    value = json.loads(row.get(key) or "[]")
+                except ValueError:
+                    value = []
+                row[key] = [str(v) for v in value] if isinstance(value, list) else []
+        return rows
+
+    def desk_sent_times_ms(self, since: datetime) -> list[int]:
+        """fired_at_ms of every successful desk fire since ``since`` (oldest first): the hourly budget."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT fired_at_ms FROM desk_fires WHERE fired_at_ms >= ? AND status = ? ORDER BY fired_at_ms",
+                (to_ms(since), DESK_SENT),
+            ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def post_alerts_since(
+        self,
+        since: datetime,
+        *,
+        min_score: int | None = None,
+        limit: int = 500,
+        newest_first: bool = False,
+        tickers: Iterable[str] | None = None,
+        author_ids: Iterable[str] | None = None,
+        exclude_post_ids: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Delivered post alerts since ``since`` with the post's author, reason and text.
+
+        Oldest first, or newest first with ``newest_first`` (``limit`` applies in that order, so
+        ``newest_first=True`` returns the newest ``limit`` alerts). With ``tickers`` and/or ``author_ids``
+        only alerts that name one of the tickers or come from one of the authors are returned.
+
+        Keys: post_id, created_at_ms (alert), score, direction, tickers (list), late, author_id,
+        author_username, reason, text, post_created_at_ms. Used by the Claude desk for context and the
+        daily review.
+        """
+        q = """SELECT a.post_id, a.created_at_ms, a.score, a.direction, a.tickers, a.late, p.author_id,
+                      p.author_username, p.reason, p.text, p.created_at_ms AS post_created_at_ms
+               FROM alerts a LEFT JOIN posts p ON p.id = a.post_id
+               WHERE a.kind = 'post' AND a.sent_ok = 1 AND a.created_at_ms >= ?"""
+        args: list[Any] = [to_ms(since)]
+        if min_score is not None:
+            q += " AND a.score >= ?"
+            args.append(int(min_score))
+        if tickers is not None or author_ids is not None:
+            match: list[str] = []
+            for t in dict.fromkeys(str(t) for t in tickers or ()):
+                match.append("a.tickers LIKE ? ESCAPE '\\'")  # alerts.tickers is a JSON list: ["TSLA", ...]
+                args.append(f"%{_like_escape(json.dumps(t))}%")
+            ids = list(dict.fromkeys(str(i) for i in author_ids or ()))
+            if ids:
+                match.append(f"p.author_id IN ({','.join('?' for _ in ids)})")
+                args.extend(ids)
+            q += f" AND ({' OR '.join(match)})" if match else " AND 0"
+        excluded = list(dict.fromkeys(str(i) for i in exclude_post_ids or ()))
+        if excluded:
+            q += f" AND a.post_id NOT IN ({','.join('?' for _ in excluded)})"
+            args.extend(excluded)
+        order = " DESC" if newest_first else ""
+        q += f" ORDER BY a.created_at_ms{order}, a.id{order} LIMIT ?"
+        args.append(int(limit))
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(q, args).fetchall()]
+        for row in rows:
+            try:
+                tickers = json.loads(row.get("tickers") or "[]")
+            except ValueError:
+                tickers = []
+            row["tickers"] = [str(t) for t in tickers] if isinstance(tickers, list) else []
+        return rows
+
     # ------------------------------------------------------------------ stats
 
     def stats_since(self, since: datetime) -> dict[str, Any]:
@@ -387,6 +536,8 @@ class Store:
           error text in ``last_score_error``.
         * ``stream_errors``: X ingest problems (``events.kind`` in :data:`INGEST_ERROR_KINDS`, any level).
         * ``errors``: events with level 'error'.
+        * ``desk_fires``: Claude analyst desk runs started (fires answered 200); ``desk_errors``: fires that
+          failed or alerts that were dropped before a fire.
         """
         ms = to_ms(since)
         kinds = ",".join("?" for _ in INGEST_ERROR_KINDS)
@@ -427,6 +578,11 @@ class Store:
                 f"SELECT COUNT(*) FROM events WHERE ts_ms >= ? AND kind IN ({kinds})",
                 (ms, *INGEST_ERROR_KINDS),
             ).fetchone()[0]
+            desk_sent, desk_errors = self._db.execute(
+                """SELECT COALESCE(SUM(status = ?), 0), COALESCE(SUM(status != ?), 0) FROM desk_fires
+                   WHERE fired_at_ms >= ?""",
+                (DESK_SENT, DESK_SENT, ms),
+            ).fetchone()
         return {
             "posts": posts,
             "flagged": flagged,
@@ -440,4 +596,6 @@ class Store:
             "score_errors": score_errors,
             "last_score_error": last_score_error[0] if last_score_error else None,
             "stream_errors": stream_errors,
+            "desk_fires": int(desk_sent),
+            "desk_errors": int(desk_errors),
         }
