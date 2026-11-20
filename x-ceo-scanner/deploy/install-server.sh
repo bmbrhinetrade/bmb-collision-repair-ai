@@ -105,8 +105,10 @@ case "$ARCH" in
     *) die "unsupported CPU architecture: $ARCH" ;;
 esac
 
-apt_get() {  # sudo drops DEBIAN_FRONTEND, so pass it through env; wait up to 10 min for the apt lock
-    $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 "$@"
+apt_get() {  # sudo drops DEBIAN_FRONTEND, so pass it through env; wait up to 10 min for the apt lock.
+    # NEEDRESTART_MODE=l: only list services that use updated libraries, never restart them (other
+    # apps on a shared server, e.g. a website, keep running untouched).
+    $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=600 "$@"
 }
 
 install_cli_plugin() {  # install_cli_plugin NAME URL
