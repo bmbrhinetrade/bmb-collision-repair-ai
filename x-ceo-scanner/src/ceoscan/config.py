@@ -118,7 +118,9 @@ class XApiSettings:
     expansions: list[str] = field(
         default_factory=lambda: ["author_id", "referenced_tweets.id", "referenced_tweets.id.author_id"]
     )
-    user_fields: list[str] = field(default_factory=lambda: ["username", "name", "verified", "public_metrics"])
+    user_fields: list[str] = field(
+        default_factory=lambda: ["username", "name", "verified", "verified_type", "public_metrics", "created_at", "parody"]
+    )
 
 
 @dataclass
@@ -287,6 +289,37 @@ class ClaudeDuetSettings:
 
 
 @dataclass
+class RedFlagSettings:
+    """Red flags and false news: early warning about bad news on X before it hits the headlines.
+
+    Bad news (short reports, fraud allegations, probes, lawsuits, recalls, downgrades, executive exits,
+    hacks) about my tickers alerts at a lower bar than other news, labeled with how credible the source
+    is: OFFICIAL / CREDIBLE / UNVERIFIED / LIKELY FALSE / DENIED. When several different accounts post
+    bad news about the same ticker within a window, a "spreading" alert goes out once; when a watched
+    company or CEO account denies a recent red flag, a "denied" alert goes out. Alerts only.
+    """
+
+    enabled: bool = True
+    min_score: int = 6  # red-flag posts about my tickers alert at Claude impact >= this (normal: scoring.threshold)
+    alert_unverified: bool = True  # also alert unverified bad news (labeled UNVERIFIED - could be false)
+    alert_likely_false: bool = True  # alert likely-false news too (labeled LIKELY FALSE: it can still move a stock)
+    spread_window_minutes: int = 60  # rolling window for the "spreading" detector
+    spread_min_authors: int = 3  # distinct authors posting red flags about one ticker within the window
+    spread_cooldown_minutes: int = 180  # at most one "spreading" alert per ticker per cooldown
+    denial_lookback_hours: int = 48  # a denial by a watched account links back to red flags this recent
+    suspicious_account_age_days: int = 90  # younger accounts posting bad news count as suspicious
+    established_min_followers: int = 50_000  # blue/business-verified and at least this many followers
+    trusted_min_followers: int = 1_000_000  # business/government-verified this big counts as a credible outlet
+    trusted_domains: list[str] = field(
+        default_factory=lambda: [
+            "sec.gov", "justice.gov", "ftc.gov", "fda.gov", "nhtsa.gov", "federalregister.gov", "courtlistener.com",
+            "reuters.com", "bloomberg.com", "wsj.com", "ft.com", "cnbc.com", "apnews.com", "nytimes.com",
+            "barrons.com", "marketwatch.com", "businesswire.com", "prnewswire.com", "globenewswire.com",
+        ]
+    )
+
+
+@dataclass
 class Settings:
     x_api: XApiSettings = field(default_factory=XApiSettings)
     scoring: ScoringSettings = field(default_factory=ScoringSettings)
@@ -294,6 +327,7 @@ class Settings:
     ops: OpsSettings = field(default_factory=OpsSettings)
     claude_desk: ClaudeDeskSettings = field(default_factory=ClaudeDeskSettings)
     claude_duet: ClaudeDuetSettings = field(default_factory=ClaudeDuetSettings)
+    red_flags: RedFlagSettings = field(default_factory=RedFlagSettings)
 
 
 def _did_you_mean(key: Any, allowed: typing.Iterable[str]) -> str:

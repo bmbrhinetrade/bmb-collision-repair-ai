@@ -166,7 +166,7 @@ def test_stream_params():
     assert p["tweet.fields"].split(",")[0] == "created_at"
     assert "note_tweet" in p["tweet.fields"]
     assert p["expansions"] == "author_id,referenced_tweets.id,referenced_tweets.id.author_id"
-    assert p["user.fields"] == "username,name,verified,public_metrics"
+    assert p["user.fields"] == "username,name,verified,verified_type,public_metrics,created_at,parody"
     assert "backfill_minutes" not in p
     s2 = XApiSettings(stream=StreamSettings(backfill_minutes=2))
     assert stream_params(s2)["backfill_minutes"] == "2"

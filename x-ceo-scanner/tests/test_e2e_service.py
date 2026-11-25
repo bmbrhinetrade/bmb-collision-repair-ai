@@ -638,6 +638,7 @@ async def test_claude_desk_fires_for_a_strong_alert_without_delaying_it(
                           claude_desk_fire_url="https://api.anthropic.com/v1/claude_code/routines/trig_01E2E/fire")
     d = cfg.settings.claude_desk
     d.enabled, d.include_rules_only, d.batch_window_seconds = True, True, 0.2  # scoring is offline in tests
+    d.daily_review = False  # otherwise a run near 18:00 PT also fires the daily review (wall-clock flake)
     store = Store(cfg.settings.ops.db_path)
     store.kv_set(KV_LAST_ALIVE, (now_utc() - timedelta(minutes=10)).isoformat())
     store.close()

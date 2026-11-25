@@ -14,6 +14,24 @@ ScoreSource = Literal["claude", "rules_fallback", "offline", "skipped"]
 PostSource = Literal["stream", "poll", "recovery", "replay"]
 Priority = Literal["low", "normal", "high", "urgent"]
 
+# Red flags / false news (see RedFlagSettings in config.py and the README section "Red flags and false news").
+RED_FLAG_TYPES: tuple[str, ...] = (
+    "short_report",  # short-seller report or public short position
+    "fraud_accounting",  # fraud allegations, accounting irregularities, restatement, auditor exit, going concern
+    "legal_regulatory",  # SEC/DOJ/FTC/state probes, subpoenas, Wells notices, lawsuits, charges, fines
+    "product_safety",  # recalls, safety defects, FDA warning letters, crashes
+    "financial_warning",  # guidance cut, profit warning, missed payments, bankruptcy, delisting, dilution
+    "executive",  # sudden CEO/CFO exit, misconduct, insider dumping
+    "analyst_downgrade",  # downgrade, price-target cut, initiation at sell
+    "security_incident",  # hack, data breach, outage
+    "account_compromise",  # a watched company/CEO account posting scam-like content (likely hijacked)
+    "other",
+)
+ClaimStatus = Literal["confirmed_official", "credible_report", "unverified", "likely_false", "denial", "not_applicable"]
+CredibilityLevel = Literal["official", "trusted", "established", "unverified", "suspicious"]
+Risk = Literal["low", "medium", "high"]
+SourceKind = Literal["short_seller", "regulator", "newswire", "journalist", "other"]
+
 
 # --------------------------------------------------------------------------- watchlist
 
@@ -49,6 +67,33 @@ class KeywordRule:
     est_posts_per_day: float = 50.0
     # Extra words / exact phrases OR-ed with the cashtags, e.g. ("Apnimed", "AD109", "Talen Energy").
     terms: tuple[str, ...] = ()
+    # A second OR-group that must ALSO match, e.g. red-flag words ("short report", lawsuit, recall).
+    require_any: tuple[str, ...] = ()
+    # Restrict the rule to these authors (numeric X user ids, resolved from the watchlist's `sources`).
+    from_ids: tuple[str, ...] = ()
+    # "keyword" (default), "red_flag" (tickers AND red-flag words) or "source" (sources AND tickers).
+    kind: Literal["keyword", "red_flag", "source"] = "keyword"
+
+
+@dataclass(frozen=True)
+class Source:
+    """An account watched ONLY for its posts that mention my tickers or companies (not all its posts).
+
+    Short sellers, regulators, fast news wires and journalists: where bad news often appears first.
+    Verified like accounts (`verify --write` stores the numeric user_id).
+    """
+
+    handle: str
+    kind: SourceKind = "other"
+    expect_name: str | None = None
+    user_id: str | None = None
+    trusted: bool = False  # regulators / established wires: what they post counts as a credible report
+    est_posts_per_day: float = 2.0  # matching posts only (for the cost estimate)
+    notes: str = ""
+
+    @property
+    def handle_lower(self) -> str:
+        return self.handle.lower()
 
 
 @dataclass(frozen=True)
@@ -57,9 +102,13 @@ class Watchlist:
     keyword_rules: tuple[KeywordRule, ...]
     my_tickers: tuple[str, ...]  # union of all tickers I care about (uppercase, no "$")
     company_names: dict[str, tuple[str, ...]]  # ticker -> names/aliases for fast rules
+    sources: tuple[Source, ...] = ()  # red-flag sources (see Source)
 
     def by_user_id(self) -> dict[str, Account]:
         return {a.user_id: a for a in self.accounts if a.user_id}
+
+    def sources_by_user_id(self) -> dict[str, Source]:
+        return {s.user_id: s for s in self.sources if s.user_id}
 
     def by_handle(self) -> dict[str, Account]:
         return {a.handle_lower: a for a in self.accounts}
@@ -91,6 +140,9 @@ class Post:
     author_name: str | None = None
     author_followers: int | None = None
     author_verified: bool | None = None
+    author_verified_type: str | None = None  # "blue" | "business" | "government" | "none"
+    author_created_at: datetime | None = None  # account creation time (UTC)
+    author_parody: bool | None = None
     conversation_id: str | None = None
     in_reply_to_user_id: str | None = None
     lang: str | None = None
@@ -165,6 +217,39 @@ class Score:
     error: str | None = None  # set when Claude failed and we fell back
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # Red flags / false news (Claude fills these; the rules-only fallback derives them from categories).
+    red_flag: bool = False  # the post reports or alleges a negative risk event for a company
+    red_flag_types: list[str] = field(default_factory=list)  # values from RED_FLAG_TYPES
+    claim_status: ClaimStatus = "not_applicable"
+    false_news_risk: Risk = "low"
+    credibility_note: str = ""  # one sentence: who says it and how believable it is
+
+
+@dataclass
+class Credibility:
+    """Who posted it and how believable the source is - computed in code from author metadata."""
+
+    level: CredibilityLevel
+    reasons: list[str] = field(default_factory=list)  # human readable, e.g. "business-verified, 2.1M followers"
+    is_official: bool = False  # the author is a watched company / CEO account
+    is_trusted_source: bool = False  # a trusted `sources` entry (regulator / wire) or a trusted link domain
+    source_kind: str | None = None  # Source.kind when the author is a listed source
+    possible_impersonation: bool = False  # display name / handle imitates a watched company or person
+    possible_compromise: bool = False  # a watched account posting scam-like content (likely hijacked)
+    link_domains: list[str] = field(default_factory=list)  # domains of links in the post (expanded urls)
+
+
+@dataclass
+class RedFlagSignal:
+    """What the red-flag tracker knows about one ticker's bad news around one alert."""
+
+    ticker: str
+    distinct_authors: int = 0  # distinct authors posting red flags about this ticker in the window
+    window_minutes: int = 60
+    spreading: bool = False  # distinct_authors reached red_flags.spread_min_authors
+    confirmed_by: list[str] = field(default_factory=list)  # official / trusted handles that reported it
+    denied_by: list[str] = field(default_factory=list)  # official handles that denied a recent red flag
+    related_post_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
