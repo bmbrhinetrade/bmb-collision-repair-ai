@@ -64,7 +64,7 @@ while [ $# -gt 0 ]; do
         --no-start) NO_START=1; shift ;;
         --only-install-docker) ONLY_DOCKER=1; shift ;;
         --update-x-token) UPDATE_X_TOKEN=1; shift ;;
-        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+        -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
