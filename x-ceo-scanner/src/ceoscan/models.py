@@ -25,12 +25,16 @@ RED_FLAG_TYPES: tuple[str, ...] = (
     "analyst_downgrade",  # downgrade, price-target cut, initiation at sell
     "security_incident",  # hack, data breach, outage
     "account_compromise",  # a watched company/CEO account posting scam-like content (likely hijacked)
+    "clinical_setback",  # failed trial / missed endpoint, FDA complete response letter, clinical hold
     "other",
 )
 ClaimStatus = Literal["confirmed_official", "credible_report", "unverified", "likely_false", "denial", "not_applicable"]
 CredibilityLevel = Literal["official", "trusted", "established", "unverified", "suspicious"]
 Risk = Literal["low", "medium", "high"]
 SourceKind = Literal["short_seller", "regulator", "newswire", "journalist", "other"]
+# "" = not a red-flag alert; "red_flag" = one bad-news post; "spreading" = several authors in a window;
+# "denial" = a watched account denies a recent red flag; "compromise" = a watched account looks hijacked.
+RedFlagKind = Literal["", "red_flag", "spreading", "denial", "compromise"]
 
 
 # --------------------------------------------------------------------------- watchlist
@@ -300,6 +304,11 @@ class AlertRecord:
     x_delay_ms: int | None = None  # post created -> we received it
     scoring_ms: int | None = None  # rules + Claude
     push_ms: int | None = None  # dispatch -> first successful channel
+    # Red flags / false news (empty / None for ordinary alerts)
+    red_flag_kind: RedFlagKind = ""
+    claim_status: str | None = None  # Score.claim_status of the alerted post
+    credibility: Credibility | None = None
+    red_flag_signal: RedFlagSignal | None = None
 
     @property
     def sent_ok(self) -> bool:
