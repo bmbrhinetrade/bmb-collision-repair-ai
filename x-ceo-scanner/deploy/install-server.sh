@@ -12,7 +12,8 @@
 #   2. adds 1 GB of swap on small servers (< 1.8 GB RAM) so the image build does not run out of memory
 #   3. downloads ceoscan into ~/ceoscan (or --dir)
 #   4. creates x-ceo-scanner/.env: asks for your X bearer token, Anthropic API key and Gmail App Password
-#      (typed input is hidden and never printed); keeps an existing .env
+#      (typed input is hidden and never printed); keeps an existing .env, but checks its X bearer token
+#      with X and asks for a new one if X rejects it (e.g. after "Regenerate" at console.x.com)
 #   5. builds the image, sends a test phone alert and a test Claude Duet email, starts ceoscan
 #      (restarts automatically after crashes and reboots) and shows its status
 #
@@ -21,6 +22,8 @@
 #   --ntfy-topic NAME   ntfy topic for phone pushes (default: a new random private topic)
 #   --dir PATH          install directory (default: ~/ceoscan)
 #   --branch NAME       git branch (default: claude/x-ceo-post-scanner-61tt30)
+#   --update-x-token    replace the X bearer token in an existing .env (asked hidden, checked with X),
+#                       e.g. after regenerating it at console.x.com; everything else in .env is kept
 #   --yes               no questions: secrets come from the environment variables X_BEARER_TOKEN,
 #                       ANTHROPIC_API_KEY and SMTP_PASSWORD; skips the "press Enter" pauses
 #   --only-install-docker   install git + Docker + Compose, then stop
@@ -37,6 +40,8 @@ SKIP_DOCKER_INSTALL=0
 SKIP_TESTS=0
 NO_START=0
 ONLY_DOCKER=0
+UPDATE_X_TOKEN=0
+RECREATE=0
 # Pinned Compose / Buildx plugin versions, used only where the OS has no package for them.
 COMPOSE_VERSION="v2.29.7"
 BUILDX_VERSION="v0.17.1"
@@ -58,7 +63,8 @@ while [ $# -gt 0 ]; do
         --skip-tests) SKIP_TESTS=1; shift ;;
         --no-start) NO_START=1; shift ;;
         --only-install-docker) ONLY_DOCKER=1; shift ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        --update-x-token) UPDATE_X_TOKEN=1; shift ;;
+        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
@@ -250,6 +256,41 @@ set_env_in() {  # set_env_in FILE KEY VALUE - replace or append KEY=VALUE (value
 }
 clean_secret() { printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 env_has() { grep -Eq "^$1=.+" .env 2>/dev/null; }
+env_get() { { grep "^$1=" .env 2>/dev/null || true; } | tail -n 1 | cut -d= -f2-; }  # the last one wins, as in Docker
+
+# X's HTTP status for TOKEN on a read-only call that reads no posts (lists the stream rules):
+# 200 = accepted, 401 = rejected, 000 = no answer. The token reaches curl on stdin as a config
+# line, never on its command line (where other users of the server could see it in `ps`).
+x_token_status() {
+    case "$1" in *[!A-Za-z0-9%._~+/=-]*|"") printf 'bad'; return 0 ;; esac
+    printf 'header = "Authorization: Bearer %s"\n' "$1" \
+        | curl -s -o /dev/null -w '%{http_code}' -m 20 -K - "https://api.x.com/2/tweets/search/stream/rules" 2>/dev/null \
+        || true
+}
+# read_x_token VAR "question": hidden prompt (up to 3 tries); a token X rejects is asked for again.
+read_x_token() {
+    local __out="$1" __question="$2" __tok="" __code="" __try
+    for __try in 1 2 3; do
+        ask_secret __tok "$__question" X_BEARER_TOKEN
+        __tok="$(clean_secret "$__tok")"
+        if [ -z "$__tok" ]; then
+            [ "$ASSUME_YES" -eq 1 ] && die "X_BEARER_TOKEN is empty (required with --yes)"
+            warn "nothing was received - try pasting again (attempt $__try of 3)"
+            continue
+        fi
+        __code="$(x_token_status "$__tok")"
+        case "$__code" in
+            200) info "X accepted this token"; break ;;
+            401|bad)
+                [ "$ASSUME_YES" -eq 1 ] && die "X rejects X_BEARER_TOKEN (copy the current Bearer Token from console.x.com)"
+                if [ "$__code" = "bad" ]; then warn "that does not look like an X bearer token (attempt $__try of 3)"
+                else warn "X rejects this token (HTTP 401) - copy the newest Bearer Token (attempt $__try of 3)"; fi
+                __tok="" ;;
+            *) warn "could not check the token with X right now (HTTP ${__code:-no answer}) - saving it anyway"; break ;;
+        esac
+    done
+    printf -v "$__out" '%s' "$__tok"
+}
 
 NEW_ENV=""
 trap '[ -n "$NEW_ENV" ] && rm -f "$NEW_ENV"' EXIT
@@ -257,6 +298,30 @@ if [ -f .env ] && env_has X_BEARER_TOKEN; then
     say "4/5 Keeping your existing .env (delete it and run this again to start over)"
     env_has CEOSCAN_UID || set_env_in .env CEOSCAN_UID "$RUN_UID"
     env_has CEOSCAN_GID || set_env_in .env CEOSCAN_GID "$RUN_GID"
+    # A token regenerated at console.x.com cancels the old one: check the saved token with X.
+    SAVED_X_STATUS="$(x_token_status "$(env_get X_BEARER_TOKEN)")"
+    case "$SAVED_X_STATUS" in
+        200) info "X accepts the saved X bearer token" ;;
+        401|bad) warn "X rejects the X bearer token saved in .env (it was probably regenerated at console.x.com)" ;;
+        *) info "could not check the saved X bearer token with X right now (HTTP ${SAVED_X_STATUS:-no answer})" ;;
+    esac
+    if [ "$UPDATE_X_TOKEN" -eq 1 ] || [ "$SAVED_X_STATUS" = "401" ] || [ "$SAVED_X_STATUS" = "bad" ]; then
+        if [ "$ASSUME_YES" -eq 1 ] && [ -z "${X_BEARER_TOKEN:-}" ]; then
+            [ "$UPDATE_X_TOKEN" -eq 1 ] && die "--update-x-token with --yes needs the X_BEARER_TOKEN environment variable"
+            warn "run this again with --update-x-token to enter the current token"
+        else
+            info "Enter the current X bearer token: console.x.com > your app > Keys and tokens > Bearer Token."
+            info "(Regenerating it there cancels the old one; copy the new one right away - X shows it only once.)"
+            info "Paste tip: in a browser terminal use the right mouse button or Ctrl+Shift+V (Cmd+V on a Mac)."
+            NEW_X_TOKEN=""
+            read_x_token NEW_X_TOKEN "New X bearer token"
+            [ -n "$NEW_X_TOKEN" ] || die "no valid X bearer token was entered; .env is unchanged - run this again with --update-x-token"
+            set_env_in .env X_BEARER_TOKEN "$NEW_X_TOKEN"
+            unset NEW_X_TOKEN
+            RECREATE=1
+            info "saved the new X bearer token in .env (the rest of .env is unchanged)"
+        fi
+    fi
 else
     if [ -f .env ]; then
         warn "the existing .env has no X bearer token (an earlier run stopped early?) - asking again"
@@ -285,13 +350,7 @@ else
     info "Paste tip: in a browser terminal use the right mouse button or Ctrl+Shift+V (Cmd+V on a Mac)."
     echo
     X_TOKEN=""; ANTH_KEY=""; APP_PW=""
-    for attempt in 1 2 3; do
-        ask_secret X_TOKEN "1. X bearer token" X_BEARER_TOKEN
-        X_TOKEN="$(clean_secret "$X_TOKEN")"
-        [ -n "$X_TOKEN" ] && break
-        [ "$ASSUME_YES" -eq 1 ] && die "X_BEARER_TOKEN is empty (required with --yes)"
-        warn "nothing was received - try pasting again (attempt $attempt of 3)"
-    done
+    read_x_token X_TOKEN "1. X bearer token"
     [ -n "$X_TOKEN" ] || die "the X bearer token is required; run this again when you have it"
     ask_secret ANTH_KEY "2. Anthropic API key (Enter to skip: rules-only scoring)" ANTHROPIC_API_KEY
     ask_secret APP_PW "3. Gmail App Password (Enter to skip: no Claude Duet emails)" SMTP_PASSWORD
@@ -366,7 +425,11 @@ fi
 
 if [ "$NO_START" -eq 0 ]; then
     info "starting ceoscan..."
-    $SUDO docker compose up -d
+    if [ "$RECREATE" -eq 1 ]; then
+        $SUDO docker compose up -d --force-recreate   # a container keeps the .env it started with
+    else
+        $SUDO docker compose up -d
+    fi
     health=""
     for _ in $(seq 1 30); do
         health="$(curl -s -m 3 "http://127.0.0.1:${HEALTH_PORT}/health" 2>/dev/null || true)"
@@ -389,7 +452,8 @@ cat <<EOF
     Useful commands (run them in $APP):
       sudo docker compose logs -f --tail 50      # live log (Ctrl-C to leave)
       curl -s 127.0.0.1:$HEALTH_PORT/health              # status
-      sudo docker compose restart ceoscan        # restart after editing .env or config/
+      sudo docker compose up -d --force-recreate # apply edits to .env or config/ ("restart" keeps the old .env)
+      bash deploy/install-server.sh --dir "$INSTALL_DIR" --update-x-token   # new X bearer token
       sudo docker compose down                   # stop
       bash deploy/install-server.sh --dir "$INSTALL_DIR"   # update to the newest version later
 

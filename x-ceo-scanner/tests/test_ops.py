@@ -385,6 +385,77 @@ async def test_credits_depleted_alert(cfg: AppConfig, store: Store) -> None:
     assert len(disp.sent) == 1
 
 
+@pytest.mark.parametrize(
+    "last_error",
+    [
+        "HTTP 401 Unauthorized: Unauthorized",  # the stream connect (what the server reported on Nov 24)
+        "stream rule sync failed: HTTP 401 Unauthorized: Unauthorized",  # rule sync at startup
+    ],
+)
+async def test_rejected_token_alert_says_how_to_fix_it(cfg: AppConfig, store: Store, last_error: str) -> None:
+    t0 = datetime(2026, 11, 25, 5, 19, 6, tzinfo=UTC)
+    status = IngestStatus(mode="stream", state="backoff", down_since=t0, last_error=last_error)
+    disp = FakeDispatcher()
+    sched = OpsScheduler(cfg, store, status, disp)  # type: ignore[arg-type]
+    rec = await sched.check_stream_down(t0 + timedelta(seconds=124))
+    assert rec is not None
+    assert rec.message.title == "X rejected the API key (HTTP 401) - update X_BEARER_TOKEN"
+    body = rec.message.body
+    assert "regenerated or revoked at console.x.com" in body
+    assert "bash x-ceo-scanner/deploy/install-server.sh --update-x-token" in body
+    assert body.rstrip().endswith(f"Last error: {last_error}")
+    assert rec.message.priority == "high"
+    assert len(rec.message.sms_text or "") <= 300
+    assert await sched.check_stream_down(t0 + timedelta(seconds=600)) is None  # still one alert per outage
+    status.state, status.down_since, status.last_error = "connected", None, None
+    rec = await sched.check_stream_down(t0 + timedelta(seconds=700))
+    assert rec is not None and "recovered" in rec.message.title
+    assert len(disp.sent) == 2
+
+
+@pytest.mark.parametrize(
+    "last_error",
+    [None, "HTTP 403 Forbidden: no access", "HTTP 503 Service Unavailable", "disconnected by X: HTTP 4010 x"],
+)
+async def test_other_errors_keep_the_plain_down_alert(cfg: AppConfig, store: Store, last_error: str | None) -> None:
+    t0 = datetime(2026, 11, 25, 5, 19, 6, tzinfo=UTC)
+    status = IngestStatus(mode="stream", state="backoff", down_since=t0, last_error=last_error)
+    disp = FakeDispatcher()
+    rec = await OpsScheduler(cfg, store, status, disp).check_stream_down(t0 + timedelta(seconds=124))  # type: ignore[arg-type]
+    assert rec is not None and rec.message.title == "X stream down"
+    assert "--update-x-token" not in rec.message.body
+
+
+async def test_credits_depleted_wins_over_a_401_text(cfg: AppConfig, store: Store) -> None:
+    t0 = datetime(2026, 11, 25, 5, 19, 6, tzinfo=UTC)
+    status = IngestStatus(mode="stream", state="credits_depleted", down_since=t0, last_error="HTTP 401 Unauthorized")
+    disp = FakeDispatcher()
+    rec = await OpsScheduler(cfg, store, status, disp).check_stream_down(t0 + timedelta(seconds=124))  # type: ignore[arg-type]
+    assert rec is not None and rec.message.title.startswith("X API credits depleted")
+
+
+def test_health_names_a_rejected_token(settings: Settings) -> None:
+    now = datetime(2026, 11, 25, 15, 0, tzinfo=UTC)
+    started = now - timedelta(hours=12)
+    hint = "X rejects the bearer token (HTTP 401): put the current token in .env (install-server.sh --update-x-token)"
+    e401 = "HTTP 401 Unauthorized"
+    long = IngestStatus(mode="stream", state="backoff", down_since=now - timedelta(hours=10), last_error=e401)
+    level, reasons = assess_health(long, settings, now, started)
+    assert level == "down" and reasons[1] == hint
+    short = IngestStatus(mode="stream", state="backoff", down_since=now - timedelta(seconds=10), last_error=e401)
+    level, reasons = assess_health(short, settings, now, started)
+    assert level == "degraded" and hint in reasons
+    other = IngestStatus(mode="stream", state="backoff", down_since=now - timedelta(hours=1), last_error="HTTP 503 x")
+    assert len(assess_health(other, settings, now, started)[1]) == 1
+
+
+def test_x_auth_rejected_matches_only_http_401() -> None:
+    assert IngestStatus(last_error="HTTP 401 Unauthorized: Unauthorized").x_auth_rejected()
+    assert IngestStatus(last_error="stream rule sync failed: HTTP 401 Unauthorized").x_auth_rejected()
+    for text in (None, "", "HTTP 403 Forbidden", "HTTP 4010 x", "HTTP 1401 x", "credits depleted: HTTP 402"):
+        assert not IngestStatus(last_error=text).x_auth_rejected()
+
+
 async def test_down_state_without_down_since_uses_first_observation(cfg: AppConfig, store: Store) -> None:
     t0 = datetime(2026, 11, 19, 20, 0, tzinfo=UTC)
     status = IngestStatus(mode="poll", state="credits_depleted")  # down_since never set

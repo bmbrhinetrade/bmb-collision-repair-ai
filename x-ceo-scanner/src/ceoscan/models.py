@@ -5,6 +5,7 @@ Keep this file dependency-free (stdlib only) so tests and tools can import it ch
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -320,6 +321,8 @@ class AlertRecord:
 
 # --------------------------------------------------------------------------- runtime status
 
+_HTTP_401_RE = re.compile(r"\bHTTP 401\b")
+
 
 @dataclass
 class IngestStatus:
@@ -337,3 +340,9 @@ class IngestStatus:
     poll_interval_seconds: float | None = None  # per-account cycle when polling
     estimated_latency_seconds: float | None = None
     notes: list[str] = field(default_factory=list)
+
+    def x_auth_rejected(self) -> bool:
+        """The last X error was HTTP 401: X refuses the bearer token (usually regenerated or revoked at
+        console.x.com - regenerating a token cancels the old one). ``last_error`` holds ``str(XApiError)``
+        ("HTTP 401 Unauthorized: ..."), optionally behind a prefix such as "stream rule sync failed: "."""
+        return bool(self.last_error and _HTTP_401_RE.search(self.last_error))

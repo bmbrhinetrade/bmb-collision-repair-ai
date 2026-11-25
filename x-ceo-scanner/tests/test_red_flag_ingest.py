@@ -353,14 +353,17 @@ def test_min_followers_zero_is_omitted_and_low_red_flag_threshold_warns() -> Non
     res = build_rules(wl, RulesSettings())
     assert any(w.startswith("red-flag rule 'rf' uses min_followers:0") for w in res.warnings)
     ok = replace(kw, min_followers=LOW_MIN_FOLLOWERS_WARNING)
-    assert not any("min_followers" in w for w in build_rules(Watchlist((), (ok,), ("TSLA",), {}), RulesSettings()).warnings)
+    warnings = build_rules(Watchlist((), (ok,), ("TSLA",), {}), RulesSettings()).warnings
+    assert not any("min_followers" in w for w in warnings)
 
 
 def _ids(n: int) -> tuple[str, ...]:
     return tuple(str(1_400_000_000_000_000_000 + i * 104_729) for i in range(n))
 
 
-@pytest.mark.parametrize(("n_ids", "n_tickers", "max_len"), [(1, 3, 1024), (40, 90, 1024), (25, 60, 512), (7, 200, 300)])
+@pytest.mark.parametrize(
+    ("n_ids", "n_tickers", "max_len"), [(1, 3, 1024), (40, 90, 1024), (25, 60, 512), (7, 200, 300)]
+)
 def test_two_dimensional_packing_covers_every_pair_once(n_ids: int, n_tickers: int, max_len: int) -> None:
     tickers = tuple(f"T{i:03d}" for i in range(n_tickers))
     kw = KeywordRule(

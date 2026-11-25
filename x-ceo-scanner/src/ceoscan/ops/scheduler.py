@@ -66,6 +66,8 @@ PROJECTION_WINDOW = timedelta(hours=24)
 HEALTHY_STATES = frozenset({"connected", "polling"})
 DOWN_STATES = frozenset({"down", "credits_depleted"})
 CONFIG_ERROR_STATE = "config_error"
+#: How to replace a rejected X bearer token on a server set up with deploy/install-server.sh (run in ~/ceoscan).
+AUTH_FIX_COMMAND = "bash x-ceo-scanner/deploy/install-server.sh --update-x-token"
 SMS_MAX_CHARS = 300
 SCORE_ERROR_CHARS = 120
 
@@ -336,9 +338,13 @@ class OpsScheduler:
         st = self.status
         tz = self.settings.alerts.timezone
         down_for = (now - down_since).total_seconds()
+        auth_rejected = st.state != "credits_depleted" and st.x_auth_rejected()
         if st.state == "credits_depleted":
             title = "X API credits depleted - add credits at console.x.com"
             cause = "X returned 402 (credits depleted)"
+        elif auth_rejected:
+            title = "X rejected the API key (HTTP 401) - update X_BEARER_TOKEN"
+            cause = "X refuses the bearer token in .env (HTTP 401)"
         else:
             title = f"X {self._ingest_label()} down"
             cause = f"state {st.state}"
@@ -346,6 +352,13 @@ class OpsScheduler:
             f"No connection to X for {format_duration(down_for)} (since {format_local(down_since, tz)}); {cause}.",
             "No post alerts can arrive until it reconnects; it keeps retrying automatically.",
         ]
+        if auth_rejected:
+            lines += [
+                "Usually the Bearer Token was regenerated or revoked at console.x.com (regenerating cancels the old"
+                " one). Put the current token on the server - in its ceoscan folder run:",
+                AUTH_FIX_COMMAND,
+                "(it asks for the token with hidden typing, checks it with X, saves it and restarts ceoscan).",
+            ]
         if st.last_error:
             lines.append(f"Last error: {st.last_error}")
         msg = _system_message(title, "\n".join(lines), "high")

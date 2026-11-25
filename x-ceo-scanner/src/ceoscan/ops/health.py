@@ -59,6 +59,11 @@ def _age(now: datetime, dt: datetime | None) -> float | None:
     return round(max((now - dt).total_seconds(), 0.0), 1) if dt is not None else None
 
 
+AUTH_REJECTED_REASON = (
+    "X rejects the bearer token (HTTP 401): put the current token in .env (install-server.sh --update-x-token)"
+)
+
+
 def assess_health(
     status: IngestStatus,
     settings: Settings,
@@ -85,10 +90,12 @@ def assess_health(
 
     if status.down_since is not None:
         down_for = max((now - status.down_since).total_seconds(), 0.0)
+        auth = [AUTH_REJECTED_REASON] if status.x_auth_rejected() else []
         if down_for > down_after:
-            return "down", [f"not connected for {down_for:.0f}s (> {down_after:.0f}s) - state {state}"]
+            return "down", [f"not connected for {down_for:.0f}s (> {down_after:.0f}s) - state {state}", *auth]
         level = "degraded"
         reasons.append(f"not connected for {down_for:.0f}s - state {state}")
+        reasons.extend(auth)
     elif state == "down":
         return "down", [status.last_error or "ingest is down"]
     elif state == "starting":
