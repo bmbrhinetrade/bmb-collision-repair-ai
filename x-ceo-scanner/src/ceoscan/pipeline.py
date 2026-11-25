@@ -23,6 +23,29 @@ off and run each through the same steps:
    alerts/duet_feed.py: an email to the inbox Claude Duet reads). Both calls only queue the alert; the
    push never waits for them.
 
+Red flags (``red_flags.enabled``): before scoring, the author's credibility is assessed in code
+(scoring/credibility.py) and passed to the scorer with what the red-flag tracker already knows about the
+tickers (redflag_tracker.py). After scoring, one of four red-flag outcomes can replace the ordinary decision;
+each is still ONE alert per post (recorded as kind "post" with that post's id and ``red_flag_kind``):
+
+* ``compromise`` - a watched account posted scam-like crypto content: "may be HACKED - do not act on this
+  post", high priority, ignores quiet hours. When Claude scored the post and the signals are not definitive
+  (hype words or a look-alike link, no wallet address or memecoin link), Claude must agree (account_compromise)
+  or the post is handled as the official post it is ("You can now send USDC to anyone" is a feature launch);
+* ``denial`` - a watched account denies recent red flags about its OWN tickers: "DENIED by @x", links back. A post
+  that is itself a red flag is never a denial;
+* ``spreading`` - this bad-news post is the one that makes ``red_flags.spread_min_authors`` distinct accounts
+  within the window: "Bad news spreading" with the strongest claim label in the window, once per ticker per
+  cooldown, even if this post alone would not alert; skipped when every post in the window is a claim whose
+  alerts are turned off (``alert_unverified`` / ``alert_likely_false``);
+* ``red_flag`` - bad news about my tickers alerts at ``red_flags.min_score`` with a claim badge; during quiet hours
+  below ``quiet_hours_threshold`` it is delivered silently instead of dropped.
+
+Before deciding, the score's claim status is capped by the credibility computed in code
+(scoring/credibility.py ``clamp_claim``): only the watched account itself, about its own tickers, is CONFIRMED.
+Claims capped at UNVERIFIED / LIKELY FALSE never trigger the dispatcher's score-based wake-ups beyond what their
+priority cap allows (no Pushover priority 1 for a rumor, no SMS for a likely-false claim).
+
 Late posts (``received_at - created_at > alerts.max_post_age_seconds``: outage / restart catch-up) are
 stored and scored like any other, but alert at most at "normal" priority with a "Missed during outage"
 title, never by SMS, and their alerts are flagged ``late`` so they stay out of the latency stats.
@@ -39,31 +62,48 @@ Post text is untrusted. It is only stored, passed to the scorer as data, and dis
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from .alerts.decision import decide, format_age, is_late, post_age_seconds
+from .alerts.decision import (
+    CLAIM_PRIORITY_CAP,
+    decide,
+    decide_compromise,
+    decide_denial,
+    decide_red_flag,
+    decide_spreading,
+    format_age,
+    is_late,
+    post_age_seconds,
+    strongest_claim,
+)
 from .alerts.dispatcher import AlertDispatcher
-from .alerts.format import RULES_ONLY_SOURCES, format_post_alert
+from .alerts.format import RULES_ONLY_SOURCES, format_post_alert, format_red_flag_alert
 from .config import TICKER_RE, AppConfig
 from .models import (
     Account,
     AlertRecord,
     ChannelResult,
+    Credibility,
     Decision,
     IngestItem,
     IngestStatus,
     Post,
+    RedFlagSignal,
     ReferencedPost,
     RuleResult,
     Score,
+    Source,
     Watchlist,
 )
+from .redflag_tracker import RedFlagTracker
 from .scoring.claude import fallback_score
+from .scoring.credibility import assess_credibility, clamp_claim, compromise_check, without_compromise
 from .scoring.rules import FastRules
 from .store import CATCH_UP_SOURCE, Store
 from .timeutil import now_utc, snowflake_to_datetime
@@ -85,7 +125,11 @@ _DIRECTIONAL = ("bullish", "bearish")
 
 
 class Scorer(Protocol):
-    """What the pipeline needs from ClaudeScorer / OfflineScorer."""
+    """What the pipeline needs from ClaudeScorer / OfflineScorer.
+
+    ``credibility`` / ``signal`` (keyword-only) are passed only to scorers whose ``score`` accepts them (red
+    flags on): the author's credibility and the bad news already seen about the post's tickers.
+    """
 
     async def score(
         self,
@@ -94,7 +138,24 @@ class Scorer(Protocol):
         rules: RuleResult,
         my_tickers: tuple[str, ...],
         tz: str,
+        *,
+        credibility: Credibility | None = None,
+        signal: RedFlagSignal | None = None,
     ) -> Score: ...
+
+
+def accepts_kwargs(fn: Any, *names: str) -> bool:
+    """True if ``fn`` can be called with all keyword arguments ``names`` (or takes ``**kwargs``)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return all(
+        n in params and params[n].kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        for n in names
+    )
 
 
 # --------------------------------------------------------------------------- parsing
@@ -177,11 +238,12 @@ def _mentions(entity_sets: list[dict[str, Any]]) -> list[str]:
 
 
 def _urls(entity_sets: list[dict[str, Any]]) -> list[str]:
+    """Expanded link targets: unwound_url (final destination after redirects) > expanded_url > url."""
     urls: list[str] = []
     for ents in entity_sets:
         for u in _list(ents.get("urls")):
             d = _dict(u)
-            url = _opt_str(d.get("expanded_url")) or _opt_str(d.get("url"))
+            url = _opt_str(d.get("unwound_url")) or _opt_str(d.get("expanded_url")) or _opt_str(d.get("url"))
             if url:
                 urls.append(url)
     return _dedupe(urls)
@@ -190,6 +252,25 @@ def _urls(entity_sets: list[dict[str, Any]]) -> list[str]:
 def _followers(user: dict[str, Any]) -> int | None:
     n = _dict(user.get("public_metrics")).get("followers_count")
     return n if isinstance(n, int) and not isinstance(n, bool) else None
+
+
+_VERIFIED_TYPES = ("blue", "business", "government", "none")
+
+
+def _verified_type(user: dict[str, Any]) -> str | None:
+    vt = _opt_str(user.get("verified_type"))
+    return vt.lower() if vt and vt.lower() in _VERIFIED_TYPES else None
+
+
+def _iso_utc(value: Any) -> datetime | None:
+    """An X ISO timestamp ("2009-06-02T20:12:29.000Z") as an aware UTC datetime, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 def _created_at(post_id: str, data: dict[str, Any]) -> datetime:
@@ -283,6 +364,9 @@ def _payload_to_post(payload: Any, received_at: datetime, source: str, watchlist
         author_name=_opt_str(author.get("name")),
         author_followers=_followers(author),
         author_verified=author.get("verified") if isinstance(author.get("verified"), bool) else None,
+        author_verified_type=_verified_type(author),
+        author_created_at=_iso_utc(author.get("created_at")),
+        author_parody=author.get("parody") if isinstance(author.get("parody"), bool) else None,
         conversation_id=_id_str(data.get("conversation_id")),
         in_reply_to_user_id=_id_str(data.get("in_reply_to_user_id")),
         lang=lang if isinstance(lang, str) and lang else None,
@@ -332,6 +416,18 @@ Outcome = Literal["malformed", "duplicate", "no_alert", "edit_skipped", "alert",
 
 
 @dataclass
+class RedFlagOutcome:
+    """What the red-flag checks decided for one post (see the module docstring)."""
+
+    kind: Literal["red_flag", "spreading", "denial", "compromise"]
+    decision: Decision
+    signal: RedFlagSignal | None = None
+    related: list[dict[str, Any]] = field(default_factory=list)  # tracker events behind spreading / denial
+    impact: int | None = None  # the alert's score when it differs from the post's (spreading: the window max)
+    compromise_signals: tuple[str, ...] = ()
+
+
+@dataclass
 class HandleResult:
     """Everything the pipeline learned about one ingest item (used by replay and tests)."""
 
@@ -343,6 +439,8 @@ class HandleResult:
     decision: Decision | None = None
     alert: AlertRecord | None = None
     detail: str = ""
+    credibility: Credibility | None = None
+    red_flag: RedFlagOutcome | None = None
 
 
 def _ms(seconds: float) -> int:
@@ -379,6 +477,7 @@ class Pipeline:
         clock: Callable[[], datetime] = now_utc,
         desk: ClaudeDesk | None = None,
         duet: DuetFeed | None = None,
+        red_flags: RedFlagTracker | None = None,
     ) -> None:
         self.cfg = cfg
         self.settings = cfg.settings
@@ -399,6 +498,16 @@ class Pipeline:
         self._by_handle = cfg.watchlist.by_handle()
         self._my_tickers_upper = frozenset(t.upper() for t in self.my_tickers)
         self._drain_deadline: float | None = None
+        #: red flags: per-ticker bad-news window, denials and hijack cooldowns (persisted in the store)
+        self.red_flags = (
+            red_flags
+            if red_flags is not None
+            else RedFlagTracker(store, cfg.settings.red_flags, self.my_tickers, clock=clock)
+        )
+        self._sources_by_id = cfg.watchlist.sources_by_user_id()
+        self._sources_by_handle = {s.handle_lower: s for s in cfg.watchlist.sources}
+        # third-party / test scorers may not take the red-flag keyword arguments
+        self._scorer_takes_red_flags = accepts_kwargs(getattr(scorer, "score", None), "credibility", "signal")
 
     # ------------------------------------------------------------------ helpers
 
@@ -426,6 +535,22 @@ class Pipeline:
             )
             return None
         return acct
+
+    def find_source(self, post: Post) -> Source | None:
+        """Listed red-flag source (watchlist ``sources``) for the author: by user id, else by username.
+
+        Like :meth:`find_account`, a username match is refused when the source pins a different user id -
+        except for replayed samples, whose ids are synthetic.
+        """
+        src = self._sources_by_id.get(post.author_id)
+        if src is not None or not post.author_username:
+            return src
+        src = self._sources_by_handle.get(post.author_username.lower())
+        if src is None:
+            return None
+        if src.user_id is not None and src.user_id != post.author_id and post.source != "replay":
+            return None
+        return src
 
     def score_route(self, post: Post, account: Account | None, rules: RuleResult) -> ScoreRoute:
         """Where a post's score comes from: "scorer" (Claude), "skipped" (rules-only) or "none" (unscored)."""
@@ -493,6 +618,142 @@ class Pipeline:
             changes.append(f"now also names {', '.join(added)}")
         return "; ".join(changes) or None
 
+    async def _score(
+        self,
+        post: Post,
+        account: Account | None,
+        rules: RuleResult,
+        credibility: Credibility | None,
+        signal: RedFlagSignal | None,
+    ) -> Score:
+        if credibility is not None and self._scorer_takes_red_flags:
+            try:
+                return await self.scorer.score(
+                    post, account, rules, self.my_tickers, self.tz, credibility=credibility, signal=signal
+                )
+            except TypeError as exc:
+                # a wrapper that forwards **kwargs to a scorer without the red-flag parameters: stop passing them
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                self._scorer_takes_red_flags = False
+                name = type(self.scorer).__name__
+                logger.warning("scorer %s does not take red-flag hints; scoring without them", name)
+        return await self.scorer.score(post, account, rules, self.my_tickers, self.tz)
+
+    def _related_events(self, post_ids: list[str]) -> list[dict[str, Any]]:
+        """Tracker events of these posts (one per post, oldest first), marked ``alerted`` when an alert went out."""
+        events: dict[str, dict[str, Any]] = {}
+        for e in self.red_flags.events_for_posts(post_ids):
+            events.setdefault(str(e["post_id"]), e)
+        alerted = self.store.delivered_post_alert_ids(events)
+        out = list(events.values())
+        for e in out:
+            e["alerted"] = str(e["post_id"]) in alerted
+        return out
+
+    def _resolve_compromise(
+        self, post: Post, account: Account | None, score: Score | None, credibility: Credibility | None
+    ) -> Credibility | None:
+        """Overrule a possible-hijack check that Claude disagrees with (signals not definitive), see module doc."""
+        if credibility is None or account is None or score is None or not credibility.possible_compromise:
+            return credibility
+        if score.source != "claude" or "account_compromise" in score.red_flag_types:
+            return credibility
+        if compromise_check(post, account, self.watchlist).definitive:
+            return credibility  # a wallet address next to hype, a memecoin link: code decides, whatever Claude says
+        logger.info("post %s: possible-hijack signals overruled by Claude (no account compromise)", post.id)
+        return without_compromise(credibility, account, post)
+
+    def _spread_claims_allowed(self, related: list[dict[str, Any]]) -> bool:
+        """False when every post behind a spreading signal is a claim whose alerts are turned off."""
+        rf = self.settings.red_flags
+        statuses = {str(e.get("claim_status") or "unverified") for e in related}
+        if statuses & {"confirmed_official", "credible_report"}:
+            return True
+        allowed = {s for s in statuses if not (s == "unverified" and not rf.alert_unverified)}
+        allowed = {s for s in allowed if not (s == "likely_false" and not rf.alert_likely_false)}
+        return bool(allowed)
+
+    def _red_flag_outcome(
+        self,
+        post: Post,
+        account: Account | None,
+        rules: RuleResult,
+        score: Score | None,
+        credibility: Credibility | None,
+        now: datetime,
+        age: float,
+    ) -> RedFlagOutcome | None:
+        """Hijack, denial, spreading or red-flag decision for this post, or None (the ordinary decision applies)."""
+        if credibility is None or score is None or not self.settings.red_flags.enabled:
+            return None
+        settings = self.settings
+        if account is not None and credibility.possible_compromise:
+            first = self.red_flags.claim_compromise(post.author_id)
+            signals = compromise_check(post, account, self.watchlist).signals
+            decision = decide_compromise(settings, now, repeat=not first, age_seconds=age)
+            return RedFlagOutcome("compromise", decision, compromise_signals=signals)
+        if account is not None and not score.red_flag:
+            # a post that reports bad news itself is never shown as "DENIED", even if it also denies something
+            tickers = self.red_flags.denial_tickers(post, account, score, rules.own_tickers)
+            if tickers:
+                signal = self.red_flags.find_denial(post, tickers)
+                if signal is not None:
+                    related = self._related_events(signal.related_post_ids)
+                    decision = decide_denial(signal, settings, now, int(score.impact), age_seconds=age)
+                    return RedFlagOutcome("denial", decision, signal, related)
+        signal = self.red_flags.observe(post, score, credibility, account)
+        if signal is not None and signal.spreading:
+            related = self._related_events(signal.related_post_ids)
+            if self._spread_claims_allowed(related):
+                impact = max([int(score.impact), *(int(e.get("impact") or 0) for e in related)])
+                decision = decide_spreading(
+                    signal, settings, now, impact, age_seconds=age, claims=[e.get("claim_status") for e in related]
+                )
+                return RedFlagOutcome("spreading", decision, signal, related, impact=impact)
+            self.red_flags.release_spread(signal.ticker)  # every claim's alert is turned off: no spreading alert
+            signal.spreading = False
+        decision = decide_red_flag(score, rules, account, settings, now, self.my_tickers, age_seconds=age)
+        if decision is None:
+            return None
+        return RedFlagOutcome("red_flag", decision, signal)
+
+    def _dispatch_score(self, red: RedFlagOutcome, score: Score, decision: Decision, impact: int) -> int | None:
+        """The score the dispatcher sees for a red-flag alert (SMS at sms.min_score, Pushover priority 1 at
+        pushover.high_priority_min_score). Silent overnight alerts get None (no SMS, no priority 1); capped claims
+        stay below the wake-ups their priority cap forbids (no Pushover priority 1 for a rumor, no SMS either for a
+        likely-false claim)."""
+        if decision.quiet_hours and decision.priority == "low" and red.kind in ("spreading", "denial", "red_flag"):
+            return None
+        if red.kind == "compromise":
+            return impact
+        alerts = self.settings.alerts
+        status = self._strongest_claim(red, score)
+        cap = CLAIM_PRIORITY_CAP.get(status or "")
+        if cap is None:
+            return impact
+        ceiling = int(alerts.pushover.high_priority_min_score) - 1  # no priority-1 wake-up for a rumor
+        if cap == "normal":
+            ceiling = min(ceiling, int(alerts.sms.min_score) - 1)  # ... and no SMS for a likely-false claim
+        return max(1, min(impact, ceiling))
+
+    @staticmethod
+    def _strongest_claim(red: RedFlagOutcome, score: Score) -> str | None:
+        """The claim a red-flag alert is labelled with: the post's, or the strongest in a spreading window."""
+        if red.kind == "spreading":
+            return strongest_claim([*(e.get("claim_status") or "unverified" for e in red.related), score.claim_status])
+        if red.kind == "red_flag":
+            return score.claim_status
+        return None
+
+    def _analyst_wants(self, analyst: Any, score: Score, account: Account | None, late: bool, kind: str) -> bool:
+        """``desk.wants`` / ``duet.wants``, with the red-flag kind when the analyst takes it."""
+        if analyst is None:
+            return False
+        if kind and accepts_kwargs(analyst.wants, "red_flag_kind"):
+            return bool(analyst.wants(score, account, late, red_flag_kind=kind))
+        return bool(analyst.wants(score, account, late))
+
     def _handle_name(self, post: Post, account: Account | None) -> str:
         if post.author_username:
             return f"@{post.author_username}"
@@ -553,25 +814,51 @@ class Pipeline:
         rules = self.fast_rules.evaluate(post, account)
         result.rules = rules
 
+        # 5b. red flags: who the author is (credibility, computed in code) and the bad news seen so far
+        credibility: Credibility | None = None
+        hint: RedFlagSignal | None = None
+        if self.settings.red_flags.enabled:
+            source = self.find_source(post)
+            credibility = assess_credibility(post, account, source, self.settings.red_flags, self.watchlist)
+            hint = self.red_flags.peek([*rules.tickers, *(account.tickers if account else ())], post.created_at)
+        result.credibility = credibility
+
         # 6. score: see score_route (watched accounts, always-alert accounts, flagged keyword posts)
         score: Score | None = None
         route = self.score_route(post, account, rules)
         if route == "scorer":
-            score = await self.scorer.score(post, account, rules, self.my_tickers, self.tz)
-        elif route == "skipped":
-            # Not worth a Claude call per settings, but always-alert accounts still alert on every post.
+            score = await self._score(post, account, rules, credibility, hint)
+        elif route == "skipped" or (route == "none" and credibility is not None and credibility.possible_compromise):
+            # Not worth a Claude call per settings, but always-alert accounts still alert on every post (and a
+            # watched account that looks hijacked always gets its "do not act" alert).
             score = fallback_score(
-                rules, account, None, source="skipped", max_impact=self.settings.scoring.fallback_max_impact
+                rules,
+                account,
+                None,
+                source="skipped",
+                max_impact=self.settings.scoring.fallback_max_impact,
+                post=post,
+                credibility=credibility,
             )
         if score is not None:
             self._cap_rules_only(score)
+            # red flags: Claude's view of a possible hijack, and the claim capped by the credibility computed in code
+            credibility = self._resolve_compromise(post, account, score, credibility)
+            note = clamp_claim(score, credibility, account)
+            if note:
+                logger.info("post %s: %s", post.id, note)
         result.score = score
+        result.credibility = credibility
         t_scored = self.clock()
 
-        # 7. decide ; 8. store the score
+        # 7. decide (red flags may replace the ordinary decision) ; 8. store the score
         age = post_age_seconds(post)
         late = is_late(age, self.settings.alerts)
         decision = decide(score, rules, account, self.settings, t_scored, self.my_tickers, age_seconds=age)
+        red = self._red_flag_outcome(post, account, rules, score, credibility, t_scored, age)
+        if red is not None:
+            decision = red.decision
+        result.red_flag = red
         result.decision = decision
         self.store.update_post_score(post.id, rules, score)
 
@@ -590,9 +877,11 @@ class Pipeline:
             )
             return
 
-        # 9. alert (an edit of a post that already alerted only when it changes the picture)
+        # 9. alert (an edit of a post that already alerted only when it changes the picture; a spreading /
+        # denial / hijack alert is about more than this post's wording and always goes out)
         edit_note: str | None = None
-        earlier = self._earlier_alert(post)
+        rf_kind = red.kind if red is not None else ""
+        earlier = self._earlier_alert(post) if rf_kind in ("", "red_flag") else None
         if earlier is not None:
             eid, prev = earlier
             edit_note = self._edit_change(prev, score)
@@ -608,17 +897,39 @@ class Pipeline:
                 return
             logger.info("post %s %s: edit of alerted post %s re-alerts: %s", post.id, handle, eid, edit_note)
 
-        desk_brief = self.desk is not None and self.desk.wants(score, account, late)
-        duet_line = self.duet is not None and self.duet.wants(score, account, late)
-        msg = format_post_alert(
-            post, account, score, decision, self.settings.alerts, edit_note=edit_note, desk_brief=desk_brief,
-            duet_line=duet_line,
-        )
+        desk_brief = self._analyst_wants(self.desk, score, account, late, rf_kind)
+        duet_line = self._analyst_wants(self.duet, score, account, late, rf_kind)
+        alert_impact = int(score.impact)
+        direction = score.direction
+        tickers = list(score.tickers)
+        dispatch_score: int | None = alert_impact
+        if red is not None:
+            msg = format_red_flag_alert(
+                post, account, score, decision, self.settings.alerts, kind=red.kind, credibility=credibility,
+                signal=red.signal, related=red.related, compromise_signals=red.compromise_signals,
+                edit_note=edit_note, desk_brief=desk_brief, duet_line=duet_line,
+            )
+            if red.impact is not None:
+                alert_impact = int(red.impact)
+                dispatch_score = alert_impact
+            if red.kind == "spreading":
+                direction = "bearish"
+            elif red.kind == "compromise":
+                direction = "unclear"  # a scam post: nothing to act on either way
+                tickers = tickers or list(account.tickers if account is not None else ())
+            if red.signal is not None and red.kind in ("spreading", "denial"):
+                tickers = [red.signal.ticker, *[t for t in tickers if t != red.signal.ticker]]
+            dispatch_score = self._dispatch_score(red, score, decision, alert_impact)
+        else:
+            msg = format_post_alert(
+                post, account, score, decision, self.settings.alerts, edit_note=edit_note, desk_brief=desk_brief,
+                duet_line=duet_line,
+            )
         t_push = self.clock()
         # Late posts carry the "late" tag (format_post_alert): the dispatcher never sends them by SMS and
         # Pushover never gives them priority 1, whatever the score; email (score >= email.min_score) still
         # goes out, and the message priority is at most "normal".
-        results = await self.dispatcher.send(msg, score.impact)
+        results = await self.dispatcher.send(msg, dispatch_score)
 
         push_ms = _first_success_ms(results)
         x_delay_ms = _ms((post.received_at - post.created_at).total_seconds())
@@ -632,20 +943,27 @@ class Pipeline:
             decision_reason=decision.reason,
             message=msg,
             results=results,
-            score=score.impact,
-            direction=score.direction,
-            tickers=list(score.tickers),
+            score=alert_impact,
+            direction=direction,
+            tickers=tickers,
             quiet_hours=decision.quiet_hours,
             late=late,
             total_latency_ms=total_ms,
             x_delay_ms=x_delay_ms,
             scoring_ms=scoring_ms,
             push_ms=push_ms,
+            red_flag_kind=rf_kind,  # type: ignore[arg-type]
+            # (a spreading alert carries the strongest claim in its window: what the Duet subject / desk show)
+            claim_status=(self._strongest_claim(red, score) or score.claim_status) if red is not None else None,
+            credibility=credibility if red is not None else None,
+            red_flag_signal=red.signal if red is not None else None,
         )
         result.alert = rec
         result.outcome = "alert"
         result.detail = decision.reason
         self.store.record_alert(rec)
+        if red is not None and red.kind == "spreading" and red.signal is not None and not rec.sent_ok:
+            self.red_flags.release_spread(red.signal.ticker)  # not delivered: the next bad-news post retries
         if self.desk is not None:  # queues only (never blocks or raises); the push already went out
             self.desk.submit(rec, post, score, account, rules)
         if self.duet is not None:  # the same: queues the email, never waits for SMTP
@@ -811,7 +1129,9 @@ __all__ = [
     "LATENCY_TARGET_SECONDS",
     "HandleResult",
     "Pipeline",
+    "RedFlagOutcome",
     "Scorer",
+    "accepts_kwargs",
     "has_content",
     "is_repost",
     "payload_to_post",

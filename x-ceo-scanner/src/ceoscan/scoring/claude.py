@@ -9,6 +9,23 @@ or hanging API costs at most that long before the rules-only score is used.
 Rules-only scores are deliberately conservative: they are based on the author's own words and
 capped at ``scoring.fallback_max_impact`` (default 7 = the alert threshold), so keywords alone
 never produce an "urgent" alert, an SMS, or a quiet-hours wake-up.
+
+Red flags (when the caller passes a ``credibility``, i.e. red flags are on): Claude fills ``red_flag``,
+``red_flag_types``, ``claim_status``, ``false_news_risk`` and ``credibility_note``; missing or invalid values get
+tolerant defaults (the pipeline then caps the claim by the credibility computed in code, see
+scoring/credibility.py ``clamp_claim``). The rules-only fallback derives them from scoring/redflags.py (unhedged
+negative events in the author's own words) and the claim status from the credibility level:
+
+* a watched account: CONFIRMED (official) only when the event is about its own company - its own tickers or company
+  names in its own words, or a first-person sentence ("we are recalling", "I'm stepping down"); a red flag about
+  another of my companies it names is UNVERIFIED and carries only those tickers (Elon on Apple is an allegation
+  about Apple, not a Tesla red flag); anything else ("massive fraud in government spending", "X Corp has filed a
+  lawsuit against ...") is not a rules-only red flag at all;
+* trusted -> credible_report (unverified when the post uses rumor words), a possible impersonator -> likely_false,
+  anything else -> unverified (false-news risk high for suspicious authors).
+
+A red flag naming the company gets a rules-only impact of at least :data:`RED_FLAG_FALLBACK_IMPACT` (5 for
+suspicious authors), still capped at ``scoring.fallback_max_impact``.
 """
 
 from __future__ import annotations
@@ -25,9 +42,30 @@ from typing import TYPE_CHECKING, Any
 import anthropic
 
 from ..config import ScoringSettings
-from ..models import Account, Direction, Post, RuleResult, Score, ScoreSource
+from ..models import (
+    RED_FLAG_TYPES,
+    Account,
+    ClaimStatus,
+    Credibility,
+    Direction,
+    Post,
+    RedFlagSignal,
+    Risk,
+    RuleResult,
+    Score,
+    ScoreSource,
+)
 from ..timeutil import now_utc
-from .prompt import SCORE_JSON_SCHEMA, SYSTEM_PROMPT, build_user_message
+from .prompt import (
+    CLAIM_STATUSES,
+    MAX_CREDIBILITY_NOTE_CHARS,
+    RISK_LEVELS,
+    SCORE_JSON_SCHEMA,
+    SYSTEM_PROMPT,
+    build_user_message,
+)
+from .redflags import scan
+from .rules import CAT_COMPANY, CAT_TICKER, own_text
 
 if TYPE_CHECKING:  # pragma: no cover
     from anthropic import AsyncAnthropic
@@ -155,16 +193,76 @@ def _parse_bool(value: Any) -> bool:
     return False
 
 
+def normalize_red_flag_types(value: Any) -> list[str]:
+    """Known RED_FLAG_TYPES only (case / spaces / dashes tolerated), deduped, in the contract's order."""
+    if isinstance(value, str):
+        items: list[Any] = re.split(r"[\s,;/]+", value)
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return []
+    found = {str(v).strip().lower().replace("-", "_").replace(" ", "_") for v in items if isinstance(v, str)}
+    return [t for t in RED_FLAG_TYPES if t in found]
+
+
+def _enum(value: Any, allowed: tuple[str, ...]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return v if v in allowed else None
+
+
+def clean_note(value: Any) -> str:
+    """One line, at most MAX_CREDIBILITY_NOTE_CHARS characters ("" for anything that is not text)."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if len(text) > MAX_CREDIBILITY_NOTE_CHARS:
+        text = text[: MAX_CREDIBILITY_NOTE_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def apply_red_flag_fields(score: Score, obj: dict[str, Any]) -> Score:
+    """Fill the red-flag fields of ``score`` from Claude's object, with tolerant defaults.
+
+    Missing / invalid values never fail the parse: red_flag false, types [], claim not_applicable, risk low.
+    Inconsistencies are resolved conservatively: a denial is never a red flag; a red flag without a valid
+    claim status is "unverified"; a red flag without a type is "other"; a likely-false claim without a valid
+    risk is "high" risk.
+    """
+    red_flag = _parse_bool(obj.get("red_flag", False))
+    types = normalize_red_flag_types(obj.get("red_flag_types"))
+    claim = _enum(obj.get("claim_status"), CLAIM_STATUSES)
+    risk = _enum(obj.get("false_news_risk"), RISK_LEVELS)
+    if claim == "denial":
+        red_flag = False
+    if red_flag:
+        types = types or ["other"]
+        if claim in (None, "not_applicable"):
+            claim = "unverified"
+    elif claim != "denial":
+        types = []  # (a claim status on good news - "unverified" rumor of a deal - is kept as Claude said)
+    if risk is None:
+        risk = "high" if claim == "likely_false" else "medium" if red_flag and claim == "unverified" else "low"
+    score.red_flag = red_flag
+    score.red_flag_types = types
+    score.claim_status = (claim or "not_applicable")  # type: ignore[assignment]
+    score.false_news_risk = risk  # type: ignore[assignment]
+    score.credibility_note = clean_note(obj.get("credibility_note"))
+    return score
+
+
 def parse_score_response(text: str, my_tickers: tuple[str, ...] = ()) -> Score:
     """Parse Claude's JSON answer into a Score (source="claude").
 
-    Raises ScoreParseError when no JSON object is found or a required field is missing.
+    Raises ScoreParseError when no JSON object is found or a required field is missing. The red-flag
+    fields are optional here (tolerant defaults, see :func:`apply_red_flag_fields`).
     """
     obj = _extract_json_object(text)
     missing = [k for k in REQUIRED_FIELDS if k not in obj]
     if missing:
         raise ScoreParseError(f"missing required field(s): {', '.join(missing)}")
-    return Score(
+    score = Score(
         tickers=normalize_tickers(obj["tickers"], my_tickers),
         direction=normalize_direction(obj["direction"]),
         impact=_parse_impact(obj["impact_score"]),
@@ -172,6 +270,7 @@ def parse_score_response(text: str, my_tickers: tuple[str, ...] = ()) -> Score:
         is_joke=_parse_bool(obj["is_joke_or_meme"]),
         source="claude",
     )
+    return apply_red_flag_fields(score, obj)
 
 
 # --------------------------------------------------------------------------- fallback
@@ -216,16 +315,129 @@ def _fallback_tickers(rules: RuleResult, account: Account | None) -> list[str]:
     return acct + [t for t in rule_tickers if t not in acct]
 
 
+#: rules-only impact floor for a red flag that names the company (= red_flags.min_score by default), still capped
+#: at scoring.fallback_max_impact; suspicious authors (new / parody accounts) get one less, so their rumors alone do
+#: not alert rules-only (the "spreading" alert still counts them). Possible impersonators keep the full floor:
+#: a fake CEO / company post is exactly the false news that moves a stock (Eli Lilly, Nov 2022).
+RED_FLAG_FALLBACK_IMPACT = 6
+_CLAIM_BY_LEVEL: dict[str, ClaimStatus] = {
+    "official": "confirmed_official",
+    "trusted": "credible_report",
+    "established": "unverified",
+    "unverified": "unverified",
+    "suspicious": "unverified",
+}
+_RISK_BY_LEVEL: dict[str, Risk] = {
+    "official": "low",
+    "trusted": "low",
+    "established": "medium",
+    "unverified": "medium",
+    "suspicious": "high",
+}
+
+
+#: rumor markers that make even an official / trusted claim unverified ("leaked" alone does not: "our data leaked")
+_STRONG_RUMOR = frozenset({"rumor", "unconfirmed", "reportedly", "anonymous sources", "hearing that", "allegedly",
+                           "cannot confirm"})
+
+
+def _rules_only_note(credibility: Credibility, claim: str, *, other_company: bool = False) -> str:
+    """A short rules-only credibility note (the alert lists the credibility reasons separately)."""
+    if claim == "denial":
+        return "Rules-only: a watched account denies a negative claim."
+    if claim == "confirmed_official":
+        return "Rules-only: posted by the company / CEO account itself."
+    if other_company:
+        return "Rules-only: a watched account makes a claim about another company; the claim was not checked."
+    if credibility.possible_impersonation:
+        return "Rules-only: the author imitates a watched account; the claim is likely false."
+    return f"Rules-only: {credibility.level} source; the claim was not checked."
+
+
+def _norm_tickers(tickers: list[str] | tuple[str, ...]) -> list[str]:
+    return list(dict.fromkeys(str(t).strip().lstrip("$").upper() for t in tickers if str(t).strip()))
+
+
+def apply_rules_only_red_flag(
+    score: Score, post: Post, rules: RuleResult, account: Account | None, credibility: Credibility, max_impact: int
+) -> Score:
+    """Derive the red-flag fields of a rules-only score from the post's own words and the author's credibility.
+
+    See the module docstring: a watched account's post is CONFIRMED only about its own company.
+    """
+    own = own_text(post)
+    found = scan(own, has_link=bool(post.urls))
+    if credibility.possible_compromise:
+        score.red_flag, score.red_flag_types = True, ["account_compromise"]
+        score.claim_status, score.false_news_risk = "likely_false", "high"
+        score.direction = "unclear"  # a scam post: do not act on it either way
+        score.credibility_note = clean_note(
+            "Rules-only: a watched account posted scam-like crypto content; it may be hijacked."
+        )
+        return score
+    if found.denial:
+        score.red_flag, score.red_flag_types = False, found.types
+        score.claim_status, score.false_news_risk = "denial", "low"
+        score.credibility_note = _rules_only_note(credibility, "denial")
+        return score
+    types = found.event_types(by_company=account is not None)
+    if not types:
+        return score
+    claim: ClaimStatus = _CLAIM_BY_LEVEL.get(credibility.level, "unverified")
+    risk: Risk = _RISK_BY_LEVEL.get(credibility.level, "medium")
+    named = _norm_tickers(rules.own_tickers)
+    tickers: list[str] | None = None
+    other_company = False
+    if account is not None:
+        # a watched account: whose bad news is it? (never "every post of the account is about its company")
+        acct = _norm_tickers(account.tickers)
+        own_named = [t for t in named if t in acct]
+        others = [t for t in named if t not in acct]
+        if own_named and not others:
+            claim, risk, tickers = "confirmed_official", "low", own_named
+        elif named:
+            claim, risk, tickers, other_company = "unverified", "medium", named, True
+        elif found.first_person_types:
+            # "we" / "I" naming no company: the account's primary (first) ticker, not a whole ticker group
+            claim, risk, tickers, types = "confirmed_official", "low", acct[:1], found.first_person_types
+        else:
+            return score  # names no company and is not about itself: keep the ordinary decision
+        names_company = True
+    else:
+        if credibility.possible_impersonation:
+            claim, risk = "likely_false", "high"
+        names_company = bool({CAT_TICKER, CAT_COMPANY} & set(rules.own_categories))
+    if claim in ("confirmed_official", "credible_report") and found.rumor:
+        strong_rumor = bool(_STRONG_RUMOR & set(found.rumor))
+        if claim == "credible_report" or strong_rumor:
+            claim, risk = "unverified", "medium"  # "rumor, unconfirmed, sources say" is never a credible report
+    score.red_flag, score.red_flag_types = True, types
+    score.claim_status, score.false_news_risk = claim, risk
+    score.direction = "bearish"
+    score.credibility_note = _rules_only_note(credibility, claim, other_company=other_company)
+    if tickers is not None:
+        score.tickers = tickers
+    if names_company:
+        weak_author = credibility.level == "suspicious" and not credibility.possible_impersonation
+        floor = RED_FLAG_FALLBACK_IMPACT - (1 if weak_author else 0)
+        score.impact = max(int(score.impact), min(floor, max(1, int(max_impact))))
+    return score
+
+
 def fallback_score(
     rules: RuleResult,
     account: Account | None,
     error: str | None,
     source: ScoreSource = "rules_fallback",
     max_impact: int | None = None,
+    *,
+    post: Post | None = None,
+    credibility: Credibility | None = None,
 ) -> Score:
     """Score derived from the fast rules only (Claude unavailable, disabled, failed, or skipped).
 
-    ``max_impact`` is ``scoring.fallback_max_impact`` (default 7); see `fallback_impact`.
+    ``max_impact`` is ``scoring.fallback_max_impact`` (default 7); see `fallback_impact`. With ``post`` and
+    ``credibility`` (red flags on) the red-flag fields are derived too (:func:`apply_rules_only_red_flag`).
     """
     cap = DEFAULT_FALLBACK_MAX_IMPACT if max_impact is None else int(max_impact)
     if rules.reasons:
@@ -234,7 +446,7 @@ def fallback_score(
         reason = prefix + "; ".join(rules.reasons[:5])
     else:
         reason = "Fast rules: no market keywords matched"
-    return Score(
+    score = Score(
         tickers=_fallback_tickers(rules, account),
         direction="unclear",
         impact=fallback_impact(rules, cap),
@@ -243,6 +455,9 @@ def fallback_score(
         source=source,
         error=error,
     )
+    if post is not None and credibility is not None:
+        apply_rules_only_red_flag(score, post, rules, account, credibility, cap)
+    return score
 
 
 # --------------------------------------------------------------------------- scorers
@@ -369,27 +584,42 @@ class ClaudeScorer:
         my_tickers: tuple[str, ...],
         tz: str,
         now: datetime | None = None,
+        *,
+        credibility: Credibility | None = None,
+        signal: RedFlagSignal | None = None,
     ) -> Score:
         """Score one post. Never raises (except for task cancellation).
 
-        ``now`` (default: the current time) is shown to Claude so it can judge staleness.
+        ``now`` (default: the current time) is shown to Claude so it can judge staleness. ``credibility``
+        (red flags on) adds the trusted source facts to the prompt, with ``signal`` (bad news about the ticker
+        seen so far) as a hint, and lets a rules-only fallback derive the red-flag fields.
         """
         started = time.perf_counter()
+        cred = credibility
 
         if not self.settings.enabled:
-            return self._fallback(post, rules, account, "Claude scoring disabled in settings", started, log=False)
+            return self._fallback(
+                post, rules, account, "Claude scoring disabled in settings", started, log=False, credibility=cred
+            )
         if self._client is None:
-            return self._fallback(post, rules, account, "Claude unavailable: no ANTHROPIC_API_KEY configured", started)
+            return self._fallback(
+                post, rules, account, "Claude unavailable: no ANTHROPIC_API_KEY configured", started, credibility=cred
+            )
 
         try:
-            kwargs = self._request_kwargs(build_user_message(post, account, rules, my_tickers, tz, now=now))
+            message = build_user_message(
+                post, account, rules, my_tickers, tz, now=now, credibility=cred, signal=signal
+            )
+            kwargs = self._request_kwargs(message)
         except Exception as exc:  # never raise from score(): e.g. malformed post data
-            return self._fallback(post, rules, account, f"could not build prompt: {type(exc).__name__}", started)
+            return self._fallback(
+                post, rules, account, f"could not build prompt: {type(exc).__name__}", started, credibility=cred
+            )
 
         response, error = await self._call_within_budget(kwargs, post.id, started)
         if response is None:
-            return self._fallback(post, rules, account, error, started)
-        return self._score_from_response(response, post, rules, account, my_tickers, started)
+            return self._fallback(post, rules, account, error, started, credibility=cred)
+        return self._score_from_response(response, post, rules, account, my_tickers, started, credibility=cred)
 
     async def _call_within_budget(self, kwargs: dict[str, Any], post_id: str, started: float) -> tuple[Any, str]:
         """(response, "") on success, (None, error text) otherwise. Never raises except cancellation."""
@@ -486,8 +716,11 @@ class ClaudeScorer:
         started: float,
         usage: Any = None,
         log: bool = True,
+        credibility: Credibility | None = None,
     ) -> Score:
-        fb = fallback_score(rules, account, error, max_impact=self.settings.fallback_max_impact)
+        fb = fallback_score(
+            rules, account, error, max_impact=self.settings.fallback_max_impact, post=post, credibility=credibility
+        )
         fb.latency_ms = int((time.perf_counter() - started) * 1000)
         if usage is not None:  # refusals / truncations are still billed
             fb.input_tokens = getattr(usage, "input_tokens", None)
@@ -504,6 +737,7 @@ class ClaudeScorer:
         account: Account | None,
         my_tickers: tuple[str, ...],
         started: float,
+        credibility: Credibility | None = None,
     ) -> Score:
         usage = getattr(response, "usage", None)
         stop_reason = getattr(response, "stop_reason", None)
@@ -511,10 +745,10 @@ class ClaudeScorer:
             details = getattr(response, "stop_details", None)
             category = getattr(details, "category", None) if details is not None else None
             error = f"Claude refused (stop_reason=refusal, category={category or 'unknown'})"
-            return self._fallback(post, rules, account, error, started, usage)
+            return self._fallback(post, rules, account, error, started, usage, credibility=credibility)
         if stop_reason in ("max_tokens", "model_context_window_exceeded"):
             error = f"Claude output truncated (stop_reason={stop_reason})"
-            return self._fallback(post, rules, account, error, started, usage)
+            return self._fallback(post, rules, account, error, started, usage, credibility=credibility)
 
         # Read blocks by type: with adaptive thinking the first block can be a thinking block.
         text = "".join(
@@ -525,7 +759,8 @@ class ClaudeScorer:
         try:
             score = parse_score_response(text, my_tickers)
         except ScoreParseError as exc:
-            return self._fallback(post, rules, account, f"unparseable Claude output: {exc}", started, usage)
+            error = f"unparseable Claude output: {exc}"
+            return self._fallback(post, rules, account, error, started, usage, credibility=credibility)
 
         score.model = getattr(response, "model", None) or self.settings.model
         score.latency_ms = int((time.perf_counter() - started) * 1000)
@@ -637,9 +872,12 @@ class OfflineScorer:
         my_tickers: tuple[str, ...],
         tz: str,
         now: datetime | None = None,
+        *,
+        credibility: Credibility | None = None,
+        signal: RedFlagSignal | None = None,
     ) -> Score:
         cap = self.settings.fallback_max_impact if self.settings is not None else None
-        sc = fallback_score(rules, account, None, source="offline", max_impact=cap)
+        sc = fallback_score(rules, account, None, source="offline", max_impact=cap, post=post, credibility=credibility)
         sc.latency_ms = 0
         return sc
 

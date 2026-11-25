@@ -11,12 +11,14 @@ Duet gives the considered follow-up on its check-ins, in the morning brief, or w
 
 * :meth:`DuetFeed.submit` is called by the pipeline right after an alert was dispatched and recorded. It
   is synchronous and never blocks or raises: the item joins a backlog bounded by :data:`BACKLOG_MAX`;
-  when it is full the lowest-scored alert (the oldest among equal scores, possibly the new one) is
-  dropped, logged and recorded as ``dropped``. Eligibility (:func:`duet_eligibility`): post alert, impact
-  >= ``min_score`` or an always-alert account, rules-only scores only with ``include_rules_only`` (then
-  from ``min(min_score, scoring.fallback_max_impact)``, as for the desk), late catch-up alerts unless
-  ``include_late`` is false (they are marked LATE). Unlike the desk, the email also goes out when the push
-  was not delivered: the feed is a channel of its own.
+  when it is full the lowest-ranked alert (possible-hijack, spreading and denied red-flag alerts rank
+  first, then the score; the oldest among equal ones, possibly the new one) is dropped, logged and
+  recorded as ``dropped``. Eligibility (:func:`duet_eligibility`): post alert, impact >= ``min_score`` or
+  an always-alert account, rules-only scores only with ``include_rules_only`` (then from
+  ``min(min_score, scoring.fallback_max_impact)``, as for the desk), late catch-up alerts unless
+  ``include_late`` is false (they are marked LATE). Red flags as for the desk: a ``red_flag`` alert from
+  ``min(min_score, red_flags.min_score)``, ``spreading`` / ``denial`` / ``compromise`` alerts always. Unlike
+  the desk, the email also goes out when the push was not delivered: the feed is a channel of its own.
 * One worker task coalesces alerts that arrive within ``batch_window_seconds`` into one email (kind
   ``alert`` for one, ``batch`` for several, ranked by score; at most :data:`MAX_ALERTS_PER_EMAIL`, fewer
   when they do not fit in ``max_text_chars``). A sliding one-hour cap of ``max_emails_per_hour`` delivered
@@ -45,7 +47,10 @@ Duet gives the considered follow-up on its check-ins, in the morning brief, or w
 Email format: a one-line, neutralized subject of at most :data:`SUBJECT_MAX` characters
 ("[ceoscan] TSLA 8/10 bullish - @elonmusk", "[ceoscan] LATE NVDA 9/10 bearish - @nvidia",
 "[ceoscan] 3 alerts: TSLA, NVDA, AMD (top 9/10)", "[ceoscan] Daily review - Thu Nov 19",
-"[ceoscan] Test - Claude Duet feed is wired"), and a plain-text body: the three-line :data:`PREFACE`, then
+"[ceoscan] Test - Claude Duet feed is wired"; red flags: "[ceoscan] 🚩 RED FLAG TSLA 7/10 bearish -
+UNVERIFIED - @handle", "[ceoscan] 🚩 SPREADING TSLA - 4 accounts", "[ceoscan] 🛡️ DENIED TSLA - @Tesla",
+"[ceoscan] ⚠️ HACKED? @handle"; the emoji go out RFC 2047-encoded), and a plain-text body: the three-line
+:data:`PREFACE`, then
 the same fenced alert text the Claude analyst desk gets (random fence id per email, untrusted text
 decoded and neutralized; see alerts/claude_desk.py), worded for Duet (:data:`DUET_STYLE`).
 
@@ -76,7 +81,7 @@ from email.message import EmailMessage
 from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
-from ..config import AppConfig, ClaudeDuetSettings, EmailSettings, Secrets
+from ..config import AppConfig, ClaudeDuetSettings, EmailSettings, RedFlagSettings, Secrets
 from ..models import Account, AlertMessage, AlertRecord, ChannelResult, Post, RuleResult, Score
 from ..store import DUET_DROPPED, DUET_FAILED, DUET_SENT, Store
 from ..timeutil import local_day_start, now_utc
@@ -87,11 +92,14 @@ from .claude_desk import (
     alert_eligibility,
     build_daily_review_text,
     build_test_text,
+    claim_word,
     clean_line,
     neutralize,
     plan_alert_fire,
     rank_alerts,
     recent_context,
+    red_flag_threshold,
+    submission_score,
 )
 from .dispatcher import AlertDispatcher
 from .format import DUET_LINE, RULES_ONLY_SOURCES, format_system_alert, one_line, truncate
@@ -282,10 +290,13 @@ def duet_eligibility(
     account: Account | None,
     late: bool,
     rules_only_max: int | None = None,
+    red_flag_kind: str = "",
+    red_flags: RedFlagSettings | None = None,
 ) -> tuple[bool, str]:
-    """(eligible, why). Pure. Same score semantics as the desk; late alerts per ``include_late``.
+    """(eligible, why). Pure. Same score and red-flag semantics as the desk; late alerts per ``include_late``.
 
-    Whether the push was delivered does not matter: the feed is a channel of its own.
+    Whether the push was delivered does not matter: the feed is a channel of its own. ``red_flag_kind`` is
+    ``AlertRecord.red_flag_kind``; ``red_flags`` is ``settings.red_flags`` (None = its defaults).
     """
     return alert_eligibility(
         enabled=bool(settings.enabled),
@@ -301,10 +312,17 @@ def duet_eligibility(
         account=account,
         late=late,
         rules_only_max=rules_only_max,
+        red_flag_kind=red_flag_kind,
+        red_flag_min_score=red_flag_threshold(red_flags),
     )
 
 
 # =========================================================================== subject and body
+
+#: Subject markers of red-flag emails (UTF-8; the email headers carry them RFC 2047-encoded).
+RED_FLAG_MARK = "\U0001f6a9"  # 🚩 red flag / spreading
+DENIED_MARK = "\U0001f6e1\ufe0f"  # 🛡️ a watched account denies a recent red flag
+HACKED_MARK = "\u26a0\ufe0f"  # ⚠️ a watched account looks hijacked
 
 #: Characters a subject never keeps: controls (CR, LF, NUL, ...), format characters, line / paragraph
 #: separators, private-use, surrogates and unassigned code points.
@@ -330,14 +348,49 @@ def _tickers_label(tickers: Sequence[str], limit: int, sep: str) -> str:
     return f"{shown} +{extra}" if extra > 0 else shown
 
 
+def _red_flag_words(a: DeskAlert) -> list[str] | None:
+    """Subject words of a red-flag alert ("🚩 RED FLAG TSLA 7/10 bearish - UNVERIFIED - @handle",
+    "🚩 SPREADING TSLA - 4 accounts - all UNVERIFIED", "🛡️ DENIED TSLA - @Tesla", "⚠️ HACKED? @handle"); None
+    otherwise."""
+    late = "LATE" if a.late else ""
+    tickers = _tickers_label(a.tickers, 3, ",") or "no ticker"
+    if a.red_flag_kind == "red_flag":
+        claim = claim_word(a.claim_status)
+        return [
+            f"{RED_FLAG_MARK} RED FLAG", late, tickers, f"{a.score}/10", a.direction,
+            "(rules-only)" if a.score_source in RULES_ONLY_SOURCES else "", "-", *([claim, "-"] if claim else []),
+            a.handle,
+        ]
+    if a.red_flag_kind == "spreading":
+        sig = a.signal
+        ticker = clean_line(sig.ticker.strip().lstrip("$").upper(), 12) if sig is not None else ""
+        n = sig.distinct_authors if sig is not None else 0
+        count = f"{n} account{'' if n == 1 else 's'}" if n > 0 else "several accounts"
+        # the strongest claim in the window (pipeline): never a bare "SPREADING" for a wave of rumors
+        strongest = a.claim_status if a.claim_status in ("confirmed_official", "credible_report") else None
+        claim = claim_word(a.claim_status) or "UNVERIFIED"
+        label = f"incl. {claim}" if strongest else f"all {claim}"
+        return [f"{RED_FLAG_MARK} SPREADING", late, ticker or tickers, "-", count, "-", label]
+    if a.red_flag_kind == "denial":
+        return [f"{DENIED_MARK} DENIED", late, tickers, "-", a.handle]
+    if a.red_flag_kind == "compromise":
+        return [f"{HACKED_MARK} HACKED?", late, a.handle]
+    return None
+
+
 def alert_subject(prefix: str, alerts: Sequence[DeskAlert]) -> str:
-    """'[ceoscan] TSLA 8/10 bullish - @elonmusk' or '[ceoscan] 3 alerts: TSLA, NVDA, AMD (top 9/10)'."""
+    """'[ceoscan] TSLA 8/10 bullish - @elonmusk' or '[ceoscan] 3 alerts: TSLA, NVDA, AMD (top 9/10)'.
+
+    Red flags: '[ceoscan] 🚩 RED FLAG TSLA 7/10 bearish - UNVERIFIED - @handle', '[ceoscan] 🚩 SPREADING TSLA
+    - 4 accounts', '[ceoscan] 🛡️ DENIED TSLA - @Tesla', '[ceoscan] ⚠️ HACKED? @handle'; a batch with red flags
+    starts with 🚩 (⚠️ when one is a possible hijack) and counts them: '[ceoscan] 🚩 3 alerts (2 red flags): ...'.
+    """
     ranked = rank_alerts(alerts)
     if not ranked:
         return make_subject(prefix, "alert")
     if len(ranked) == 1:
         a = ranked[0]
-        words = [
+        words = _red_flag_words(a) or [
             "LATE" if a.late else "",
             _tickers_label(a.tickers, 3, ",") or "no ticker",
             f"{a.score}/10",
@@ -349,13 +402,19 @@ def alert_subject(prefix: str, alerts: Sequence[DeskAlert]) -> str:
         return make_subject(prefix, " ".join(w for w in words if w))
     tickers = list(dict.fromkeys(t for a in ranked for t in a.tickers))
     late = sum(1 for a in ranked if a.late)
-    head = f"{len(ranked)} alerts"
+    red = sum(1 for a in ranked if a.red_flag_kind)
+    notes = [f"{late} late"] if 0 < late < len(ranked) else []
+    if red:
+        notes.append(f"{red} red flag{'' if red == 1 else 's'}")
+    head = f"{len(ranked)} alerts" + (f" ({', '.join(notes)})" if notes else "")
     if late == len(ranked):
         head = f"LATE {head}"
-    elif late:
-        head += f" ({late} late)"
+    if any(a.red_flag_kind == "compromise" for a in ranked):
+        head = f"{HACKED_MARK} {head}"
+    elif red:
+        head = f"{RED_FLAG_MARK} {head}"
     label = _tickers_label(tickers, 5, ", ") or "no ticker"
-    return make_subject(prefix, f"{head}: {label} (top {ranked[0].score}/10)")
+    return make_subject(prefix, f"{head}: {label} (top {max(a.score for a in ranked)}/10)")
 
 
 def daily_review_subject(prefix: str, now: datetime, tz: str) -> str:
@@ -740,16 +799,23 @@ class DuetFeed:
         return len(self._pending) + len(self._jobs)
 
     def _eligibility(
-        self, *, kind: str, score: Score | None, account: Account | None, late: bool
+        self, *, kind: str, score: Score | None, account: Account | None, late: bool, red_flag_kind: str = ""
     ) -> tuple[bool, str]:
         return duet_eligibility(
             self.settings, kind=kind, score=score, account=account, late=late,
             rules_only_max=int(self.cfg.settings.scoring.fallback_max_impact),
+            red_flag_kind=red_flag_kind, red_flags=self.cfg.settings.red_flags,
         )
 
-    def wants(self, score: Score | None, account: Account | None, late: bool) -> bool:
-        """Would a post alert with this score be emailed? (for the push body line)"""
-        ok, _ = self._eligibility(kind="post", score=score, account=account, late=late)
+    def wants(
+        self, score: Score | None, account: Account | None, late: bool, *, red_flag_kind: str = ""
+    ) -> bool:
+        """Would a post alert with this score be emailed? (for the push body line)
+
+        ``red_flag_kind`` is the alert's ``AlertRecord.red_flag_kind`` (red flags qualify at a lower score;
+        spreading / denied / possible-hijack alerts always qualify).
+        """
+        ok, _ = self._eligibility(kind="post", score=score, account=account, late=late, red_flag_kind=red_flag_kind)
         return ok
 
     def start(self) -> None:
@@ -757,12 +823,17 @@ class DuetFeed:
             return
         self._seed_budget()
         self._task = asyncio.create_task(self._run(), name="ceoscan-claude-duet")
+        red = red_flag_threshold(self.cfg.settings.red_flags)
         logger.info(
-            "claude_duet: on - emails to %s for alerts with score >= %d%s%s, batch window %.0fs, at most %d "
+            "claude_duet: on - emails to %s for alerts with score >= %d%s%s%s, batch window %.0fs, at most %d "
             "emails/hour%s",
             self.recipients_masked,
             self.settings.min_score,
             " or from always-alert accounts" if self.settings.include_always_alert else "",
+            (
+                f", red flags from {min(red, int(self.settings.min_score))} (spreading / denied / possible-hijack "
+                "alerts always)"
+            ) if red is not None else "",
             " (late alerts included)" if self.settings.include_late else "",
             self.settings.batch_window_seconds,
             self.settings.max_emails_per_hour,
@@ -779,7 +850,10 @@ class DuetFeed:
     ) -> bool:
         """Queue a recorded post alert for the feed if it is eligible. Never blocks, never raises."""
         try:
-            ok, why = self._eligibility(kind=rec.kind, score=score, account=account, late=rec.late)
+            ok, why = self._eligibility(
+                kind=rec.kind, score=score, account=account, late=rec.late, red_flag_kind=rec.red_flag_kind
+            )
+            score = submission_score(rec, score)
             if not ok or score is None:
                 logger.debug("claude_duet: post %s not emailed (%s)", post.id, why)
                 return False
@@ -864,12 +938,13 @@ class DuetFeed:
         return True
 
     def _lowest_alert(self, incoming: _Item | None = None) -> _AlertItem | None:
+        """The lowest-ranked alert (red-flag rank, then score, the oldest first among equal ones)."""
         candidates: list[_AlertItem] = list(self._pending)
         if isinstance(incoming, _AlertItem):
             candidates.append(incoming)
         if not candidates:
             return None
-        return min(candidates, key=lambda i: (i.alert.score, i.queued_at))
+        return min(candidates, key=lambda i: (i.alert.rank_priority, i.alert.score, i.queued_at))
 
     def _drop(self, kind: str, post_ids: list[str], tickers: list[str], why: str) -> None:
         self.counters["dropped"] += 1
@@ -1338,10 +1413,13 @@ def duet_health(
 
 __all__ = [
     "ADDRESS_PLACEHOLDER",
+    "DENIED_MARK",
     "DUET_LINE",
     "DUET_STYLE",
+    "HACKED_MARK",
     "KIND_HEADER",
     "PREFACE",
+    "RED_FLAG_MARK",
     "SKILL_NAME",
     "DuetConfigCheck",
     "DuetFeed",

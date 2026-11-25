@@ -16,6 +16,9 @@
 #   include_retweets   false (default) = ignore plain reposts; quote posts are always included
 #   est_posts_per_day  only used for the startup cost estimate
 #   user_id            filled in by `verify --write`; do not edit by hand
+#
+# Further down: `sources` (accounts watched only for what they post about my tickers), the red-flag
+# word lists and `keyword_rules` (handle-less rules, including the red-flag early warning).
 
 ticker_groups:
   big_tech: [AAPL, MSFT, GOOGL, AMZN, META, NVDA]
@@ -502,8 +505,306 @@ accounts:
     include_replies: false
     est_posts_per_day: 4
 
+# --- Red-flag sources ----------------------------------------------------------------------------
+# Accounts watched ONLY for their posts that mention my tickers or companies (not everything they post):
+# short sellers, regulators, fast news wires and journalists - where bad news often appears first. The
+# "red-flag-sources" rule below streams those posts; alerts name the source and how credible it is.
+# Fields per source:
+#   handle             X handle without "@" (not also listed under accounts)
+#   kind               short_seller | regulator | newswire | journalist | other
+#   expect_name        display name we expect (verify checks it; news words like "News" are fine here)
+#   trusted            true = what it posts counts as a credible report (regulators, established wires);
+#                      false (default) = a claim to verify (short sellers, commentators)
+#   est_posts_per_day  its posts per day that mention my tickers/companies (cost estimate only)
+#   notes              free text
+#   user_id            filled in by `verify --write`; a source without one is NOT watched
+# After adding or changing a source, run `python -m ceoscan verify --write` to fill in its user_id.
+# Checked on X Nov 24-25, 2026 (all active). Left out: Citron (inactive; founder convicted of securities
+# fraud in June 2026), Hindenburg (closed Jan 2025), Bonitas (inactive), and handles not found on X.
+sources:
+  # Short sellers: they publish reports that make a stock fall, and profit when it does. What they
+  # post is always an allegation to verify, never a fact (trusted: false).
+  - handle: muddywatersre
+    user_id: "168679374"
+    kind: short_seller
+    expect_name: Muddy Waters Research
+    est_posts_per_day: 0.2
+    notes: Muddy Waters (Carson Block); shorted AppLovin
+  - handle: sprucepointcap
+    user_id: "2371952437"
+    kind: short_seller
+    expect_name: Spruce Point Capital
+    est_posts_per_day: 0.1
+  - handle: FuzzyPandaShort
+    user_id: "735203813921939457"
+    kind: short_seller
+    expect_name: Fuzzy Panda
+    est_posts_per_day: 0.1
+  - handle: WolfpackReports
+    user_id: "816683586552287232"
+    kind: short_seller
+    expect_name: Wolfpack Research
+    est_posts_per_day: 0.1
+  - handle: ResearchGrizzly
+    user_id: "1120714928518848512"
+    kind: short_seller
+    expect_name: Grizzly Research
+    est_posts_per_day: 0.05
+    notes: posts rarely (last post Oct 14, 2026)
+  - handle: KerrisdaleCap
+    user_id: "486139568"
+    kind: short_seller
+    expect_name: Kerrisdale Capital
+    est_posts_per_day: 0.1
+  - handle: CulperResearch
+    user_id: "945717991156736001"
+    kind: short_seller
+    expect_name: Culper
+    est_posts_per_day: 0.2
+    notes: shorted Nvidia in May 2026
+  - handle: GothamResearch
+    user_id: "955733059"
+    kind: short_seller
+    expect_name: Gotham City Research
+    est_posts_per_day: 0.05
+  - handle: viceroyresearch
+    user_id: "812145753338548224"
+    kind: short_seller
+    expect_name: Viceroy
+    est_posts_per_day: 0.1
+  - handle: JCap_Research
+    user_id: "3305918126"
+    kind: short_seller
+    expect_name: J Capital
+    est_posts_per_day: 0.1
+  # Regulators: their own posts are official (SEC charges, DOJ indictments, FDA and NHTSA actions).
+  - handle: SECGov
+    user_id: "18481050"
+    kind: regulator
+    expect_name: U.S. Securities and Exchange Commission
+    trusted: true
+    est_posts_per_day: 0.2
+  - handle: TheJusticeDept
+    user_id: "73181712"
+    kind: regulator
+    expect_name: U.S. Department of Justice
+    trusted: true
+    est_posts_per_day: 0.2
+  - handle: FTC
+    user_id: "187993109"
+    kind: regulator
+    expect_name: FTC
+    trusted: true
+    est_posts_per_day: 0.3
+  - handle: FDA
+    user_id: "208120290"
+    kind: regulator
+    expect_name: U.S. FDA
+    trusted: true
+    est_posts_per_day: 0.2
+  - handle: NHTSAgov
+    user_id: "49706919"
+    kind: regulator
+    expect_name: nhtsagov
+    trusted: true
+    est_posts_per_day: 0.2
+    notes: Tesla recalls and probes
+  - handle: FINRA
+    user_id: "35781013"
+    kind: regulator
+    expect_name: FINRA
+    trusted: true
+    est_posts_per_day: 0.05
+    notes: industry self-regulator, so X shows a blue check, not the grey government one (verify warns; expected)
+  # Established news organizations: a credible report, but still not the company's own word
+  # (Reuters and CNBC briefly ran the false "90-day tariff pause" headline in April 2025).
+  # The wires are NOT in the red-flag-sources rule: with 400K+ followers each, the red-flag rules
+  # already catch their bad-news posts. Listing them here labels those posts as trusted.
+  - handle: Reuters
+    user_id: "1652541"
+    kind: newswire
+    expect_name: Reuters
+    trusted: true
+    est_posts_per_day: 10
+  - handle: ReutersBiz
+    user_id: "15110357"
+    kind: newswire
+    expect_name: Reuters Business
+    trusted: true
+    est_posts_per_day: 10
+  - handle: business
+    user_id: "34713362"
+    kind: newswire
+    expect_name: Bloomberg
+    trusted: true
+    est_posts_per_day: 18
+  - handle: CNBC
+    user_id: "20402945"
+    kind: newswire
+    expect_name: CNBC
+    trusted: true
+    est_posts_per_day: 15
+  - handle: WSJmarkets
+    user_id: "28164923"
+    kind: newswire
+    expect_name: WSJ Markets
+    trusted: true
+    est_posts_per_day: 4
+  - handle: MarketWatch
+    user_id: "624413"
+    kind: newswire
+    expect_name: MarketWatch
+    trusted: true
+    est_posts_per_day: 8
+  - handle: barronsonline
+    user_id: "20449296"
+    kind: newswire
+    expect_name: Barron's
+    trusted: true
+    est_posts_per_day: 4
+  # Fast headline accounts: often first, but not news organizations (DeItaone amplified the false
+  # tariff-pause headline in April 2025). Labelled as a source, never trusted.
+  - handle: DeItaone
+    user_id: "2704294333"
+    kind: newswire
+    expect_name: Walter Bloomberg
+    est_posts_per_day: 20
+    notes: not affiliated with Bloomberg
+  - handle: FirstSquawk
+    user_id: "3295423333"
+    kind: newswire
+    expect_name: First Squawk
+    est_posts_per_day: 12
+  - handle: LiveSquawk
+    user_id: "59393368"
+    kind: newswire
+    expect_name: LiveSquawk
+    est_posts_per_day: 10
+  - handle: financialjuice
+    user_id: "381696140"
+    kind: newswire
+    expect_name: FinancialJuice
+    est_posts_per_day: 10
+  - handle: unusual_whales
+    user_id: "1200616796295847936"
+    kind: newswire
+    expect_name: unusual_whales
+    est_posts_per_day: 20
+  # Journalists who break Wall Street and accounting red-flag stories.
+  - handle: CGasparino
+    user_id: "68739089"
+    kind: journalist
+    expect_name: Charles Gasparino
+    est_posts_per_day: 4
+  - handle: herbgreenberg
+    user_id: "14276189"
+    kind: journalist
+    expect_name: Herb Greenberg
+    est_posts_per_day: 4
+
+# --- Red-flag words and company names (used by the red-flag keyword rules below) -----------------
+# red_flag_terms: words and "exact phrases" that mark bad news. X matches whole words, ignoring case,
+#   without stemming (so both downgrade and downgraded). Keep it short: every red-flag stream rule
+#   repeats the whole list, and one stream rule holds at most 1024 characters.
+# red_flag_names: every company name, matched next to the $CASHTAGS by the red-flag-sources rule (only
+#   unambiguous names: Visa is left out because "visa" is an everyday word; it is covered by $V). The two
+#   red-flag rules list their own tier's names; keep all three lists in step when adding a company.
+# Referenced in keyword rules as "@red_flag_terms" / "@red_flag_names".
+red_flag_terms:
+  - short report
+  - short seller
+  - we are short
+  - fraud
+  - accounting irregularities
+  - restatement
+  - going concern
+  - material weakness
+  - SEC investigation
+  - SEC probe
+  - subpoena
+  - Wells notice
+  - class action
+  - lawsuit
+  - indicted
+  - probe
+  - recall
+  - downgrade
+  - downgraded
+  - price target cut
+  - guidance cut
+  - cuts guidance
+  - lowers guidance
+  - profit warning
+  - bankruptcy
+  - delisting
+  - resigns
+  - steps down
+  - data breach
+  - hacked
+  - trading halted
+  - whistleblower
+  - scandal
+  - complete response letter
+  - clinical hold
+red_flag_names:
+  - Tesla
+  - SpaceX
+  - AMD
+  - Nvidia
+  - Supermicro
+  - Microsoft
+  - Google
+  - Alphabet
+  - Apple
+  - Amazon
+  - Meta
+  - MicroStrategy
+  - CleanSpark
+  - Robinhood
+  - SoFi
+  - Coinbase
+  - Intel
+  - Micron
+  - "Constellation Energy"
+  - Vistra
+  - "Talen Energy"
+  - Twilio
+  - Apnimed
+  - Cisco
+  - ASML
+  - "Texas Instruments"
+  - "Dell Technologies"
+  - Seagate
+  - "GE Vernova"
+  - Palantir
+  - AppLovin
+  - ServiceNow
+  - Shopify
+  - Uber
+  - Airbnb
+  - "Eli Lilly"
+  - AstraZeneca
+  - AbbVie
+  - Amgen
+  - "Monster Beverage"
+  - "Interactive Brokers"
+  - "CME Group"
+
 # Handle-less keyword rules: posts from accounts with at least min_followers that mention any
 # of the tickers (as $CASHTAGS) or terms (words, or "exact phrases" when they contain spaces).
+# Fields per rule:
+#   name               unique; part of the stream rule tag (ceoscan:kw:<name>:<n>)
+#   kind               keyword (default) | red_flag (tickers/terms AND a require_any word) |
+#                      source (posts by the sources above that mention the tickers/terms)
+#   tickers            "all" (every ticker in this file) or a list; matched as $CASHTAGS
+#   terms              words / phrases OR-ed with the cashtags; may be "@red_flag_names"
+#   require_any        a second word list that must ALSO match; may be "@red_flag_terms"
+#   from               kind source only: sources (every source with a user_id) or a list of source handles
+#   min_followers      only authors with at least this many followers (0 = no limit; default 1000000,
+#                      0 for source rules)
+#   extra_operators    X operators appended to the rule
+#   est_posts_per_day  cost estimate only (source rules: default = sum of their sources' estimates);
+#                      `python -m ceoscan counts` measures the real volume
 keyword_rules:
   - name: big-account-cashtags
     tickers: all                     # "all" = every ticker above; or a list like [TSLA, NVDA]
@@ -528,6 +829,41 @@ keyword_rules:
     min_followers: 20000
     extra_operators: "-is:retweet -is:reply lang:en"
     est_posts_per_day: 8
+  # Red flags: a post must name one of my tickers ($TSLA ...) or companies AND contain a red-flag word
+  # (red_flag_terms): short reports, fraud claims, probes, lawsuits, recalls, downgrades... as they start
+  # to spread on X, often a day before the headlines. Most are unverified at first - the alerts say so.
+  # Two tiers by how much a company is talked about, so the cost stays modest. Measured Nov 19-24, 2026
+  # with `counts` (no follower limit): ~2,500 red-flag posts/day for the 9 most-discussed companies,
+  # ~350/day for the other 33. The follower limits cut that to an estimated 1-4% / 10-20% (X can't
+  # count min_followers in advance, so these estimates are modeled - check the daily summary's cost).
+  - name: red-flags-mega
+    kind: red_flag
+    tickers: [TSLA, NVDA, MSFT, AMD, AAPL, GOOGL, AMZN, META, SPCX]
+    terms: [Tesla, SpaceX, AMD, Nvidia, Microsoft, Google, Alphabet, Apple, Amazon, Meta]
+    require_any: "@red_flag_terms"
+    min_followers: 100000
+    extra_operators: "-is:retweet -is:reply lang:en"
+    est_posts_per_day: 75
+  - name: red-flags
+    kind: red_flag
+    tickers: [APMD, SMCI, MSTR, CLSK, HOOD, SOFI, COIN, INTC, MU, CEG, VST, TLN, TWLO, CSCO, ASML, TXN, DELL, STX, GEV, PLTR, APP, NOW, SHOP, UBER, ABNB, LLY, AZN, ABBV, AMGN, MNST, V, IBKR, CME]
+    terms: [Supermicro, MicroStrategy, CleanSpark, Robinhood, SoFi, Coinbase, Intel, Micron, "Constellation Energy", Vistra, "Talen Energy", Twilio, Apnimed, Cisco, ASML, "Texas Instruments", "Dell Technologies", Seagate, "GE Vernova", Palantir, AppLovin, ServiceNow, Shopify, Uber, Airbnb, "Eli Lilly", AstraZeneca, AbbVie, Amgen, "Monster Beverage", "Interactive Brokers", "CME Group"]
+    require_any: "@red_flag_terms"
+    min_followers: 10000
+    extra_operators: "-is:retweet -is:reply lang:en"
+    est_posts_per_day: 60
+  # Red-flag sources: everything the short sellers, regulators and journalists above post about my
+  # tickers or companies, with or without a red-flag word (e.g. "We are short $NVDA"), any follower count.
+  # The news wires are left out: the red-flag rules already catch their bad-news posts.
+  # Measured upper bound ~26 posts/day; realistically ~10.
+  - name: red-flag-sources
+    kind: source
+    from: [muddywatersre, sprucepointcap, FuzzyPandaShort, WolfpackReports, ResearchGrizzly, KerrisdaleCap, CulperResearch, GothamResearch, viceroyresearch, JCap_Research, SECGov, TheJusticeDept, FTC, FDA, NHTSAgov, FINRA, CGasparino, herbgreenberg]
+    tickers: all
+    terms: "@red_flag_names"
+    min_followers: 0
+    extra_operators: "-is:retweet"
+    est_posts_per_day: 12
 
 # Company names / product words the fast rules treat like a ticker mention. Matching ignores case,
 # except: an alias written with a leading "=" (e.g. "=Gaudi") matches only with that exact case, and

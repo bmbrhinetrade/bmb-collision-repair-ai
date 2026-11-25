@@ -15,6 +15,8 @@ Overall status:
 The ``claude_desk`` block reports the Claude analyst desk (enabled, configured, fires today, last fire,
 last error, queued, budget left this hour), the ``claude_duet`` block the Claude Duet feed (emails today,
 last email, last error, queued, cap left this hour - never an address); neither affects the overall status.
+``today`` also counts red flags (``red_flags`` with ``red_flags_unverified``, ``spreading``, ``denials``,
+``compromises`` and ``red_flag_posts``: bad-news posts about my tickers seen, alerted or not).
 """
 
 from __future__ import annotations
@@ -200,6 +202,14 @@ class HealthServer:
             "desk_errors": stats.get("desk_errors", 0),
             "duet_emails": stats.get("duet_emails", 0),
             "duet_errors": stats.get("duet_errors", 0),
+            # red flags: bad-news alerts about my tickers (incl. "spreading"), how many of those were unverified
+            # or likely false, spreading / denied / possible-hijack alerts, and bad-news posts seen (alerted or not)
+            "red_flags": stats.get("red_flags", 0),
+            "red_flags_unverified": stats.get("red_flags_unverified", 0),
+            "spreading": stats.get("spreading", 0),
+            "denials": stats.get("denials", 0),
+            "compromises": stats.get("compromises", 0),
+            "red_flag_posts": stats.get("red_flag_posts", 0),
         }
 
     def snapshot(self, now: datetime | None = None) -> dict:

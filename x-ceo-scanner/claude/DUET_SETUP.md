@@ -256,13 +256,25 @@ Duet should answer with an example line such as
 If it does not find the test email, run the test command from step A6 again and ask it to check once
 more.
 
+**Red-flag emails arrive too.** ceoscan also emails early warnings of bad news about your stocks as it
+appears on X, labeled with how believable the source is (it may be false news): subjects such as
+`[ceoscan] 🚩 RED FLAG TSLA 7/10 bearish - UNVERIFIED - @handle`, `[ceoscan] 🚩 SPREADING TSLA - 4 accounts - all UNVERIFIED`,
+`[ceoscan] 🛡️ DENIED TSLA - @Tesla` and `[ceoscan] ⚠️ HACKED? @handle`. The skill already tells Duet how
+to check them (upload the updated skill, step C6). Optional: if you set Duet up before red flags existed,
+also send it this:
+
+```text
+ceoscan now also emails red flags: bad news about my stocks that appears on X, often before the news covers it, and some of it may be false. For each one, check whether the claim is true in primary sources (SEC filings, court records, regulators, the company's own site and X account) and tell me who is saying it and why. Put a CLAIM line (CONFIRMED, CREDIBLE, UNVERIFIED, LIKELY FALSE or DENIED) under the VERDICT line, and never repeat an unverified allegation as fact. Message me right away about confirmed or credible red flags with a score of 8 or more, any SPREADING or HACKED? alert, and any denial of an earlier red flag. For a HACKED? alert, tell me not to act on the post and to wait for the company.
+```
+
 ## Step F. Using it day to day
 
 You keep getting the instant phone push for every alert. Alerts that also went to Duet carry the line
 **"📨 Sent to Claude Duet - ask it about this alert"**. Then:
 
 - **Wait for Duet:** on its next check-in it messages you right away about anything important (ACT,
-  score 9-10, always-alert accounts) and puts the rest in your morning brief.
+  score 9-10, always-alert accounts, confirmed or credible red flags scoring 8+, spreading bad news,
+  possible hijacks and denials) and puts the rest in your morning brief.
 - **Or ask it directly** when a push catches your eye. Things you can say:
   - "Analyze my latest ceoscan alert."
   - "What's on my ceoscan watch list?"

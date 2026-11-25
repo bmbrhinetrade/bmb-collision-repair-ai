@@ -588,6 +588,11 @@ class OpsScheduler:
         desk_errors = int(stats.get("desk_errors") or 0)
         duet_emails = int(stats.get("duet_emails") or 0)
         duet_errors = int(stats.get("duet_errors") or 0)
+        red_flags = int(stats.get("red_flags") or 0)
+        red_unverified = int(stats.get("red_flags_unverified") or 0)
+        spreading = int(stats.get("spreading") or 0)
+        denials = int(stats.get("denials") or 0)
+        compromises = int(stats.get("compromises") or 0)
         avg_ms, max_ms = stats.get("avg_latency_ms"), stats.get("max_latency_ms")
 
         error_kinds: list[str] = []
@@ -631,6 +636,13 @@ class OpsScheduler:
             body_lines.append(f"Claude desk: {desk_fires} analyses ({desk_errors} failed)")
         if self.settings.claude_duet.enabled or duet_emails or duet_errors:
             body_lines.append(f"Claude Duet feed: {duet_emails} emails ({duet_errors} failed)")
+        if self.settings.red_flags.enabled or red_flags or denials or compromises:
+            red_line = f"Red flags: {red_flags} ({red_unverified} unverified, {spreading} spreading)"
+            if denials:
+                red_line += f", {denials} denied"
+            if compromises:
+                red_line += f", {compromises} possible hacked account{'s' if compromises != 1 else ''}"
+            body_lines.append(red_line)
         body_lines += [
             f"Errors: {errors_line}" if errors else "Errors: none",
             f"Ingest: {st.mode} / {st.state}, {st.reconnects} reconnect(s) since start",
@@ -647,6 +659,7 @@ class OpsScheduler:
             + (f", avg {avg_ms / 1000:.1f}s" if avg_ms is not None else "")
             + f", {errors} errors"
             + (f", {score_errors} scoring errors" if score_errors else "")
+            + (f", {red_flags} red flags" if red_flags else "")
             + (f", {st.reconnects} reconnects" if st.reconnects else "")
         )
         return AlertMessage(

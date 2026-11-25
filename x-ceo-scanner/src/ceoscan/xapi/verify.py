@@ -20,6 +20,12 @@ Flow (``python -m ceoscan verify [--write] [--accept-warnings]``):
 
 Accounts without a user id are never streamed, so an unverified handle can never trigger alerts.
 A changed user id is a warning, so it is only written with ``--accept-warnings``.
+
+The watchlist's ``sources`` (short sellers, regulators, news wires and journalists watched only for
+posts about my tickers) go through the same checks with :func:`verify_sources` / :func:`assess_source`
+(results carry ``section="sources"``): news-style display-name words ("News", "Alerts") are normal
+there, and a ``regulator`` is expected to have the government (grey) badge. ``write_user_ids`` stores
+their ids under the ``sources`` entries.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 from ruamel.yaml.tokens import CommentToken
 
 from ..config import load_watchlist
-from ..models import Account, Watchlist
+from ..models import Account, Source, Watchlist
 from ..timeutil import now_utc, snowflake_to_datetime
 from .client import (
     CreditsDepleted,
@@ -100,6 +106,8 @@ _SUSPICIOUS_NAME_WORDS = frozenset(
         "bot",
     }
 )
+# For sources (news wires, research accounts) "news", "alerts", "updates" ... are normal; these are not.
+_SOURCE_SUSPICIOUS_NAME_WORDS = frozenset({"parody", "fan", "fans", "fanclub", "fake", "satire", "unofficial"})
 _NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
 
 #: VerifyResult.error_kind values for a failed lookup request (see :func:`batch_failure`).
@@ -127,6 +135,8 @@ class VerifyResult:
     error_kind: str | None = None
     #: X's error text for a failed lookup request
     error_detail: str | None = None
+    #: which watchlist list the handle is in: "accounts" or "sources"
+    section: str = "accounts"
 
     @property
     def ok(self) -> bool:
@@ -176,10 +186,10 @@ def name_matches(expected: str, actual: str) -> bool:
     )
 
 
-def suspicious_name_words(expected: str, actual: str) -> list[str]:
+def suspicious_name_words(expected: str, actual: str, words: frozenset[str] = _SUSPICIOUS_NAME_WORDS) -> list[str]:
     """Words like "parody", "fan" or "news" in ``actual`` that ``expected`` does not have."""
     exp = set(_name_tokens(expected))
-    found = [t for t in _name_tokens(actual) if t in _SUSPICIOUS_NAME_WORDS and t not in exp]
+    found = [t for t in _name_tokens(actual) if t in words and t not in exp]
     if "affiliated" in _name_tokens(actual) and "affiliated" not in exp:  # "not affiliated with ..."
         found.append("affiliated")
     return list(dict.fromkeys(found))
@@ -204,6 +214,27 @@ def _as_int(value: Any) -> int | None:
 
 def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
     """Check one /2/users/by user object against what the watchlist expects (pure function)."""
+    return _assess(account, user, now)
+
+
+def _source_as_account(source: Source) -> Account:
+    return Account(handle=source.handle, tickers=(), kind="person", expect_name=source.expect_name,
+                   user_id=source.user_id)
+
+
+def assess_source(source: Source, user: dict, now: datetime) -> VerifyResult:
+    """:func:`assess_user` for a watchlist ``sources`` entry (pure function).
+
+    The same checks (pinned id, badge, parody, protected, followers, account age, name, activity),
+    except: news-style words in the display name are normal for a news wire, and a ``regulator`` is
+    expected to have the government (grey) badge.
+    """
+    result = _assess(_source_as_account(source), user, now, source_kind=source.kind)
+    result.section = "sources"
+    return result
+
+
+def _assess(account: Account, user: dict, now: datetime, source_kind: str | None = None) -> VerifyResult:
     raw_metrics = user.get("public_metrics")
     metrics: dict[str, Any] = raw_metrics if isinstance(raw_metrics, dict) else {}
     followers = _as_int(metrics.get("followers_count"))
@@ -246,6 +277,10 @@ def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
 
     if account.kind == "company" and is_verified and vtype != "business":
         problems.append(f"company account but verified_type is {vtype or 'unknown'!r} (expected 'business' gold check)")
+    if source_kind == "regulator" and is_verified and vtype != "government":
+        problems.append(
+            f"regulator source but verified_type is {vtype or 'unknown'!r} (expected 'government' grey check)"
+        )
     if parody:
         problems.append("parody account")
     if protected:
@@ -255,15 +290,17 @@ def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
     if created_at is not None:
         account_age = now - created_at
         if account_age < timedelta(days=RECENT_ACCOUNT_DAYS):
+            what = "CEO/company" if source_kind is None else "news, research or regulator"
             problems.append(
                 f"new account: created {created_at:%Y-%m-%d} ({max(account_age.days, 0)} days ago); "
-                "a real CEO/company account is usually years old (re-registered handle?)"
+                f"a real {what} account is usually years old (re-registered handle?)"
             )
     if account.expect_name and name is not None:
         if not name_matches(account.expect_name, str(name)):
             problems.append(f"display name {str(name)!r} does not match expected {account.expect_name!r}")
         else:
-            odd = suspicious_name_words(account.expect_name, str(name))
+            words = _SUSPICIOUS_NAME_WORDS if source_kind is None else _SOURCE_SUSPICIOUS_NAME_WORDS
+            odd = suspicious_name_words(account.expect_name, str(name), words)
             if odd:
                 problems.append(
                     f"display name {str(name)!r} contains {', '.join(repr(w) for w in odd)} "
@@ -294,13 +331,13 @@ def assess_user(account: Account, user: dict, now: datetime) -> VerifyResult:
     )
 
 
-def _error_result(account: Account, error: dict) -> VerifyResult:
+def _error_result(account: Account, error: dict, section: str = "accounts") -> VerifyResult:
     """Map an entry of the /2/users/by "errors" array to not_found / suspended."""
     title = str(error.get("title") or "")
     detail = str(error.get("detail") or title or "not found")
     text = f"{title} {detail}".lower()
     status = "suspended" if "suspend" in text else "not_found"
-    return VerifyResult(handle=account.handle, status=status, problems=[detail])
+    return VerifyResult(handle=account.handle, status=status, problems=[detail], section=section)
 
 
 # --------------------------------------------------------------------------- lookup
@@ -348,7 +385,13 @@ async def _lookup_ids(client: Any, ids: list[str]) -> tuple[list[dict], list[dic
     return (users if isinstance(users, list) else []), (errors if isinstance(errors, list) else [])
 
 
-async def _check_pinned_ids(client: Any, watchlist: Watchlist, results: list[VerifyResult], now: datetime) -> None:
+async def _check_pinned_ids(
+    client: Any,
+    by_handle: dict[str, Account],
+    results: list[VerifyResult],
+    now: datetime,
+    assess: Any = assess_user,
+) -> None:
     """For not-found / suspended handles with a pinned user_id, look the id up before it is dropped.
 
     A renamed account keeps its id: report it as a warning naming the new handle (the pinned id is
@@ -356,7 +399,6 @@ async def _check_pinned_ids(client: Any, watchlist: Watchlist, results: list[Ver
     ``not_found`` / ``suspended`` (and ``write_user_ids`` removes the id). If the id lookup fails,
     the id is kept as well.
     """
-    by_handle = watchlist.by_handle()
     todo = [
         (i, by_handle[r.handle.lower()])
         for i, r in enumerate(results)
@@ -379,7 +421,7 @@ async def _check_pinned_ids(client: Any, watchlist: Watchlist, results: list[Ver
             old = results[i]
             user = users.get(str(acct.user_id))
             if user is not None:
-                assessed = assess_user(acct, user, now)
+                assessed = assess(acct, user, now)
                 new_handle = assessed.username or "?"
                 assessed.problems.insert(
                     0,
@@ -406,11 +448,26 @@ async def verify_accounts(client: XClient, watchlist: Watchlist, now: datetime |
     (never raises for X/network errors, so the report can still be printed; see
     :func:`batch_failure`).
     """
-    now = now or now_utc()
-    accounts = list(watchlist.accounts)
+    return await _verify_entries(client, list(watchlist.accounts), now or now_utc(), assess_user, "accounts")
+
+
+async def verify_sources(client: XClient, watchlist: Watchlist, now: datetime | None = None) -> list[VerifyResult]:
+    """:func:`verify_accounts` for the watchlist's ``sources`` (results have ``section="sources"``)."""
+    by_handle = {s.handle_lower: s for s in watchlist.sources}
+
+    def assess(acct: Account, user: dict, at: datetime) -> VerifyResult:
+        return assess_source(by_handle[acct.handle_lower], user, at)
+
+    entries = [_source_as_account(s) for s in watchlist.sources]
+    return await _verify_entries(client, entries, now or now_utc(), assess, "sources")
+
+
+async def _verify_entries(
+    client: Any, entries: list[Account], now: datetime, assess: Any, section: str
+) -> list[VerifyResult]:
     results: list[VerifyResult] = []
-    for start in range(0, len(accounts), LOOKUP_BATCH):
-        batch = accounts[start : start + LOOKUP_BATCH]
+    for start in range(0, len(entries), LOOKUP_BATCH):
+        batch = entries[start : start + LOOKUP_BATCH]
         try:
             users, errors = await client.lookup_users([a.handle for a in batch], VERIFY_USER_FIELDS)
         except _LOOKUP_ERRORS as exc:
@@ -425,6 +482,7 @@ async def verify_accounts(client: XClient, watchlist: Watchlist, now: datetime |
                     problems=[f"X API lookup failed: {msg}"],
                     error_kind=kind,
                     error_detail=msg,
+                    section=section,
                 )
                 for a in batch
             )
@@ -440,16 +498,26 @@ async def verify_accounts(client: XClient, watchlist: Watchlist, now: datetime |
         for account in batch:
             user = by_name.get(account.handle_lower)
             if user is not None:
-                results.append(assess_user(account, user, now))
+                results.append(assess(account, user, now))
             elif account.handle_lower in errors_by_value:
-                results.append(_error_result(account, errors_by_value[account.handle_lower]))
+                results.append(_error_result(account, errors_by_value[account.handle_lower], section))
             else:
                 results.append(
-                    VerifyResult(handle=account.handle, status="error", problems=["X returned no data for this handle"])
+                    VerifyResult(
+                        handle=account.handle,
+                        status="error",
+                        problems=["X returned no data for this handle"],
+                        section=section,
+                    )
                 )
-    await _check_pinned_ids(client, watchlist, results, now)
+    await _check_pinned_ids(client, {a.handle_lower: a for a in entries}, results, now, assess)
+    for r in results:
+        r.section = section
     counts = {s: sum(1 for r in results if r.status == s) for s in STATUSES}
-    logger.info("verify: %d handles checked: %s", len(results), ", ".join(f"{k}={v}" for k, v in counts.items() if v))
+    logger.info(
+        "verify: %d %s checked: %s", len(results), "sources" if section == "sources" else "handles",
+        ", ".join(f"{k}={v}" for k, v in counts.items() if v),
+    )
     return results
 
 
@@ -527,11 +595,14 @@ _STATUS_LABEL = {
 }
 
 
-def format_verify_report(results: list[VerifyResult]) -> str:
-    """A table of every handle plus a list of handles that were not found or look wrong."""
+def format_verify_report(results: list[VerifyResult], title: str = "X account verification") -> str:
+    """A table of every handle plus a list of handles that were not found or look wrong.
+
+    ``title`` heads the report, e.g. "Sources" for the red-flag sources' separate table.
+    """
     counts = {s: sum(1 for r in results if r.status == s) for s in STATUSES}
     summary = ", ".join(f"{counts[s]} {s.replace('_', ' ')}" for s in STATUSES)
-    lines = [f"X account verification: {len(results)} handle(s): {summary}"]
+    lines = [f"{title}: {len(results)} handle(s): {summary}"]
     if not results:
         return lines[0]
 
@@ -665,6 +736,21 @@ def _delete_key(cmap: CommentedMap, key: str) -> None:
     _append_comment_lines(cmap, keys[idx - 1], rest, token)
 
 
+def _entries_with_results(data: Any, results: list[VerifyResult]) -> list[tuple[CommentedMap, VerifyResult]]:
+    """(watchlist YAML entry, its verify result) for the ``accounts`` and ``sources`` lists."""
+    pairs: list[tuple[CommentedMap, VerifyResult]] = []
+    for section in ("accounts", "sources"):
+        by_handle = {r.handle.lstrip("@").lower(): r for r in results if (r.section or "accounts") == section}
+        items = data.get(section) if isinstance(data, CommentedMap) else None
+        for item in items or []:
+            if not isinstance(item, CommentedMap):
+                continue
+            r = by_handle.get(str(item.get("handle", "")).strip().lstrip("@").lower())
+            if r is not None:
+                pairs.append((item, r))
+    return pairs
+
+
 def write_user_ids(watchlist_path: Path, results: list[VerifyResult], accept_warnings: bool = False) -> int:
     """Write verified user ids into the watchlist YAML, preserving comments and layout.
 
@@ -674,23 +760,16 @@ def write_user_ids(watchlist_path: Path, results: list[VerifyResult], accept_war
     * ``not_found`` / ``suspended``: remove ``user_id`` so the handle is no longer streamed.
     * ``warning`` (not accepted) / ``error``: left unchanged.
 
-    The new file is validated with :func:`load_watchlist` and replaced atomically.
-    Returns the number of accounts changed (0 -> the file is not rewritten).
+    Results with ``section="sources"`` (from :func:`verify_sources`) update the ``sources`` entries,
+    the others the ``accounts`` entries. The new file is validated with :func:`load_watchlist` and
+    replaced atomically. Returns the number of entries changed (0 -> the file is not rewritten).
     """
     path = Path(watchlist_path)
     yaml = _round_trip_yaml()
     original = path.read_text(encoding="utf-8")
     data = yaml.load(original)
-    by_handle = {r.handle.lstrip("@").lower(): r for r in results}
-    items = data.get("accounts") if isinstance(data, CommentedMap) else None
     changed = 0
-    for item in items or []:
-        if not isinstance(item, CommentedMap):
-            continue
-        handle = str(item.get("handle", "")).strip().lstrip("@").lower()
-        r = by_handle.get(handle)
-        if r is None:
-            continue
+    for item, r in _entries_with_results(data, results):
         current = item.get("user_id")
         current_s = str(current).strip() if current is not None else None
         if r.status == "ok" or (r.status == "warning" and accept_warnings):
@@ -742,6 +821,7 @@ def write_user_ids(watchlist_path: Path, results: list[VerifyResult], accept_war
 __all__ = [
     "VERIFY_USER_FIELDS",
     "VerifyResult",
+    "assess_source",
     "assess_user",
     "batch_failure",
     "format_verify_report",
@@ -749,5 +829,6 @@ __all__ = [
     "record_results",
     "suspicious_name_words",
     "verify_accounts",
+    "verify_sources",
     "write_user_ids",
 ]

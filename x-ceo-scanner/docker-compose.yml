@@ -8,7 +8,7 @@
 #   curl -s 127.0.0.1:8080/health
 #   docker compose logs -f --tail 100
 #
-# Any sub-command works the same way: docker compose run --rm ceoscan cost | check-access | rules |
+# Any sub-command works the same way: docker compose run --rm ceoscan cost | counts | check-access | rules |
 # test-alert | test-desk | test-duet | replay samples/sample_posts.jsonl   (`run` does not publish
 # ports, so it can run next to the live service). After `git pull`, rebuild: docker compose up -d --build
 services:

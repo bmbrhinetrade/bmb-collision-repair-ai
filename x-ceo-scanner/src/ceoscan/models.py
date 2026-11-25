@@ -204,6 +204,9 @@ class RuleResult:
     own_flagged: bool = False
     own_categories: list[str] = field(default_factory=list)
     own_rule_score: int = 0
+    # Tickers named in the author's OWN words ($cashtags, bare tickers, company names): a denial or a rules-only
+    # red flag is about these, never about a ticker only the quoted / parent post names.
+    own_tickers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -236,7 +239,7 @@ class Credibility:
     level: CredibilityLevel
     reasons: list[str] = field(default_factory=list)  # human readable, e.g. "business-verified, 2.1M followers"
     is_official: bool = False  # the author is a watched company / CEO account
-    is_trusted_source: bool = False  # a trusted `sources` entry (regulator / wire) or a trusted link domain
+    is_trusted_source: bool = False  # a trusted `sources` entry (regulator / wire); a link alone never sets it
     source_kind: str | None = None  # Source.kind when the author is a listed source
     possible_impersonation: bool = False  # display name / handle imitates a watched company or person
     possible_compromise: bool = False  # a watched account posting scam-like content (likely hijacked)

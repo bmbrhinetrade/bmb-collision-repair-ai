@@ -16,6 +16,7 @@ when a post could move one of your tickers.
 [Setup](#setup-step-by-step) ·
 [Deploy](#8-deploy-to-a-linux-server) ·
 [Operations](#operations) ·
+[Red flags](#red-flags-and-false-news) ·
 [Claude Duet](#claude-duet-recommended) ·
 [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) ·
 [CLI](#cli-reference) ·
@@ -59,6 +60,12 @@ when a post could move one of your tickers.
 - **Decides** whether to alert: score at or above the threshold (7), quiet hours (22:00-06:30
   local, only scores of 9+), always-alert accounts, jokes only at 9+, and the ticker must be one
   of yours.
+- **Red flags and false news.** Early warning when bad news about one of your tickers (a short
+  report, fraud or accounting claims, a probe or lawsuit, a recall, a downgrade, a guidance cut, an
+  executive exit, a hack, a failed trial) appears on X, often a day before the headlines. Each alert
+  says how credible the source is, because some of it is false; extra alerts go out when the bad news
+  is spreading across several accounts, when a watched company denies it, and when a watched account
+  looks hijacked. See [Red flags and false news](#red-flags-and-false-news).
 - **Pushes** the alert through ntfy and/or Pushover, plus optional Twilio SMS and email.
 - **Watches itself.** It has a health endpoint, sends an alert when the stream has been down for
   more than 2 minutes (and when it recovers), sends a daily summary at 6 PM PT and logs per-alert
@@ -359,9 +366,11 @@ warning and uses the environment.
 
 Also in the watchlist: `ticker_groups`, `my_tickers` (extra tickers you care about),
 `keyword_rules` (handle-less `$CASHTAG` rules for very large accounts, filtered by
-`min_followers`; keys `name`, `tickers` (`all` or a list), `min_followers`, `extra_operators`,
-`est_posts_per_day`) and `company_names` (names and product words the fast rules treat like a
-ticker mention, e.g. `TSLA: [Tesla, "Model Y"]`). Aliases match in any letter case, except that
+`min_followers`; keys `name`, `kind` (`keyword`, `red_flag` or `source`), `tickers` (`all` or a
+list), `terms`, `require_any`, `from`, `min_followers`, `extra_operators`, `est_posts_per_day`),
+`sources` and the word lists `red_flag_terms` / `red_flag_names` (see
+[Red flags and false news](#red-flags-and-false-news)), and `company_names` (names and product words
+the fast rules treat like a ticker mention, e.g. `TSLA: [Tesla, "Model Y"]`). Aliases match in any letter case, except that
 an alias written with a leading `=` (e.g. `"=Gaudi"`) matches only with exact case, and common
 words are exact-case automatically (Strategy, Base, Meta, Instinct, Llama, Optimus, Rubin, Gemini,
 Copilot, Azure, Intel, Alphabet; Strategy and Base also never match as a sentence's first word).
@@ -425,6 +434,7 @@ all stop the start with a message naming the setting, instead of failing later o
 | `claude_duet.context_days` | `7` | recent alerts (max 10) for the same tickers or accounts sent along as context |
 | `claude_duet.subject_prefix` | `"[ceoscan]"` | every subject starts with this; the `ceoscan-alert-desk` skill looks for it, so change both together |
 | `claude_duet.max_text_chars` | `60000` | one email body (preface + alert data, 2,000-100,000); the longest fields are cut first |
+| `red_flags.*` | see the section | early warning on bad news and false news about your tickers: `enabled`, `min_score` (6), `alert_unverified`, `alert_likely_false`, the spreading window, the denial lookback and the credibility thresholds; see [Red flags and false news](#red-flags-and-false-news) |
 
 ### 7. Verify handles, check access, preview rules and cost, send a test alert
 
@@ -806,6 +816,259 @@ handle, whether it was flagged, the score and the decision, then a summary.
 
 ---
 
+## Red flags and false news
+
+Bad news about a company (a short-seller report, fraud or accounting claims, a regulator's probe, a
+lawsuit, a recall, a downgrade, a guidance cut, an executive's sudden exit, a hack, a failed trial)
+often appears on X hours or a day before the mainstream news reports it, and the stock can drop when
+it does. Some of it is false: a fabricated claim, an impersonator, a parody, a hijacked account, old
+news recycled, or a short seller talking their book. ceoscan gives you **early warning** of such
+posts about your tickers, **labels how credible the source is**, raises extra alerts when the bad
+news **spreads**, is **denied**, or comes from a **possibly hijacked** account, and hands the strong
+cases to [Claude Duet](#claude-duet-recommended) and the
+[Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) to verify.
+
+> **Alerts only.** Nothing here trades. ceoscan never presents an allegation as fact: every red-flag
+> alert carries a claim label such as UNVERIFIED (a spreading alert carries the strongest label in its
+> window, such as "all UNVERIFIED"), and the Claude playbooks forbid repeating an unverified claim as
+> fact.
+
+### What is detected
+
+Bad news reaches ceoscan three ways:
+
+1. **Your watched accounts**, as always (every post).
+2. **The two red-flag keyword rules** in `config/watchlist.yaml`: a post (English, no reposts or
+   replies) that names one of your tickers as a `$CASHTAG` or one of your companies (for example
+   Tesla, Nvidia, "Eli Lilly"; ambiguous words such as "visa" are left out) **and** contains a
+   red-flag word or phrase. The rules are split by how much a company is talked about, so the cost
+   stays modest: `red-flags-mega` covers the 9 most-discussed companies (TSLA, NVDA, MSFT, AMD, AAPL,
+   GOOGL, AMZN, META, SPCX) from accounts with 100,000+ followers, and `red-flags` covers the other 33
+   from accounts with 10,000+ followers. (APMD also has its own rule at 1,000+ followers, and every
+   post that reaches ceoscan is checked for red flags, whichever rule matched it.) The red-flag
+   words are `red_flag_terms`, for example
+   short report, short seller, fraud, accounting irregularities, restatement, going concern, material weakness, SEC
+   investigation, subpoena, Wells notice, class action, lawsuit, indicted, probe, recall, downgrade,
+   price target cut, guidance cut, profit warning, bankruptcy, delisting, resigns, steps down, data
+   breach, hacked, trading halted, whistleblower, scandal, complete response letter, clinical hold).
+   X matches whole words, ignoring case, without stemming. Keep the lists short: every red-flag
+   stream rule repeats them, and one rule holds at most 1,024 characters.
+3. **Sources** (see [Sources](#sources-short-sellers-regulators-wires-journalists) below): short
+   sellers, regulators, news wires and journalists you list, watched only for their posts that
+   mention your tickers or companies.
+
+Claude scores each post as usual and also says whether it reports or alleges a negative event (a red
+flag), its types, a claim status, a false-news risk and a one-line credibility note:
+
+| Red-flag type | Examples |
+|---|---|
+| `short_report` | a short-seller report or a public short position |
+| `fraud_accounting` | fraud allegations, accounting irregularities, a restatement, an auditor's exit, going-concern doubt |
+| `legal_regulatory` | SEC / DOJ / FTC / state probes, subpoenas, Wells notices, lawsuits, charges, fines |
+| `product_safety` | recalls, safety defects, FDA warning letters, crashes |
+| `financial_warning` | a guidance cut, a profit warning, missed payments, bankruptcy, delisting, dilution |
+| `executive` | a sudden CEO / CFO exit, misconduct, insider dumping |
+| `analyst_downgrade` | a downgrade, a price-target cut, an initiation at sell |
+| `security_incident` | a hack, a data breach, an outage |
+| `account_compromise` | a watched company / CEO account posting scam-like content |
+| `clinical_setback` | a failed trial or missed endpoint, an FDA complete response letter, a clinical hold |
+| `other` | any other negative risk event |
+
+If Claude is unavailable, the rules-only score derives the red-flag fields from keyword patterns in the
+author's own words. These patterns skip marketing and protective wording ("stop cyberattacks", "zero
+outages", "ways to stay safe from fraud"), positive outcomes tied to the event ("lawsuit dismissed",
+"SEC closes its investigation"; a share-price move never counts), scheduled halts, a company suing
+someone ("we filed a lawsuit against ..."), a rival's bad news, and questions, conditions and recaps. A
+watched account's rules-only red flag is CONFIRMED (official) only when it is about its own company (its
+tickers or company names in its own words, or a first-person sentence such as "we are recalling"); a
+claim it makes about another of your companies is UNVERIFIED and carries only that company's tickers;
+anything else from it ("massive fraud in government spending") is not a red flag. A red-flag post about
+your tickers alerts from Claude impact `red_flags.min_score` (6) instead of `scoring.threshold` (7) (the
+lower of the two); jokes still need `scoring.joke_threshold`.
+
+### Credibility labels
+
+Every red-flag alert carries two labels. **Treat both as hints, not proof.**
+
+**Source credibility** is computed by ceoscan from the author's account metadata (verification
+type, followers, account age, X's parody label, whether it is a watched account or a listed source),
+not from the post's words. Each alert lists the reasons, including links to `trusted_domains` sites; a
+link is only a hint (anyone can link to reuters.com or a paid press-release wire) and never raises
+the level.
+
+| Level | What it means |
+|---|---|
+| OFFICIAL | the watched company or CEO account itself |
+| TRUSTED | a listed source with `trusted: true` (a regulator, an established wire) or a business- or government-verified account with `trusted_min_followers` (1,000,000)+ followers (a link to `trusted_domains` alone never counts) |
+| ESTABLISHED | a blue- or business-verified account with `established_min_followers` (50,000)+ followers and more than a year old, or a listed source without `trusted: true` (a short seller, a journalist): still a claim to check |
+| UNVERIFIED | any other account: a claim, not a fact |
+| SUSPICIOUS | an account younger than `suspicious_account_age_days` (90), an account with X's parody label, a display name or handle that imitates a watched person or a watched company's name (business- and government-verified accounts excepted; a handle only imitates when the extra characters are decoration such as `elonmusk_ceo` or `real_elonmusk`, never another word such as `MacroStrategy`, and never for an account over two years old with `established_min_followers`+ followers), or a watched account posting scam-like crypto content (a possible hijack) |
+
+**Claim status** is Claude's judgment of the post, given the source, capped by ceoscan against the
+source's credibility: only the watched account itself, about its own tickers, can be CONFIRMED; only an
+OFFICIAL or TRUSTED author can be CREDIBLE; a possible impersonator's claim is LIKELY FALSE.
+
+| Claim status | Label (Duet subject, Claude's CLAIM line) | What it means |
+|---|---|---|
+| `confirmed_official` | CONFIRMED | the company itself (its own account, about its own company) says it |
+| `credible_report` | CREDIBLE | a trusted source (a regulator, a wire, a large verified organisation) reports it; not yet confirmed by the company |
+| `unverified` | UNVERIFIED | an allegation; it could be false (alerted while `alert_unverified: true`) |
+| `likely_false` | LIKELY FALSE | signs of false news (an impersonator, a parody, recycled or contradicted news); still alerted while `alert_likely_false: true`, because false news can move a stock too |
+| `denial` | DENIED | the post denies an earlier claim |
+
+### The extra alert types
+
+| Alert | When | Claude Duet email subject |
+|---|---|---|
+| Red flag | one bad-news post about your tickers at impact `min_score` (6)+ | `[ceoscan] 🚩 RED FLAG TSLA 7/10 bearish - UNVERIFIED - @handle` |
+| Spreading | `spread_min_authors` (3) different accounts post red flags about the same ticker within `spread_window_minutes` (60), counted over the busiest window around each post (posts are scored in parallel and can finish out of order); at most once per ticker per `spread_cooldown_minutes` (180). The title, SMS and subject carry the strongest claim in the window ("incl. CONFIRMED", "incl. CREDIBLE", "all UNVERIFIED", "all LIKELY FALSE"); an all-UNVERIFIED wave is capped like an UNVERIFIED red flag, an all-LIKELY FALSE one like a LIKELY FALSE one, and no spreading alert goes out when every post in the window is a claim whose alerts are turned off (`alert_unverified` / `alert_likely_false`) | `[ceoscan] 🚩 SPREADING TSLA - 4 accounts - all UNVERIFIED` |
+| Denied | a watched company or CEO account denies a recent red flag (tracked within `denial_lookback_hours` (48), whether or not it alerted) about **its own tickers**. A reply to or quote of a tracked red-flag post denies exactly that post; a stand-alone denial covers the ticker's UNVERIFIED / LIKELY FALSE red flags, never confirmed or credible reports. When Claude scored the post, Claude must read it as a denial (or it must answer a tracked red flag): "Fake news" under an unrelated post that merely names the company denies nothing, and a post that itself reports bad news is never a denial | `[ceoscan] 🛡️ DENIED TSLA - @Tesla` |
+| Possible hijack | a watched account posts scam-like content: a wallet address next to hype words, a memecoin trading site (pump.fun, dexscreener.com, ...), a send-and-get-back scam, a look-alike link domain (coinbase-airdrop.xyz) next to a hype word, or several hype words (airdrop, presale, giveaway, claim now, connect wallet, NFT mint, token launch), as in the reported July 2026 hijack of @vladtenev's account to promote a memecoin. Ordinary product language ("send USDC to anyone", "claim your rewards", "launching the cbBTC token") is not enough, @handles never count, and when Claude scored the post and the signals are not definitive (no address, memecoin site or send-and-get-back scam), Claude must agree. Do not act on such a post; wait for the company. The alert shows the post with "[link removed]" / "[address removed]" in place of its links and wallet addresses. | `[ceoscan] ⚠️ HACKED? @handle` |
+
+**Phone pushes and quiet hours:** an UNVERIFIED red flag is pushed at most at high priority and never
+with Pushover priority 1 (which bypasses the phone's do-not-disturb); a LIKELY FALSE one at most at
+normal priority, with no SMS and no Pushover priority 1 whatever its score (no urgent wake-up for a
+rumor). Spreading and denied alerts are at least high / normal and follow the impact upwards (a
+confirmed restatement stays urgent when it also completes a spreading wave). During quiet hours a red
+flag at `scoring.quiet_hours_threshold` (9)+ alerts as usual; a red flag below it, and spreading and
+denied alerts below it, are delivered silently (low priority, no SMS, no Pushover priority 1), so bad
+news posted overnight is waiting on your phone in the morning instead of being dropped; a possible
+hijack ignores quiet hours, because it protects you from acting on a fake post.
+
+A Duet batch that holds red flags starts with 🚩 (⚠️ when one is a possible hijack) and counts them,
+for example `[ceoscan] 🚩 3 alerts (2 red flags): TSLA, NVDA (top 8/10)`. The emoji travel in the
+standard encoded form of email headers (RFC 2047), so every mail program shows them.
+
+### Verification: Claude Duet and the analyst desk
+
+ceoscan labels; Claude checks. Red-flag alerts go to Duet and the desk at a lower bar than other
+alerts:
+
+- a **red flag** qualifies from `min(claude_duet.min_score, red_flags.min_score)` (6 with the
+  defaults; for the desk `claude_desk.min_score`);
+- **spreading**, **denied** and **possible hijack** alerts always qualify. The usual rules still
+  apply: the desk only gets delivered alerts that are not late, Duet gets late ones while
+  `claude_duet.include_late` is true, and the hourly caps hold. These three rank first in a batch.
+
+Each red-flag alert in the email or fire text carries a **Red flag check** block in two parts. The
+first is computed by ceoscan from account metadata and its own records: the alert type, the
+credibility level and its reasons, the source details (official account, trusted source, listed
+source kind, possible impersonation, possible hijack, link domains), and the signal (distinct accounts
+posting red flags about the ticker in the window, who confirmed - official / trusted accounts whose own
+claim was CONFIRMED or CREDIBLE - or denied it, links to the related posts). The second is Claude's
+reading of the untrusted post: the red-flag types, the claim status (capped by ceoscan as above), the
+false-news risk and the credibility note. That part comes from the post, so it is neutralized like the
+reason; the post text stays fenced as untrusted data.
+
+The skill ([`claude/skills/ceoscan-alert-desk/SKILL.md`](claude/skills/ceoscan-alert-desk/SKILL.md))
+and the desk prompt ([`claude/desk_prompt.md`](claude/desk_prompt.md)) have a section "Red flags and
+possible false news": check primary sources (SEC EDGAR filings including 8-Ks, lawsuits on
+CourtListener / PACER, regulator press releases, the company's newsroom, investor-relations site and
+official X account, reputable outlets), look for a denial, check whether it is old news recycled,
+ask who says it and why (a short seller with a disclosed position, a new or impersonator account, a
+parody), and check the market reaction since the post. The answer keeps the `VERDICT: ...` first
+line and adds a second line `CLAIM: CONFIRMED | CREDIBLE | UNVERIFIED | LIKELY FALSE | DENIED - <why>`.
+For a possible hijack Claude tells you not to act on the post and to wait for the company; for a
+denial it compares with the earlier drop; for spreading it says what is new and what is just
+repetition. Duet messages you right away for CONFIRMED or CREDIBLE red flags scoring 8+, any
+spreading or possible-hijack alert, and denials of earlier red flags.
+
+**After updating ceoscan**, upload the updated skill again (DUET_SETUP step C6) and paste the new
+desk prompt into your scheduled task. [`claude/DUET_SETUP.md`](claude/DUET_SETUP.md) has an optional
+message that tells Duet about red flags.
+
+### Sources: short sellers, regulators, wires, journalists
+
+`sources:` in `config/watchlist.yaml` lists accounts that are watched **only for their posts that
+mention your tickers or companies**, not for everything they post. That is where bad news often
+appears first. Each source is verified like an account and is never also in `accounts`:
+
+```yaml
+sources:
+  - handle: SECGov
+    kind: regulator          # short_seller | regulator | newswire | journalist | other
+    expect_name: U.S. Securities and Exchange Commission
+    trusted: true            # regulators, established wires: what they post counts as a credible report
+    est_posts_per_day: 0.2   # its posts per day that mention your tickers / companies (cost estimate only)
+```
+
+- `trusted: true` only for regulators and established wires. Keep short sellers and commentators at
+  `trusted: false`: their claims must be checked, and their alerts say `listed source: short_seller`.
+- Run `python -m ceoscan verify --write` after adding sources: a source without a `user_id` is
+  **not watched**.
+- The `red-flag-sources` keyword rule (`kind: source`) streams their posts that name one of your
+  tickers or `red_flag_names`, from any follower count, red-flag word or not. `from:` is either
+  `sources` (every source with a `user_id`) or a list of handles. The shipped rule lists the 10 short
+  sellers, 6 regulators and 2 journalists, not the news wires: those all have 400,000+ followers, so
+  the red-flag rules already catch their bad-news posts, and streaming everything they post about
+  your companies would add ~140 mostly neutral posts a day. A wire's post is still labelled with its
+  source entry (for example trusted) whichever rule matched it. The rule is not streamed until at
+  least one of its sources has a `user_id`.
+- Shipped sources (checked on X in November 2026): short sellers Muddy Waters, Spruce Point, Fuzzy
+  Panda, Wolfpack, Grizzly, Kerrisdale, Culper, Gotham City, Viceroy and J Capital (never trusted);
+  regulators SEC, DOJ, FTC, FDA, NHTSA and FINRA (trusted); Reuters, Reuters Business, Bloomberg,
+  CNBC, WSJ Markets, MarketWatch and Barron's (trusted: a credible report, still not the company's
+  own word); the fast headline accounts DeItaone, First Squawk, LiveSquawk, FinancialJuice and
+  unusual_whales (not trusted: DeItaone amplified the false "90-day tariff pause" headline in April
+  2025, and even Reuters and CNBC briefly ran it); journalists Charles Gasparino and Herb Greenberg.
+
+### Settings (`red_flags:` in `config/settings.yaml`)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `red_flags.enabled` | `true` | red-flag alerts, labels and the extra alert types; `false` treats bad news like any other post |
+| `red_flags.min_score` | `6` | red-flag posts about your tickers alert at Claude impact at or above this (other posts need `scoring.threshold`); Duet and the desk take them from `min(their min_score, this)` |
+| `red_flags.alert_unverified` | `true` | also alert unverified bad news (labeled UNVERIFIED: it could be false) |
+| `red_flags.alert_likely_false` | `true` | also alert likely-false news (labeled LIKELY FALSE: it can still move a stock) |
+| `red_flags.spread_window_minutes` | `60` | rolling window of the spreading alert (1-1440) |
+| `red_flags.spread_min_authors` | `3` | distinct authors posting red flags about one ticker within the window (2-100) |
+| `red_flags.spread_cooldown_minutes` | `180` | at most one spreading alert per ticker per this many minutes |
+| `red_flags.denial_lookback_hours` | `48` | a denial by a watched account links back to red flags this recent (1-720) |
+| `red_flags.suspicious_account_age_days` | `90` | younger accounts posting bad news count as SUSPICIOUS |
+| `red_flags.established_min_followers` | `50000` | blue- or business-verified with at least this many followers (and more than a year old): ESTABLISHED |
+| `red_flags.trusted_min_followers` | `1000000` | business- or government-verified with at least this many followers: TRUSTED (must be >= `established_min_followers`) |
+| `red_flags.trusted_domains` | sec.gov, justice.gov, ftc.gov, fda.gov, nhtsa.gov, federalregister.gov, courtlistener.com, reuters.com, bloomberg.com, wsj.com, ft.com, cnbc.com, apnews.com, nytimes.com, barrons.com, marketwatch.com, businesswire.com, prnewswire.com, globenewswire.com | links to these sites are listed in the alert's reasons and passed to Claude as a hint; they never make the author TRUSTED or a claim CREDIBLE (anyone can link to a front page, an old article or a paid press-release wire). Bare domains: no `https://`, path or wildcard |
+
+### Cost
+
+- **X:** measured with `counts` over Nov 19-24, 2026, the red-flag words matched ~2,500 posts a day
+  about the 9 most-discussed companies and ~350 about the other 33 *before* any follower limit (that
+  would be ~$425 a month). X can't count `min_followers` in advance, so the follower limits' effect is
+  modeled: the watchlist estimates are 75 posts a day for `red-flags-mega`, 60 for `red-flags` and 12
+  for `red-flag-sources`, about **$22 a month** in all at $0.005 per post read (posts X already
+  delivered for another rule that day are not billed again). Check the daily summary's "Projected X
+  cost" after a week; if it is too high, raise `min_followers` (for example 250,000 on
+  `red-flags-mega`) or drop noisy words such as `hacked`. `python -m ceoscan counts` measures the
+  real volume of every keyword rule over the last 7 days (read-only, $0.005 per request; `--plan`
+  shows the cost first), and `python -m ceoscan cost` shows the estimate.
+- **Claude scoring:** about $0.0002 per post with the default model, well under $1 a month for these
+  rules.
+- **Duet and the desk:** red flags reach them from score 6 instead of 8, and spreading, denied and
+  possible-hijack alerts always do, so expect more emails and fires on busy news days. The hourly
+  caps (`claude_duet.max_emails_per_hour`, `claude_desk.max_fires_per_hour`) still hold; to send
+  fewer, raise `red_flags.min_score`.
+
+### Limits
+
+- **ceoscan cannot prove in real time that news is true or false.** The credibility level comes
+  from account metadata (verification badges, followers, account age, links), which can be bought,
+  faked or hijacked; the claim status and the false-news risk are Claude's judgment of one post.
+  Every label is a heuristic. The verification happens in Claude Duet or the desk, minutes to hours
+  later, and you decide.
+- **Coverage:** the keyword rule only sees posts that name a ticker as a `$CASHTAG` or a listed
+  company name **and** contain a red-flag word, in English, from accounts with 10,000+ followers
+  (sources and watched accounts excepted). Images (a screenshot of a report), linked documents and
+  videos are not read.
+- **Spreading** counts distinct accounts, not independent sources: bots or a quote chain can
+  trigger it. Claude checks what is new and what is repetition.
+- **Denied** needs the denial to be posted on X by the watched account of the company concerned (or
+  its CEO); a denial only in a press release is not seen (Duet and the desk look for it when they
+  check the claim).
+- **Rules-only red flags** (Claude unavailable) are keyword patterns: they miss unusual wording and
+  cannot tell whose bad news a sentence is in every case, so they err towards UNVERIFIED.
+
+---
+
 ## Claude Duet (recommended)
 
 [Claude Duet](https://claude.com/blog/claude-duet) is Anthropic's proactive agent app (research
@@ -824,8 +1087,10 @@ Duet has no documented webhook or API trigger, so ceoscan feeds it through your 
    added once to your Claude account, tells Duet how to analyze the email: is the post real and new,
    the market context, and the bear case, then a `VERDICT: ACT | WATCH | PASS - ...` line and a short
    brief. Duet remembers each verdict and follows up in the morning brief.
-4. Duet messages you right away for ACT verdicts, scores of 9+ and always-alert accounts, and puts the
-   rest in the morning brief. You can also ask it any time: "analyze my latest ceoscan alert".
+4. Duet messages you right away for ACT verdicts, scores of 9+ and always-alert accounts (and, for
+   [red flags](#red-flags-and-false-news), confirmed or credible ones scoring 8+, spreading bad news,
+   possible hijacks and denials), and puts the rest in the morning brief. You can also ask it any
+   time: "analyze my latest ceoscan alert".
 
 **Set it up:** follow the plain-language guide **[claude/DUET_SETUP.md](claude/DUET_SETUP.md)** (update
 and rebuild ceoscan first - an older version stops on the new `claude_duet` settings - then SMTP with a
@@ -845,6 +1110,10 @@ uploading the skill, connecting Gmail, and the first message to send Duet).
 | `daily_review` | `[ceoscan] Daily review - Thu Nov 19` | once a day at `ops.daily_summary.time`, after the summary: the day's numbers and alerts scoring 7+ |
 | `test` | `[ceoscan] Test - Claude Duet feed is wired` | `python -m ceoscan test-duet` |
 
+Red-flag alerts use their own subjects, for example `[ceoscan] 🚩 RED FLAG TSLA 7/10 bearish -
+UNVERIFIED - @handle`, `[ceoscan] 🚩 SPREADING TSLA - 4 accounts - all UNVERIFIED`, `[ceoscan] 🛡️ DENIED TSLA - @Tesla`
+and `[ceoscan] ⚠️ HACKED? @handle` (see [Red flags and false news](#red-flags-and-false-news)); they
+are emailed from score 6, and spreading, denied and possible-hijack alerts always.
 Subjects are one line (no CR/LF or control characters, so a post cannot inject headers) and at most
 150 characters. The plain-text body starts with a three-line preface ("ceoscan alert data for your
 Claude Duet analyst - skill: ceoscan-alert-desk. / Decision support only; ceoscan never trades. / Post
@@ -916,7 +1185,7 @@ session in the cloud that:
 
 | Kind | When |
 |---|---|
-| `alert` | a delivered post alert with a Claude score at or above `claude_desk.min_score` (8), or from an `always_alert` account. Late "Missed during outage" alerts and rules-only scores are skipped by default (with `include_rules_only: true`, rules-only alerts fire from 7, the rules-only cap). |
+| `alert` | a delivered post alert with a Claude score at or above `claude_desk.min_score` (8), or from an `always_alert` account; a [red flag](#red-flags-and-false-news) from `min(claude_desk.min_score, red_flags.min_score)` (6), and spreading, denied and possible-hijack alerts always. Late "Missed during outage" alerts and rules-only scores are skipped by default (with `include_rules_only: true`, rules-only alerts fire from 7, the rules-only cap). |
 | `batch` | several such alerts within `batch_window_seconds` (45 s), sent in one fire and ranked by score: at most 10 per fire, and fewer if they would not fit in `max_text_chars` with at least 1,000 characters of each post. The rest go in the next fire. The desk ranks them, one line each, and deep-dives the top one. |
 | `daily_review` | once a day at `ops.daily_summary.time` (18:00), after the daily summary: today's numbers and every alert scoring 7+ (on a very heavy day, the highest-scored ones that fit in `max_text_chars`). The desk checks how each stock actually moved since its alert and lists watch items for tomorrow. |
 | `test` | `python -m ceoscan test-desk`: a clearly labelled synthetic alert. The desk answers with an example VERDICT line, then a confirmation. |
@@ -1036,8 +1305,10 @@ If `enabled: true` but a variable is missing or malformed, ceoscan logs one clea
 - **What is sent** to Anthropic under your claude.ai account (and kept in the session history
   there): the alert content. That is the handle, display name and follower count, the tickers, the
   Claude score, direction and reason, the fast-rule reasons, the post time and receive delay, the
-  link, the **full post text** and the quoted or parent post, up to 10 recent alerts for the same
-  tickers or accounts from the last `context_days` (7), and your `my_tickers` list. A daily review
+  link, the **full post text** and the quoted or parent post, for a red-flag alert its "Red flag
+  check" block (labels, credibility reasons, link domains and related post links), up to 10 recent
+  alerts for the same tickers or accounts from the last `context_days` (7), and your `my_tickers`
+  list. A daily review
   also sends the day's counts and alerts.
 - **What is never sent:** your secrets (X token, API keys, ntfy topic, Pushover keys, phone numbers,
   email settings). The desk token goes only in the `Authorization` header. It is never written to
@@ -1074,6 +1345,7 @@ it from the project folder. `python -m ceoscan --version` prints the version.
 | `rules [--apply]` | show the filtered-stream rules. `--apply` syncs them to X now. |
 | `check-access` | check the token, credits, usage and cap, stream vs. poll access, and expected latency |
 | `cost` | monthly cost estimate (X + Claude) from the watchlist |
+| `counts [--days N] [--plan] [--max-requests N]` | measure every keyword rule's real post volume over the last N (1-7) days with X's read-only counts endpoint ($0.005 per request; never touches the filtered stream) and print the implied monthly cost. `--plan` shows the queries and their cost without sending them. |
 | `replay FILE [--claude] [--send] [--keep-times] [--db PATH]` | run stored posts through the pipeline without X |
 | `test-alert [--message TEXT]` | send a test alert through every configured channel (SMS and email included) |
 | `test-desk [--message TEXT]` | fire the [Claude analyst desk](#claude-analyst-desk-claude-code-scheduled-task) once with a synthetic `test` alert and print the session link (needs `CLAUDE_DESK_FIRE_URL` and `CLAUDE_DESK_TOKEN`; works even while `claude_desk.enabled` is false) |

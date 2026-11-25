@@ -64,7 +64,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     x_delay_ms       INTEGER,
     scoring_ms       INTEGER,
     push_ms          INTEGER,
-    late             INTEGER NOT NULL DEFAULT 0
+    late             INTEGER NOT NULL DEFAULT 0,
+    red_flag_kind    TEXT NOT NULL DEFAULT '',
+    claim_status     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_alerts_post ON alerts(post_id);
@@ -135,6 +137,30 @@ CREATE TABLE IF NOT EXISTS duet_emails (
     text_chars  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_duet_emails_at ON duet_emails(sent_at_ms);
+
+-- Red flags: one row per (bad-news post, ticker) and per denial, for the "spreading" and "denied" alerts
+-- (redflag_tracker.py). Survives restarts; old rows are pruned. Never holds post text.
+CREATE TABLE IF NOT EXISTS red_flag_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind           TEXT NOT NULL,              -- 'red_flag' | 'denial'
+    ticker         TEXT NOT NULL,
+    post_id        TEXT NOT NULL,
+    author_id      TEXT NOT NULL,
+    handle         TEXT,
+    created_at_ms  INTEGER NOT NULL,           -- when the post was published (X time)
+    recorded_at_ms INTEGER NOT NULL,
+    credibility    TEXT,                       -- Credibility.level
+    source_kind    TEXT,
+    types          TEXT,                       -- JSON list of RED_FLAG_TYPES
+    claim_status   TEXT,
+    impact         INTEGER,
+    official       INTEGER NOT NULL DEFAULT 0,
+    trusted        INTEGER NOT NULL DEFAULT 0,
+    related        TEXT,                       -- denial: JSON list of the red-flag post ids it denies
+    UNIQUE (kind, ticker, post_id)
+);
+CREATE INDEX IF NOT EXISTS idx_red_flag_events_ticker ON red_flag_events(ticker, kind, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_red_flag_events_recorded ON red_flag_events(recorded_at_ms);
 """
 
 #: desk_fires.status values
@@ -152,7 +178,14 @@ _DUET_COUNTS_SQL = (
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # (table, column, column definition)
     ("alerts", "late", "INTEGER NOT NULL DEFAULT 0"),  # post older than alerts.max_post_age_seconds
+    ("alerts", "red_flag_kind", "TEXT NOT NULL DEFAULT ''"),  # "", red_flag, spreading, denial, compromise
+    ("alerts", "claim_status", "TEXT"),  # Score.claim_status of the alerted post (red-flag alerts)
 )
+
+#: alerts.red_flag_kind values counted as red-flag alerts in the stats ("denial" / "compromise" are counted apart)
+RED_FLAG_ALERT_KINDS: tuple[str, ...] = ("red_flag", "spreading")
+#: claim statuses counted as "unverified" in the stats
+UNVERIFIED_CLAIMS: tuple[str, ...] = ("unverified", "likely_false")
 
 #: events.kind values written by the X ingest (stream / poller) for connection and API problems
 INGEST_ERROR_KINDS: tuple[str, ...] = ("stream_error", "poll_error")
@@ -292,7 +325,8 @@ class Store:
             cur = self._db.execute(
                 """INSERT INTO alerts (post_id, kind, created_at_ms, decision_reason, score, direction,
                    tickers, title, body, channels, sent_ok, quiet_hours, total_latency_ms, x_delay_ms,
-                   scoring_ms, push_ms, late) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   scoring_ms, push_ms, late, red_flag_kind, claim_status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rec.post_id,
                     rec.kind,
@@ -311,6 +345,8 @@ class Store:
                     rec.scoring_ms,
                     rec.push_ms,
                     int(bool(rec.late)),
+                    rec.red_flag_kind or "",
+                    rec.claim_status if rec.red_flag_kind else None,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -594,12 +630,13 @@ class Store:
         ``newest_first=True`` returns the newest ``limit`` alerts). With ``tickers`` and/or ``author_ids``
         only alerts that name one of the tickers or come from one of the authors are returned.
 
-        Keys: post_id, created_at_ms (alert), score, direction, tickers (list), late, author_id,
-        author_username, reason, text, post_created_at_ms. Used by the Claude desk for context and the
-        daily review.
+        Keys: post_id, created_at_ms (alert), score, direction, tickers (list), late, red_flag_kind ("" for
+        ordinary alerts), claim_status, author_id, author_username, reason, text, post_created_at_ms. Used by the
+        Claude desk for context and the daily review.
         """
-        q = """SELECT a.post_id, a.created_at_ms, a.score, a.direction, a.tickers, a.late, p.author_id,
-                      p.author_username, p.reason, p.text, p.created_at_ms AS post_created_at_ms
+        q = """SELECT a.post_id, a.created_at_ms, a.score, a.direction, a.tickers, a.late, a.red_flag_kind,
+                      a.claim_status, p.author_id, p.author_username, p.reason, p.text,
+                      p.created_at_ms AS post_created_at_ms
                FROM alerts a LEFT JOIN posts p ON p.id = a.post_id
                WHERE a.kind = 'post' AND a.sent_ok = 1 AND a.created_at_ms >= ?"""
         args: list[Any] = [to_ms(since)]
@@ -633,6 +670,126 @@ class Store:
             row["tickers"] = [str(t) for t in tickers] if isinstance(tickers, list) else []
         return rows
 
+    # ------------------------------------------------------------------ red flags
+
+    def record_red_flag_event(
+        self,
+        *,
+        kind: str,
+        ticker: str,
+        post_id: str,
+        author_id: str,
+        handle: str | None,
+        created_at: datetime,
+        credibility: str | None,
+        source_kind: str | None = None,
+        types: Iterable[str] = (),
+        claim_status: str | None = None,
+        impact: int | None = None,
+        official: bool = False,
+        trusted: bool = False,
+        related: Iterable[str] = (),
+        recorded_at: datetime | None = None,
+    ) -> bool:
+        """One red-flag (or denial) event per (kind, ticker, post); False if it was already recorded."""
+        with self._lock:
+            cur = self._db.execute(
+                """INSERT OR IGNORE INTO red_flag_events (kind, ticker, post_id, author_id, handle, created_at_ms,
+                   recorded_at_ms, credibility, source_kind, types, claim_status, impact, official, trusted, related)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    kind,
+                    ticker,
+                    post_id,
+                    author_id,
+                    handle,
+                    to_ms(created_at),
+                    to_ms(recorded_at or now_utc()),
+                    credibility,
+                    source_kind,
+                    json.dumps(list(types)),
+                    claim_status,
+                    impact,
+                    int(bool(official)),
+                    int(bool(trusted)),
+                    json.dumps(list(related)),
+                ),
+            )
+            return cur.rowcount == 1
+
+    @staticmethod
+    def _red_flag_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            row = dict(r)
+            for key in ("types", "related"):
+                try:
+                    value = json.loads(row.get(key) or "[]")
+                except ValueError:
+                    value = []
+                row[key] = [str(v) for v in value] if isinstance(value, list) else []
+            row["official"] = bool(row.get("official"))
+            row["trusted"] = bool(row.get("trusted"))
+            out.append(row)
+        return out
+
+    def red_flag_events(
+        self,
+        ticker: str,
+        since: datetime,
+        until: datetime | None = None,
+        *,
+        kind: str = "red_flag",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Events for ``ticker`` posted in [since, until] (X time), oldest first; types / related decoded."""
+        q = "SELECT * FROM red_flag_events WHERE ticker = ? AND kind = ? AND created_at_ms >= ?"
+        args: list[Any] = [ticker, kind, to_ms(since)]
+        if until is not None:
+            q += " AND created_at_ms <= ?"
+            args.append(to_ms(until))
+        q += " ORDER BY created_at_ms, id LIMIT ?"
+        args.append(int(limit))
+        with self._lock:
+            rows = self._db.execute(q, args).fetchall()
+        return self._red_flag_rows(rows)
+
+    def red_flag_events_for_posts(self, post_ids: Iterable[str], *, kind: str = "red_flag") -> list[dict[str, Any]]:
+        """Events of these posts (any ticker), oldest first."""
+        ids = list(dict.fromkeys(str(i) for i in post_ids))
+        if not ids:
+            return []
+        q = (
+            f"SELECT * FROM red_flag_events WHERE kind = ? AND post_id IN ({','.join('?' for _ in ids)}) "
+            "ORDER BY created_at_ms, id"
+        )
+        with self._lock:
+            rows = self._db.execute(q, (kind, *ids)).fetchall()
+        return self._red_flag_rows(rows)
+
+    def denied_red_flag_post_ids(self, ticker: str, since: datetime) -> set[str]:
+        """Red-flag post ids for ``ticker`` that a denial since ``since`` already linked to."""
+        out: set[str] = set()
+        for row in self.red_flag_events(ticker, since, kind="denial"):
+            out.update(row["related"])
+        return out
+
+    def delivered_post_alert_ids(self, post_ids: Iterable[str]) -> set[str]:
+        """Which of these post ids had a delivered post alert."""
+        ids = list(dict.fromkeys(str(i) for i in post_ids))
+        if not ids:
+            return set()
+        marks = ",".join("?" for _ in ids)
+        q = f"SELECT DISTINCT post_id FROM alerts WHERE kind='post' AND sent_ok=1 AND post_id IN ({marks})"
+        with self._lock:
+            return {str(r[0]) for r in self._db.execute(q, ids).fetchall()}
+
+    def prune_red_flag_events(self, before: datetime) -> int:
+        """Delete events recorded before ``before``; returns how many."""
+        with self._lock:
+            cur = self._db.execute("DELETE FROM red_flag_events WHERE recorded_at_ms < ?", (to_ms(before),))
+        return int(cur.rowcount or 0)
+
     # ------------------------------------------------------------------ stats
 
     def stats_since(self, since: datetime) -> dict[str, Any]:
@@ -650,6 +807,10 @@ class Store:
           failed or alerts that were dropped before a fire.
         * ``duet_emails``: Claude Duet feed emails the SMTP server accepted; ``duet_errors``: emails that failed
           or alerts that were dropped before an email.
+        * ``red_flags``: delivered red-flag alerts (bad news about my tickers, including "spreading" alerts);
+          ``red_flags_unverified`` how many of those were unverified or likely false; ``spreading``: "bad news
+          spreading" alerts; ``denials``: "denied" alerts; ``compromises``: "may be hacked" alerts;
+          ``red_flag_posts``: distinct bad-news posts about my tickers seen (alerted or not).
         """
         ms = to_ms(since)
         kinds = ",".join("?" for _ in INGEST_ERROR_KINDS)
@@ -696,6 +857,21 @@ class Store:
                 (DESK_SENT, DESK_SENT, ms),
             ).fetchone()
             duet_sent, duet_errors = self._db.execute(_DUET_COUNTS_SQL, (DUET_SENT, DUET_SENT, ms)).fetchone()
+            rf_kinds = ",".join("?" for _ in RED_FLAG_ALERT_KINDS)
+            unverified = ",".join("?" for _ in UNVERIFIED_CLAIMS)
+            red_flags, red_unverified, spreading, denials, compromises = self._db.execute(
+                f"""SELECT COALESCE(SUM(red_flag_kind IN ({rf_kinds})), 0),
+                           COALESCE(SUM(red_flag_kind IN ({rf_kinds}) AND claim_status IN ({unverified})), 0),
+                           COALESCE(SUM(red_flag_kind = 'spreading'), 0),
+                           COALESCE(SUM(red_flag_kind = 'denial'), 0),
+                           COALESCE(SUM(red_flag_kind = 'compromise'), 0)
+                    FROM alerts WHERE created_at_ms >= ? AND kind='post' AND sent_ok=1""",
+                (*RED_FLAG_ALERT_KINDS, *RED_FLAG_ALERT_KINDS, *UNVERIFIED_CLAIMS, ms),
+            ).fetchone()
+            red_flag_posts = self._db.execute(
+                "SELECT COUNT(DISTINCT post_id) FROM red_flag_events WHERE kind='red_flag' AND recorded_at_ms >= ?",
+                (ms,),
+            ).fetchone()[0]
         return {
             "posts": posts,
             "flagged": flagged,
@@ -713,4 +889,10 @@ class Store:
             "desk_errors": int(desk_errors),
             "duet_emails": int(duet_sent),
             "duet_errors": int(duet_errors),
+            "red_flags": int(red_flags),
+            "red_flags_unverified": int(red_unverified),
+            "spreading": int(spreading),
+            "denials": int(denials),
+            "compromises": int(compromises),
+            "red_flag_posts": int(red_flag_posts),
         }

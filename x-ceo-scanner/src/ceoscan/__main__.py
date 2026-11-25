@@ -8,6 +8,9 @@ Commands:
                               ``--apply`` syncs them to X now
 * ``check-access``            token, credits, usage, stream vs. poll access, expected latency
 * ``cost``                    monthly X + Claude cost estimate (offline, no secrets needed)
+* ``counts [--days N] [--plan] [--max-requests N]``  measure every keyword rule's post volume over the
+                              last N (1-7) days with GET /2/tweets/counts/recent ($0.005 per request,
+                              read-only; never touches the filtered stream) and the implied monthly cost
 * ``replay FILE [--claude] [--send] [--keep-times] [--db PATH]``  saved posts through the pipeline
                               without contacting X (offline, no secrets needed)
 * ``test-alert [--message TEXT]``  send a system alert through every configured channel
@@ -33,19 +36,33 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import re
 import signal
 import sqlite3
 import sys
 from collections.abc import Callable, Coroutine
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 
 from . import __version__
-from .alerts.claude_desk import DeskClient, build_test_text, check_desk_secrets, fire_with_retries, rejection_hint
+from .alerts.claude_desk import (
+    DeskClient,
+    build_test_text,
+    check_desk_secrets,
+    fire_with_retries,
+    rejection_hint,
+)
 from .alerts.dispatcher import AlertDispatcher, build_dispatcher
-from .alerts.duet_feed import KIND_HEADER, SmtpMailer, build_test_email, check_duet_config, send_with_retries
+from .alerts.duet_feed import (
+    KIND_HEADER,
+    SmtpMailer,
+    build_test_email,
+    check_duet_config,
+    send_with_retries,
+)
 from .alerts.duet_feed import rejection_hint as duet_rejection_hint
 from .alerts.format import format_system_alert
 from .alerts.notifiers import Notifier
@@ -70,12 +87,23 @@ from .replay import run_replay
 from .store import DESK_FAILED, DESK_SENT, DUET_FAILED, DUET_SENT, Store
 from .timeutil import now_utc
 from .xapi.access import AccessReport, check_access, format_access_report
-from .xapi.client import XApiError, XClient
+from .xapi.client import (
+    CreditsDepleted,
+    NotAuthorized,
+    RateLimited,
+    TooManyConnections,
+    XApiError,
+    XClient,
+)
 from .xapi.rules import (
+    CountQuery,
     RuleBuildResult,
     RuleSyncPlan,
+    build_count_queries,
     build_rules,
+    keyword_rule_values,
     plan_sync,
+    remove_operator,
     rule_errors,
     sync_rules,
 )
@@ -84,6 +112,7 @@ from .xapi.verify import (
     format_verify_report,
     record_results,
     verify_accounts,
+    verify_sources,
     write_user_ids,
 )
 
@@ -104,6 +133,13 @@ TEST_ALERT_BODY = (
 TEST_DESK_RETRY_DELAYS = (2.0, 5.0)
 #: test-duet retries a 4xx / network failure / timeout after these pauses (the service uses 5 s and 20 s)
 TEST_DUET_RETRY_DELAYS = (2.0, 5.0)
+
+#: `counts` refuses to send more requests than this unless --max-requests says otherwise
+COUNTS_DEFAULT_MAX_REQUESTS = 60
+#: GET /2/tweets/counts/recent only covers the last 7 days
+COUNTS_MAX_DAYS = 7
+# X's message for an operator the search / counts endpoints do not know (linear-time pattern)
+_UNRECOGNIZED_OPERATOR_RE = re.compile(r"Unrecognized operator:\s{0,3}'([A-Za-z_]{1,40})'")
 
 Handler = Callable[[AppConfig, argparse.Namespace], Coroutine[Any, Any, int]]
 
@@ -158,6 +194,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check-access", help="check token, credits, usage, stream vs. poll access and latency")
     sub.add_parser("cost", help="estimate the monthly X API + Claude cost from the watchlist (offline)")
 
+    p = sub.add_parser(
+        "counts",
+        help="measure each keyword rule's real post volume (GET /2/tweets/counts/recent, read-only, "
+        "$0.005 per request)",
+    )
+    p.add_argument("--days", type=_counts_days, default=COUNTS_MAX_DAYS, metavar="N",
+                   help=f"count the last N days, 1-{COUNTS_MAX_DAYS} (default {COUNTS_MAX_DAYS})")
+    p.add_argument("--plan", action="store_true", help="only show the queries and what they would cost")
+    p.add_argument("--max-requests", type=int, default=COUNTS_DEFAULT_MAX_REQUESTS, metavar="N",
+                   help=f"refuse to send more than N requests (default {COUNTS_DEFAULT_MAX_REQUESTS})")
+
     p = sub.add_parser("replay", help="run saved stream-shaped posts through the pipeline without X")
     p.add_argument("file", metavar="FILE", help="JSONL file of stream payloads (e.g. samples/sample_posts.jsonl)")
     p.add_argument("--claude", action="store_true", help="score with Claude (needs ANTHROPIC_API_KEY)")
@@ -178,6 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--message", metavar="TEXT", default=None, help="a note to include in the test email")
     return parser
+
+
+def _counts_days(value: str) -> int:
+    try:
+        days = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--days must be a whole number 1-{COUNTS_MAX_DAYS}") from None
+    if not 1 <= days <= COUNTS_MAX_DAYS:
+        raise argparse.ArgumentTypeError(f"--days must be 1-{COUNTS_MAX_DAYS} (the counts endpoint keeps 7 days)")
+    return days
 
 
 # --------------------------------------------------------------------------- helpers
@@ -213,6 +270,13 @@ def format_rule_build(build: RuleBuildResult, rs: RulesSettings, source: Path) -
         lines.append(
             f"Skipped - no verified user_id, NOT streamed ({len(build.skipped_accounts)}): "
             + ", ".join(f"@{h}" for h in build.skipped_accounts)
+        )
+        lines.append("  Run `python -m ceoscan verify --write` to verify them and store their user_ids.")
+    skipped_sources = getattr(build, "skipped_sources", [])
+    if skipped_sources:
+        lines.append(
+            f"Sources skipped - no verified user_id, NOT streamed ({len(skipped_sources)}): "
+            + ", ".join(f"@{h}" for h in skipped_sources)
         )
         lines.append("  Run `python -m ceoscan verify --write` to verify them and store their user_ids.")
     other = [w for w in build.warnings if "have no verified user_id" not in w]
@@ -252,25 +316,32 @@ async def cmd_verify(cfg: AppConfig, args: argparse.Namespace) -> int:
     if not token:
         return EXIT_CONFIG
     accounts = cfg.watchlist.accounts
-    if not accounts:
+    sources = cfg.watchlist.sources
+    if not accounts and not sources:
         _err(f"error: the watchlist {cfg.watchlist_path} has no accounts")
         return EXIT_CONFIG
     if args.accept_warnings and not args.write:
         print("note: --accept-warnings only has an effect together with --write")
     price = cfg.settings.x_api.pricing.user_read
-    print(
-        f"Looking up {len(accounts)} handle(s) on X (GET /2/users/by; about ${len(accounts) * price:.2f} "
-        "in user reads)..."
-    )
+    n = len(accounts) + len(sources)
+    what = f"{len(accounts)} account(s) + {len(sources)} source(s)" if sources else f"{n} handle(s)"
+    print(f"Looking up {what} on X (GET /2/users/by; about ${n * price:.2f} in user reads)...")
     async with new_session() as session:
         client = XClient(session, token, cfg.settings.x_api)
-        results = await verify_accounts(client, cfg.watchlist)
+        account_results = await verify_accounts(client, cfg.watchlist)
+        source_results = await verify_sources(client, cfg.watchlist) if sources else []
+    results = account_results + source_results
 
     failure = batch_failure(results)
     if failure:  # e.g. HTTP 402 for every handle: one clear line instead of a table of identical errors
         _err(f"error: {failure}")
         return EXIT_ERROR
-    print(format_verify_report(results))
+    if accounts:
+        print(format_verify_report(account_results))
+    if sources:
+        if accounts:
+            print()
+        print(format_verify_report(source_results, title="Sources (watched only for posts about my tickers)"))
 
     try:
         store = Store(cfg.settings.ops.db_path)
@@ -297,7 +368,7 @@ async def cmd_verify(cfg: AppConfig, args: argparse.Namespace) -> int:
         for r in not_written:
             print(f"NOT changed: @{r.handle} keeps user_id {r.previous_user_id} (X now returns {r.user_id}).")
         if changed:
-            print(f"Updated {changed} account(s) in {cfg.watchlist_path}.")
+            print(f"Updated {changed} {'account(s)/source(s)' if sources else 'account(s)'} in {cfg.watchlist_path}.")
         elif any(r.status == "error" for r in results):
             print(f"{cfg.watchlist_path} was not changed (some lookups failed - see above).")
         else:
@@ -306,6 +377,12 @@ async def cmd_verify(cfg: AppConfig, args: argparse.Namespace) -> int:
             wl = load_watchlist(cfg.watchlist_path)
             n_ok = sum(1 for a in wl.accounts if a.user_id)
             print(f"{n_ok} of {len(wl.accounts)} account(s) now have a user_id and will be watched.")
+            if wl.sources:
+                s_ok = sum(1 for src in wl.sources if src.user_id)
+                print(
+                    f"{s_ok} of {len(wl.sources)} source(s) now have a user_id and are watched for posts about "
+                    "my tickers."
+                )
         except Exception as exc:  # pragma: no cover - write_user_ids validated the file already
             _err(f"warning: could not re-read {cfg.watchlist_path}: {exc}")
     elif any(r.user_id for r in results if r.status in ("ok", "warning")):
@@ -416,6 +493,205 @@ async def cmd_cost(cfg: AppConfig, args: argparse.Namespace) -> int:
     mode = "poll" if cfg.settings.x_api.mode == "poll" else "stream"
     print(format_cost_estimate(estimate_monthly_cost(cfg.watchlist, cfg.settings, mode=mode)))
     return EXIT_OK
+
+
+async def _count_query(
+    client: XClient, query: str, start: datetime | None
+) -> tuple[dict[str, Any], str, list[str]]:
+    """One counts request; an operator X does not know is removed and the query sent once more.
+
+    Returns (response, the query actually sent, operators removed after X rejected them).
+    """
+    removed: list[str] = []
+    for _ in range(3):
+        try:
+            return await client.count_recent(query, start_time=start), query, removed
+        except XApiError as exc:
+            if exc.status != 400:
+                raise
+            messages = [str(exc)]
+            for err in (exc.body or {}).get("errors") or []:
+                if isinstance(err, dict):
+                    messages.append(str(err.get("message") or ""))
+            match = next((m for m in map(_UNRECOGNIZED_OPERATOR_RE.search, messages) if m), None)
+            shorter = remove_operator(query, match.group(1)) if match else query
+            if match is None or shorter == query or not shorter:
+                raise
+            removed.append(match.group(1))
+            query = shorter
+    raise XApiError(status=400, title="Invalid Request", detail="too many unsupported operators")
+
+
+def _count_total(resp: dict[str, Any], days: int) -> tuple[int, float]:
+    """(posts counted, length of the counted window in days) from a counts/recent response."""
+    buckets = [b for b in resp.get("data") or [] if isinstance(b, dict)]
+    meta = resp.get("meta") or {}
+    total = meta.get("total_tweet_count")
+    if not isinstance(total, int):
+        total = sum(int(b.get("tweet_count") or 0) for b in buckets)
+    window = float(days)
+    try:
+        start = datetime.fromisoformat(str(buckets[0]["start"]))
+        end = datetime.fromisoformat(str(buckets[-1]["end"]))
+        if end > start:
+            window = (end - start).total_seconds() / 86400
+    except (IndexError, KeyError, ValueError):
+        pass
+    return total, window
+
+
+def format_count_plan(queries: list[CountQuery], notes: list[str], price: float, days: int) -> str:
+    head = (
+        f"{len(queries)} counts quer{'y' if len(queries) == 1 else 'ies'} for the last {days} day(s) "
+        f"(GET /2/tweets/counts/recent, at most 512 characters each; ${price:.3f} per request = "
+        f"${len(queries) * price:.3f}). Read-only: the filtered stream is not touched."
+    )
+    lines = [head]
+    removed = sorted({op.split(":", 1)[0] for q in queries for op in q.removed})
+    if removed:
+        lines.append(
+            "Left out of the queries (the counts endpoint rejects them): "
+            + ", ".join(removed)
+            + ". Counts for rules that use them are an UPPER BOUND of what the stream delivers."
+        )
+    for note in notes:
+        lines.append(f"  - {note}")
+    for q in queries:
+        lines.append(f"  [{q.rule}:{q.n}] {len(q.query)} chars")
+        lines.append(f"    {q.query}")
+    return "\n".join(lines)
+
+
+async def cmd_counts(cfg: AppConfig, args: argparse.Namespace) -> int:
+    """Measure every keyword rule's volume with GET /2/tweets/counts/recent. Never touches the stream."""
+    wl, x = cfg.watchlist, cfg.settings.x_api
+    if not wl.keyword_rules:
+        print(f"The watchlist {cfg.watchlist_path} has no keyword rules; nothing to count.")
+        return EXIT_OK
+    queries, notes = build_count_queries(wl, x.rules)
+    print(format_count_plan(queries, notes, x.pricing.counts_request, args.days))
+    if not queries:
+        return EXIT_OK
+    if len(queries) > args.max_requests:
+        _err(
+            f"error: {len(queries)} requests are needed but --max-requests is {args.max_requests}; "
+            "pass a higher --max-requests to send them anyway."
+        )
+        return EXIT_CONFIG
+    if args.plan:
+        print("Nothing was sent (--plan).")
+        return EXIT_OK
+    token = require_x_token(cfg, "counts")
+    if not token:
+        return EXIT_CONFIG
+
+    start = None if args.days >= COUNTS_MAX_DAYS else now_utc() - timedelta(days=args.days)
+    counted: dict[int, tuple[int, float]] = {}
+    failed: dict[int, str] = {}
+    rejected_ops: dict[int, list[str]] = {}
+    stop_reason: str | None = None
+    exit_code = EXIT_OK
+    async with new_session() as session:
+        client = XClient(session, token, x)
+        for i, q in enumerate(queries):
+            try:
+                resp, _sent, removed = await _count_query(client, q.query, start)
+            except CreditsDepleted:
+                stop_reason, exit_code = "X API credits depleted (HTTP 402): add credits at console.x.com", EXIT_ERROR
+                break
+            except NotAuthorized as exc:
+                if exc.status == 401:
+                    stop_reason, exit_code = (
+                        "X rejected the bearer token (HTTP 401): check X_BEARER_TOKEN in .env", EXIT_CONFIG
+                    )
+                else:
+                    stop_reason, exit_code = (
+                        f"X refused the counts endpoint ({exc}): this app may not have access to it", EXIT_ERROR
+                    )
+                break
+            except (RateLimited, TooManyConnections) as exc:
+                reset = exc.rate_limit.reset_at if exc.rate_limit else None
+                when = f" (resets {reset:%H:%M:%S} UTC)" if reset else ""
+                stop_reason, exit_code = f"X rate limit hit on the counts endpoint{when}; try again later", EXIT_ERROR
+                break
+            except XApiError as exc:
+                failed[i] = str(exc)
+                exit_code = EXIT_ERROR
+                continue
+            except (aiohttp.ClientError, OSError, TimeoutError) as exc:
+                stop_reason, exit_code = f"could not reach the X API: {_network_error(exc)}", EXIT_ERROR
+                break
+            counted[i] = _count_total(resp, args.days)
+            if removed:
+                rejected_ops[i] = removed
+    print(format_count_results(cfg, queries, counted, failed, rejected_ops))
+    if stop_reason:
+        _err(f"error: {stop_reason}. {len(counted)} of {len(queries)} queries were counted.")
+    return exit_code
+
+
+def format_count_results(
+    cfg: AppConfig,
+    queries: list[CountQuery],
+    counted: dict[int, tuple[int, float]],
+    failed: dict[int, str],
+    rejected_ops: dict[int, list[str]],
+) -> str:
+    pricing, rs = cfg.settings.x_api.pricing, cfg.settings.x_api.rules
+    lines = ["", "Results:"]
+    for i, q in enumerate(queries):
+        if i in counted:
+            total, window = counted[i]
+            per_day = total / window if window > 0 else 0.0
+            extra = f"; X rejected and it was left out: {', '.join(rejected_ops[i])}" if i in rejected_ops else ""
+            lines.append(f"  [{q.rule}:{q.n}] {total:,} posts in {window:.1f} days = {per_day:,.1f}/day{extra}")
+        elif i in failed:
+            lines.append(f"  [{q.rule}:{q.n}] FAILED: {failed[i]}")
+        else:
+            lines.append(f"  [{q.rule}:{q.n}] not counted")
+
+    rows = [("RULE", "KIND", "STREAM RULES", "ESTIMATE/DAY", "COUNTED/DAY", "IMPLIED $/MONTH", "NOTE")]
+    rules_by_name = {k.name: k for k in cfg.watchlist.keyword_rules}
+    for name in dict.fromkeys(q.rule for q in queries):
+        kw = rules_by_name[name]
+        idx = [i for i, q in enumerate(queries) if q.rule == name]
+        try:
+            n_stream = str(len(keyword_rule_values(kw, int(rs.max_rule_length))))
+        except ValueError:
+            n_stream = "?"
+        complete = all(i in counted for i in idx)
+        per_day = sum(counted[i][0] / counted[i][1] for i in idx if i in counted and counted[i][1] > 0)
+        notes = []
+        if not complete:
+            notes.append("incomplete")
+        if any(op.startswith("min_followers:") for i in idx for op in queries[i].removed):
+            notes.append("upper bound (no min_followers)")
+        if len(idx) > 1:
+            notes.append(f"sum of {len(idx)} queries")
+        rows.append(
+            (
+                name,
+                getattr(kw, "kind", "keyword"),
+                n_stream,
+                f"{kw.est_posts_per_day:,.1f}",
+                f"{per_day:,.1f}" if idx and any(i in counted for i in idx) else "-",
+                f"${per_day * 30 * pricing.post_read:,.2f}" if any(i in counted for i in idx) else "-",
+                ", ".join(notes),
+            )
+        )
+    widths = [max(len(r[c]) for r in rows) for c in range(len(rows[0]))]
+    lines += ["", f"By rule (implied cost = counted posts/day x 30 x ${pricing.post_read:.3f} per post read):"]
+    lines += ["  " + "  ".join(cell.ljust(w) for cell, w in zip(r, widths, strict=True)).rstrip() for r in rows]
+    n_ok = len(counted)
+    lines.append(
+        f"Requests: {n_ok} counted (${n_ok * pricing.counts_request:.3f} at ${pricing.counts_request:.3f} each), "
+        f"{len(failed)} failed (not billed)."
+    )
+    lines.append(
+        "A post that matches several queries of one rule is counted in each, and the stream bills a post once "
+        "per UTC day: treat these as upper bounds. Update est_posts_per_day in the watchlist with what you see."
+    )
+    return "\n".join(lines)
 
 
 async def cmd_replay(cfg: AppConfig, args: argparse.Namespace) -> int:
@@ -677,6 +953,7 @@ COMMANDS: dict[str, Handler] = {
     "rules": cmd_rules,
     "check-access": cmd_check_access,
     "cost": cmd_cost,
+    "counts": cmd_counts,
     "replay": cmd_replay,
     "test-alert": cmd_test_alert,
     "test-desk": cmd_test_desk,

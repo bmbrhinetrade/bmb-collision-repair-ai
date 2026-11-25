@@ -1137,6 +1137,7 @@ class FastRules:
             own_flagged=bool(own_categories),
             own_categories=own_categories,
             own_rule_score=own_score,
+            own_tickers=list(own.tickers),
         )
         logger.debug(
             "fast rules post=%s flagged=%s categories=%s tickers=%s score=%d own=%s/%d",

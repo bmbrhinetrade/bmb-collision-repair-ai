@@ -6,8 +6,11 @@ X pay-per-use pricing (``settings.x_api.pricing``, from docs.x.com, see ``pricin
 * every user object returned is one *user read*;
 * failed and empty responses are not billed.
 
-Post volume comes from ``est_posts_per_day`` in the watchlist (per account and per keyword rule),
-so the estimate is only as good as those numbers. The "worst case" adds charges for expanded
+Post volume comes from ``est_posts_per_day`` in the watchlist (per account and per keyword rule,
+including the red-flag and source rules; a source rule without its own estimate uses the sum of its
+sources' ``est_posts_per_day``), so the estimate is only as good as those numbers. ``python -m ceoscan
+counts`` measures the keyword rules' real volume over the last days. A source rule with no verified
+source is not streamed yet and is left out (with a note). The "worst case" adds charges for expanded
 objects because X does not document whether those are billed: the referenced (quoted / replied-to)
 posts, the authors of the watched accounts and keyword-rule matches, and - through the
 ``referenced_tweets.id.author_id`` expansion - the author of every referenced post (counted as a
@@ -15,7 +18,7 @@ distinct user each time, which is the conservative assumption).
 
 Claude: every post from a watched account is scored when ``scoring.score_watchlist_unflagged`` is
 true (the default); otherwise only the share the fast rules flag (``flag_rate``). Keyword-rule posts
-always carry one of your cashtags, so the fast rules flag them and they are all scored.
+always carry one of your cashtags or company names, so the fast rules flag them and they are all scored.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import logging
 from dataclasses import dataclass
 
 from ..config import Settings
-from ..models import Watchlist
+from ..models import KeywordRule, Watchlist
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,23 @@ REFERENCED_POST_SHARE = 0.5  # share of posts that quote/reply to/repost another
 KEYWORD_AUTHORS_PER_DAY = 30  # distinct non-watchlist authors per keyword rule per day
 # Every referenced post's author (expansion referenced_tweets.id.author_id) is counted as a distinct user.
 TOP_LINES_SHOWN = 12
+#: cost-line label per keyword rule kind
+RULE_LABELS = {"keyword": "keyword rule", "red_flag": "red-flag rule", "source": "source rule"}
+
+
+def rule_label(rule: KeywordRule) -> str:
+    """"keyword rule big-account-cashtags", "red-flag rule red-flags", "source rule red-flag-sources (3 sources)"."""
+    kind = getattr(rule, "kind", "keyword")
+    label = f"{RULE_LABELS.get(kind, 'keyword rule')} {rule.name}"
+    if kind == "source":
+        n = len(rule.from_ids)
+        label += f" ({n} source{'s' if n != 1 else ''})"
+    return label
+
+
+def _streamed(rule: KeywordRule) -> bool:
+    """A source rule without a verified source is not streamed (build_rules skips it)."""
+    return not (getattr(rule, "kind", "keyword") == "source" and not rule.from_ids)
 
 
 @dataclass
@@ -82,19 +102,22 @@ def estimate_monthly_cost(
     for a in watchlist.accounts:
         ppm = max(a.est_posts_per_day, 0.0) * DAYS_PER_MONTH
         lines.append((f"@{a.handle}", ppm, ppm * pricing.post_read))
-    keyword_rules = () if poll else watchlist.keyword_rules
+    keyword_rules = () if poll else tuple(k for k in watchlist.keyword_rules if _streamed(k))
     for k in keyword_rules:
         ppm = max(k.est_posts_per_day, 0.0) * DAYS_PER_MONTH
-        lines.append((f"keyword rule {k.name}", ppm, ppm * pricing.post_read))
+        lines.append((rule_label(k), ppm, ppm * pricing.post_read))
 
     posts_per_month = sum(ppm for _, ppm, _ in lines)
     x_monthly = posts_per_month * pricing.post_read
 
     referenced_posts = posts_per_month * REFERENCED_POST_SHARE
     referenced_authors_per_day = referenced_posts / DAYS_PER_MONTH
-    authors_per_day = (
-        len(watchlist.accounts) + KEYWORD_AUTHORS_PER_DAY * len(keyword_rules) + referenced_authors_per_day
+    # A source rule's authors are its sources; other keyword rules match ~KEYWORD_AUTHORS_PER_DAY strangers.
+    rule_authors = sum(
+        len(k.from_ids) if getattr(k, "kind", "keyword") == "source" else KEYWORD_AUTHORS_PER_DAY
+        for k in keyword_rules
     )
+    authors_per_day = len(watchlist.accounts) + rule_authors + referenced_authors_per_day
     x_worst = x_monthly + referenced_posts * pricing.post_read + authors_per_day * pricing.user_read * DAYS_PER_MONTH
     worst_posts = posts_per_month + referenced_posts
 
@@ -108,7 +131,7 @@ def estimate_monthly_cost(
     scored_per_month += sum(max(k.est_posts_per_day, 0.0) * DAYS_PER_MONTH for k in keyword_rules)
     claude_monthly = scored_per_month * per_scored if sc.enabled else 0.0
 
-    one_time_verify = len(watchlist.accounts) * pricing.user_read
+    one_time_verify = (len(watchlist.accounts) + len(watchlist.sources)) * pricing.user_read
     cap = int(pricing.monthly_post_cap)
     cap_ok = posts_per_month <= cap
 
@@ -128,6 +151,13 @@ def estimate_monthly_cost(
         notes.append(
             f"Poll mode: {len(watchlist.keyword_rules)} keyword rule(s) need the filtered stream and are not counted."
         )
+    else:
+        waiting = [k.name for k in watchlist.keyword_rules if not _streamed(k)]
+        if waiting:
+            notes.append(
+                f"Not streamed yet, not counted: source rule(s) {', '.join(waiting)} (no source with a verified "
+                "user_id; add sources and run `verify --write`)."
+            )
     if sc.enabled:
         policy = (
             "every watched-account post is scored (scoring.score_watchlist_unflagged)"
@@ -153,6 +183,17 @@ def estimate_monthly_cost(
     if missing_ids:
         notes.append(
             f"{missing_ids} account(s) have no user_id yet (run `verify --write`); they are included in the estimate."
+        )
+    missing_sources = sum(1 for src in watchlist.sources if not src.user_id)
+    if missing_sources:
+        notes.append(
+            f"{missing_sources} source(s) have no user_id yet (run `verify --write`); they are not streamed until then."
+        )
+    if not poll and any(getattr(k, "kind", "keyword") != "keyword" for k in keyword_rules):
+        notes.append(
+            "Red-flag and source rule volumes are watchlist estimates; `python -m ceoscan counts` measures the "
+            f"real volume of every keyword rule over the last 7 days (read-only, ${pricing.counts_request:.3f} "
+            "per request)."
         )
     if x_monthly > 0 and lines:
         label, ppm, usd = max(lines, key=lambda line: line[2])

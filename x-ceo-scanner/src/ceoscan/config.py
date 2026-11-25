@@ -21,14 +21,15 @@ import re
 import sys
 import types
 import typing
-from dataclasses import MISSING, dataclass, field, fields, is_dataclass, replace as _dc_replace
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ruamel.yaml import YAML
 
-from .models import Account, KeywordRule, Watchlist
+from .models import Account, KeywordRule, Source, Watchlist
 
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
@@ -87,6 +88,7 @@ class XPricing:
     # docs.x.com/x-api/getting-started/pricing (checked 2026-11-19). Update if X changes prices.
     post_read: float = 0.005
     user_read: float = 0.010
+    counts_request: float = 0.005  # GET /2/tweets/counts/recent, per request (used by `counts`)
     monthly_post_cap: int = 3_000_000
     checked: str = "2026-11-19"
 
@@ -510,7 +512,7 @@ def _settings_problems(s: Settings) -> list[str]:
     at_least(x.rules.max_rule_length, 64, "x_api.rules.max_rule_length")
     if not re.match(r"^[A-Za-z0-9_-]{1,32}$", x.rules.tag_prefix or ""):
         p.append(f"x_api.rules.tag_prefix must be 1-32 letters, digits, '_' or '-' (got {x.rules.tag_prefix!r})")
-    for name in ("post_read", "user_read"):
+    for name in ("post_read", "user_read", "counts_request"):
         at_least(getattr(x.pricing, name), 0, f"x_api.pricing.{name}")
     at_least(x.pricing.monthly_post_cap, 0, "x_api.pricing.monthly_post_cap")
     for name, items in (("tweet_fields", x.tweet_fields), ("expansions", x.expansions), ("user_fields", x.user_fields)):
@@ -605,7 +607,39 @@ def _settings_problems(s: Settings) -> list[str]:
             'claude_duet.subject_prefix must be 1-40 printable characters on one line without leading or trailing '
             f'spaces, e.g. "[ceoscan]" (got {du.subject_prefix!r})'
         )
+
+    rf = s.red_flags
+    between(rf.min_score, 1, 10, "red_flags.min_score")
+    between(rf.spread_window_minutes, 1, 1440, "red_flags.spread_window_minutes")
+    between(rf.spread_min_authors, 2, 100, "red_flags.spread_min_authors")
+    between(rf.spread_cooldown_minutes, 0, 10_080, "red_flags.spread_cooldown_minutes")
+    between(rf.denial_lookback_hours, 1, 720, "red_flags.denial_lookback_hours")
+    between(rf.suspicious_account_age_days, 0, 3650, "red_flags.suspicious_account_age_days")
+    at_least(rf.established_min_followers, 0, "red_flags.established_min_followers")
+    at_least(rf.trusted_min_followers, 0, "red_flags.trusted_min_followers")
+    if rf.trusted_min_followers < rf.established_min_followers:
+        p.append(
+            f"red_flags.trusted_min_followers ({rf.trusted_min_followers:,}) must be >= "
+            f"red_flags.established_min_followers ({rf.established_min_followers:,})"
+        )
+    for i, domain in enumerate(rf.trusted_domains):
+        if not _is_bare_domain(domain):
+            p.append(
+                f"red_flags.trusted_domains[{i}] must be a bare domain such as reuters.com - no https://, path, "
+                f"port or wildcard (got {domain!r})"
+            )
     return p
+
+
+_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _is_bare_domain(value: Any) -> bool:
+    """``reuters.com`` / ``sec.gov`` / ``news.bbc.co.uk``: lowercase-insensitive labels, a dot, no scheme/path."""
+    if not isinstance(value, str) or not 3 <= len(value) <= 253 or value != value.strip():
+        return False
+    labels = value.lower().split(".")
+    return len(labels) >= 2 and all(_DOMAIN_LABEL_RE.match(label) for label in labels) and not labels[-1].isdigit()
 
 
 def _validate_settings(s: Settings) -> None:
@@ -628,7 +662,16 @@ def _norm_ticker(t: Any, path: str = "ticker") -> str:
     return t
 
 
-WATCHLIST_KEYS = ("ticker_groups", "my_tickers", "accounts", "keyword_rules", "company_names")
+WATCHLIST_KEYS = (
+    "ticker_groups",
+    "my_tickers",
+    "accounts",
+    "sources",
+    "red_flag_terms",
+    "red_flag_names",
+    "keyword_rules",
+    "company_names",
+)
 ACCOUNT_KEYS = (
     "handle",
     "kind",
@@ -641,9 +684,36 @@ ACCOUNT_KEYS = (
     "user_id",
     "notes",
 )
-KEYWORD_RULE_KEYS = ("name", "tickers", "terms", "min_followers", "extra_operators", "est_posts_per_day")
+SOURCE_KEYS = ("handle", "kind", "expect_name", "user_id", "trusted", "est_posts_per_day", "notes")
+SOURCE_KINDS = ("short_seller", "regulator", "newswire", "journalist", "other")
+KEYWORD_RULE_KEYS = (
+    "name",
+    "kind",
+    "from",
+    "tickers",
+    "terms",
+    "require_any",
+    "min_followers",
+    "extra_operators",
+    "est_posts_per_day",
+)
+KEYWORD_RULE_KINDS = ("keyword", "red_flag", "source")
+#: Reusable term lists at the top of the watchlist, referenced in keyword rules as "@red_flag_terms" etc.
+TERM_GROUPS = ("red_flag_terms", "red_flag_names")
 # A keyword-rule term: a $CASHTAG, a word or a plain phrase. No quotes, parentheses or ":" (X operators).
 _KW_TERM_RE = re.compile(r"^\$?[A-Za-z0-9][A-Za-z0-9 ._'&+-]{0,59}$")
+_KW_TERM_HELP = (
+    "use a $CASHTAG, a word or a plain phrase (letters, digits, spaces, . _ ' & + -; at most 60 characters;"
+    " no quotes, parentheses or ':')"
+)
+
+
+def _kw_term(t: Any, where: str) -> str:
+    """One validated keyword-rule term (whitespace collapsed)."""
+    text = " ".join(str(t).split()) if isinstance(t, (str, int)) and not isinstance(t, bool) else None
+    if not text or not _KW_TERM_RE.match(text):
+        raise ConfigError(f"{where}: {t!r} is not a valid term - {_KW_TERM_HELP}")
+    return text
 
 
 def _check_keys(item: Any, allowed: tuple[str, ...], path: str) -> dict[str, Any]:
@@ -687,6 +757,164 @@ def _wl_text(item: dict[str, Any], key: str, path: str) -> str | None:
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         raise ConfigError(f"{path}.{key} must be text (got {_type_name(value)} {value!r})")
     return str(value)
+
+
+def _parse_sources(raw: Any, account_handles: set[str]) -> list[Source]:
+    """The top-level ``sources:`` list: accounts watched ONLY for posts about my tickers / companies."""
+    sources: list[Source] = []
+    seen: set[str] = set()
+    example = "[{handle: SECGov, kind: regulator, trusted: true}]"
+    for i, s in enumerate(_as_list(raw, "sources", example)):
+        where = f"sources[{i}]"
+        if isinstance(s, dict) and s.get("handle") is not None:
+            where = f"sources[{i}] (@{str(s.get('handle')).strip().lstrip('@')})"
+        s = _check_keys(s, SOURCE_KEYS, where)
+        handle = str(s.get("handle", "") or "").strip().lstrip("@")
+        if not HANDLE_RE.match(handle):
+            raise ConfigError(f"{where}: invalid or missing handle {handle!r}")
+        if handle.lower() in account_handles:
+            raise ConfigError(
+                f"{where}: @{handle} is also in accounts, which already streams every post of it; "
+                "list it once (remove it from sources or from accounts)"
+            )
+        if handle.lower() in seen:
+            raise ConfigError(f"duplicate source handle {handle!r} in watchlist")
+        seen.add(handle.lower())
+        user_id = s.get("user_id")
+        if user_id is not None:
+            user_id = str(user_id).strip()
+            if not user_id.isdigit():
+                raise ConfigError(f"{where}: user_id must be numeric")
+        kind = s.get("kind", "other")
+        if kind not in SOURCE_KINDS:
+            raise ConfigError(
+                f"{where}.kind must be one of {', '.join(SOURCE_KINDS)} (got {kind!r}){_did_you_mean(kind, SOURCE_KINDS)}"
+            )
+        sources.append(
+            Source(
+                handle=handle,
+                kind=kind,
+                expect_name=_wl_text(s, "expect_name", where),
+                user_id=user_id or None,
+                trusted=_wl_bool(s, "trusted", False, where),
+                est_posts_per_day=_wl_number(s, "est_posts_per_day", 2.0, where),
+                notes=_wl_text(s, "notes", where) or "",
+            )
+        )
+    return sources
+
+
+def _parse_term_groups(raw: dict[str, Any]) -> dict[str, tuple[str, ...]]:
+    """``red_flag_terms`` / ``red_flag_names``: plain term lists (no nested "@group" references)."""
+    groups: dict[str, tuple[str, ...]] = {}
+    for name in TERM_GROUPS:
+        items = _as_list(raw.get(name), name, '[fraud, lawsuit, "short report"]')
+        groups[name] = tuple(dict.fromkeys(_kw_term(t, name) for t in items))
+    return groups
+
+
+def _expand_terms(value: Any, where: str, groups: dict[str, tuple[str, ...]]) -> list[str]:
+    """A term list for ``terms`` / ``require_any``: a list (items may be "@red_flag_terms") or one "@group"."""
+    if value is None:
+        return []
+    if isinstance(value, str) and value.strip().startswith("@"):
+        items: list[Any] = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise ConfigError(
+            f'{where} must be a list, e.g. [Apnimed, AD109, "Talen Energy"], or a term group such as '
+            f'"@red_flag_terms" (got {_type_name(value)} {value!r})'
+        )
+    out: list[str] = []
+    for t in items:
+        if isinstance(t, str) and t.strip().startswith("@"):
+            name = t.strip()[1:]
+            if name not in groups:
+                known = ", ".join(f"@{g}" for g in TERM_GROUPS)
+                raise ConfigError(f"{where}: unknown term group {t.strip()!r} (known: {known}){_did_you_mean(name, TERM_GROUPS)}")
+            if not groups[name]:
+                raise ConfigError(f"{where} uses @{name}, but the watchlist has no (or an empty) top-level {name}: list")
+            out.extend(groups[name])
+        else:
+            out.append(_kw_term(t, where))
+    return list(dict.fromkeys(out))
+
+
+def _resolve_from(value: Any, where: str, sources: list[Source]) -> list[Source]:
+    """``from: sources`` (every source) or a list of source handles."""
+    if value == "sources":
+        return list(sources)
+    if isinstance(value, list) and value:
+        by_handle = {s.handle_lower: s for s in sources}
+        chosen: list[Source] = []
+        for h in value:
+            handle = str(h).strip().lstrip("@") if isinstance(h, str) else ""
+            src = by_handle.get(handle.lower())
+            if src is None:
+                hint = _did_you_mean(handle, [s.handle for s in sources])
+                raise ConfigError(f"{where}: {h!r} is not a handle in the top-level sources: list{hint}")
+            if src not in chosen:
+                chosen.append(src)
+        return chosen
+    raise ConfigError(
+        f"{where} must be sources (every entry of the top-level sources: list) or a list of source handles, "
+        f"e.g. [SECGov] (got {_type_name(value)} {value!r})"
+    )
+
+
+def _parse_keyword_rule(
+    i: int, k: Any, expand: Any, groups: dict[str, tuple[str, ...]], sources: list[Source]
+) -> KeywordRule:
+    where = f"keyword_rules[{i}]"
+    k = _check_keys(k, KEYWORD_RULE_KEYS, where)
+    kind = k.get("kind", "keyword")
+    if kind not in KEYWORD_RULE_KINDS:
+        raise ConfigError(
+            f"{where}.kind must be keyword, red_flag or source (got {kind!r}){_did_you_mean(kind, KEYWORD_RULE_KINDS)}"
+        )
+    from_cfg = k.get("from")
+    chosen: list[Source] = []
+    if kind == "source":
+        if from_cfg is None:
+            raise ConfigError(f"{where}: kind: source needs from: sources (or a list of source handles)")
+        chosen = _resolve_from(from_cfg, f"{where}.from", sources)
+    elif from_cfg is not None:
+        raise ConfigError(f"{where}: from: is only used by kind: source rules (got kind: {kind})")
+
+    tickers_cfg = k.get("tickers", "all")
+    # A source rule is already limited to its authors: by default it does not filter on followers.
+    min_followers = k.get("min_followers", 0 if kind == "source" else 1_000_000)
+    if isinstance(min_followers, bool) or not isinstance(min_followers, int) or min_followers < 0:
+        raise ConfigError(f"{where}.min_followers must be a whole number >= 0 (got {min_followers!r})")
+    extra = k.get("extra_operators", "-is:retweet -is:reply")
+    if extra is None:
+        extra = ""
+    if not isinstance(extra, str):
+        raise ConfigError(f"{where}.extra_operators must be text (got {extra!r})")
+    terms = _expand_terms(k.get("terms"), f"{where}.terms", groups)
+    require_any = _expand_terms(k.get("require_any"), f"{where}.require_any", groups)
+    if kind == "red_flag" and not require_any:
+        raise ConfigError(f'{where}: kind: red_flag needs require_any (e.g. require_any: "@red_flag_terms")')
+    tickers = ("__ALL__",) if tickers_cfg == "all" else expand(tickers_cfg, f"{where}.tickers")
+    if not tickers and not terms:
+        raise ConfigError(f"{where} needs tickers or terms")
+    name = str(k.get("name") or f"keywords-{i}").strip()
+    if not 1 <= len(name) <= 64 or ":" in name or not name.isprintable():
+        raise ConfigError(f"{where}.name must be 1-64 printable characters without ':' (it is part of the rule tag)")
+    # A source rule's volume defaults to the sum of its sources' estimates (matching posts only).
+    default_est = sum(s.est_posts_per_day for s in chosen) if kind == "source" else 50.0
+    return KeywordRule(
+        name=name,
+        tickers=tickers,
+        min_followers=min_followers,
+        extra_operators=extra,
+        est_posts_per_day=_wl_number(k, "est_posts_per_day", default_est, where),
+        terms=tuple(terms),
+        require_any=tuple(require_any),
+        from_ids=tuple(dict.fromkeys(str(s.user_id) for s in chosen if s.user_id)),
+        kind=kind,
+    )
 
 
 def load_watchlist(path: str | Path) -> Watchlist:
@@ -754,44 +982,19 @@ def load_watchlist(path: str | Path) -> Watchlist:
         )
     resolved_accounts = accounts
 
-    kw_rules: list[KeywordRule] = []
-    for i, k in enumerate(_as_list(raw.get("keyword_rules"), "keyword_rules", "[{name: big-accounts, tickers: all}]")):
-        where = f"keyword_rules[{i}]"
-        k = _check_keys(k, KEYWORD_RULE_KEYS, where)
-        tickers_cfg = k.get("tickers", "all")
-        min_followers = k.get("min_followers", 1_000_000)
-        if isinstance(min_followers, bool) or not isinstance(min_followers, int) or min_followers < 0:
-            raise ConfigError(f"{where}.min_followers must be a whole number >= 0 (got {min_followers!r})")
-        extra = k.get("extra_operators", "-is:retweet -is:reply")
-        if extra is None:
-            extra = ""
-        if not isinstance(extra, str):
-            raise ConfigError(f"{where}.extra_operators must be text (got {extra!r})")
-        terms_cfg = k.get("terms") or []
-        if not isinstance(terms_cfg, list):
-            raise ConfigError(f"{where}.terms must be a list, e.g. [Apnimed, AD109, \"Talen Energy\"] (got {terms_cfg!r})")
-        terms: list[str] = []
-        for t in terms_cfg:
-            text = " ".join(str(t).split()) if isinstance(t, (str, int)) and not isinstance(t, bool) else None
-            if not text or not _KW_TERM_RE.match(text):
-                raise ConfigError(
-                    f"{where}.terms: {t!r} is not a valid term - use a $CASHTAG, a word or a plain phrase"
-                    " (letters, digits, spaces, . _ ' & + -; at most 60 characters; no quotes, parentheses or ':')"
-                )
-            terms.append(text)
-        tickers = ("__ALL__",) if tickers_cfg == "all" else expand(tickers_cfg, f"{where}.tickers")
-        if not tickers and not terms:
-            raise ConfigError(f"{where} needs tickers or terms")
-        kw_rules.append(
-            KeywordRule(
-                name=str(k.get("name") or f"keywords-{i}"),
-                tickers=tickers,
-                min_followers=min_followers,
-                extra_operators=extra,
-                est_posts_per_day=_wl_number(k, "est_posts_per_day", 50.0, where),
-                terms=tuple(dict.fromkeys(terms)),
-            )
+    sources = _parse_sources(raw.get("sources"), seen)
+    term_groups = _parse_term_groups(raw)
+
+    kw_rules: list[KeywordRule] = [
+        _parse_keyword_rule(i, k, expand, term_groups, sources)
+        for i, k in enumerate(
+            _as_list(raw.get("keyword_rules"), "keyword_rules", "[{name: big-accounts, tickers: all}]")
         )
+    ]
+    names = [k.name for k in kw_rules]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:  # the rule name is part of the stream rule tag; alerts use it to find the rule
+        raise ConfigError(f"duplicate keyword rule name(s): {', '.join(dupes)} (each keyword rule needs its own name)")
 
     my = list(expand(raw.get("my_tickers"), "my_tickers"))
     for a in resolved_accounts:
@@ -812,9 +1015,9 @@ def load_watchlist(path: str | Path) -> Watchlist:
     if not isinstance(raw_names, dict):
         raise ConfigError(f"company_names must be a mapping, e.g. TSLA: [Tesla] (got {raw_names!r})")
     company_names: dict[str, tuple[str, ...]] = {}
-    for t, names in raw_names.items():
+    for t, names_cfg in raw_names.items():
         where = f"company_names.{t}"
-        items = _as_list(names, where, "[Tesla, \"Model Y\"]")
+        items = _as_list(names_cfg, where, "[Tesla, \"Model Y\"]")
         if any(not isinstance(n, (str, int)) or isinstance(n, bool) or not str(n).strip() for n in items):
             raise ConfigError(f"{where} must be a list of names (text)")
         company_names[_norm_ticker(t, where)] = tuple(str(n) for n in items)
@@ -823,6 +1026,7 @@ def load_watchlist(path: str | Path) -> Watchlist:
         keyword_rules=tuple(kw_rules),
         my_tickers=my_tickers,
         company_names=company_names,
+        sources=tuple(sources),
     )
 
 

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from ceoscan.config import ScoringSettings
-from ceoscan.models import Account, RuleResult
+from ceoscan.models import RED_FLAG_TYPES, Account, RuleResult
 from ceoscan.scoring.claude import (
     DEFAULT_FALLBACK_MAX_IMPACT,
     MAX_REASON_CHARS,
@@ -230,8 +230,20 @@ def test_schema_matches_parser_contract() -> None:
         "impact_score",
         "reason",
         "is_joke_or_meme",
+        "red_flag",
+        "red_flag_types",
+        "claim_status",
+        "false_news_risk",
+        "credibility_note",
     }
     props = SCORE_JSON_SCHEMA["properties"]
+    assert props["red_flag"]["type"] == "boolean"
+    assert props["red_flag_types"]["items"]["enum"] == list(RED_FLAG_TYPES)
+    assert props["claim_status"]["enum"] == [
+        "confirmed_official", "credible_report", "unverified", "likely_false", "denial", "not_applicable"
+    ]
+    assert props["false_news_risk"]["enum"] == ["low", "medium", "high"]
+    assert props["credibility_note"]["type"] == "string"
     assert props["direction"]["enum"] == ["bullish", "bearish", "unclear"]
     assert props["impact_score"]["type"] == "integer"
     assert props["tickers"] == {**props["tickers"], "type": "array", "items": {"type": "string"}}

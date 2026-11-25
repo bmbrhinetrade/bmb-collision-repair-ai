@@ -117,7 +117,8 @@ def test_sample_file_covers_required_scenarios(cfg: AppConfig) -> None:
     assert any(len(d.get("edit_history_tweet_ids", [])) > 1 for d in datas)
 
     handles = {a.handle_lower for a in cfg.watchlist.accounts}
-    kw = [s for s in samples if any(":kw:" in r["tag"] for r in s["matching_rules"])]
+    # the big-account cashtag rule (min_followers 1M); red-flag rule posts come from smaller accounts on purpose
+    kw = [s for s in samples if any(":kw:big-account-cashtags:" in r["tag"] for r in s["matching_rules"])]
     assert kw, "needs a keyword-rule post"
     for s in kw:
         author = next(u for u in s["includes"]["users"] if u["id"] == s["data"]["author_id"])
@@ -195,9 +196,10 @@ async def test_run_replay_produces_alerts_and_dedupes(cfg: AppConfig, tmp_path: 
     titles = " ".join(a.message.title for a in alerts)
     for handle in ("@elonmusk", "@vladtenev", "@saylor"):
         assert handle in titles
-    # offline scores are rules-only: capped (never urgent) and labelled as such
+    # offline scores are rules-only: capped (never urgent) and labelled as such (a possible hijack is detected in
+    # code whatever scored it, so its title carries no rules-only marker)
     assert all(a.score is not None and a.score <= cfg.settings.scoring.fallback_max_impact for a in alerts)
-    assert all("(rules-only)" in a.message.title for a in alerts)
+    assert all("(rules-only)" in a.message.title for a in alerts if a.red_flag_kind != "compromise")
 
     # latency is measured on rebased (fresh) ids: ~x_delay_seconds (3 s) post -> console
     live = [a for a in alerts if not a.late]
@@ -248,6 +250,59 @@ async def test_run_replay_scenarios_offline(cfg: AppConfig, no_network: None) ->
     assert len({a.post_id for a in alerts}) == len(alerts)
     # a watched account with no keyword hit at all is still scored
     assert " -       score " in line_for("LisaSu")
+
+
+def test_sample_file_covers_red_flag_scenarios(cfg: AppConfig) -> None:
+    """Short report, credible wire, new-account rumor, CEO impersonator, denial, hijacked account, anti-fraud ad."""
+    samples = load_samples(SAMPLES)
+    texts = " ".join(s["data"]["text"] for s in samples)
+    for needle in ("short report", "auditor has resigned", "BREAKING!!!", "recalling every Cybertruck",
+                   "Tesla is not recalling", "launching our own token", "block $40B in fraud"):
+        assert needle in texts, needle
+    users = {u["username"]: u for s in samples for u in s["includes"]["users"]}
+    assert users["elonmusk_ceo2"]["name"] == "Elon Musk"  # the impersonator
+    assert users["sample_wire"]["verified_type"] == "business"
+    denial = next(s for s in samples if "Tesla is not recalling" in s["data"]["text"])
+    fake = next(s for s in samples if "recalling every Cybertruck" in s["data"]["text"])
+    assert denial["data"]["referenced_tweets"] == [{"type": "replied_to", "id": fake["data"]["id"]}]
+    # the three $SMCI red flags fall inside one 60-minute window even with the original ids (keep-times replay)
+    smci = [snowflake_to_datetime(s["data"]["id"]) for s in samples if "$SMCI" in s["data"]["text"]]
+    assert len(smci) == 3 and max(smci) - min(smci) < timedelta(minutes=cfg.settings.red_flags.spread_window_minutes)
+
+
+async def test_run_replay_red_flag_scenarios_offline(cfg: AppConfig, no_network: None) -> None:
+    """The red-flag samples end to end, rules-only: badges, spreading, denial, hijack, and no false alarm."""
+    out: list[str] = []
+    alerts = await run_replay(cfg, SAMPLES, out=out.append)
+    by_kind: dict[str, list[Any]] = {}
+    for a in alerts:
+        by_kind.setdefault(a.red_flag_kind, []).append(a)
+    titles = [a.message.title for a in by_kind.get("red_flag", [])]
+    assert any("RED FLAG $AMD" in t and "CONFIRMED (official)" in t for t in titles)  # sample 02: a guidance cut
+    assert any("RED FLAG $SMCI" in t and "UNVERIFIED (could be false)" in t for t in titles)  # the short report
+    assert any("RED FLAG $SMCI" in t and "CREDIBLE" in t for t in titles)  # the business-verified wire
+    assert any("RED FLAG $TSLA" in t and "LIKELY FALSE" in t for t in titles)  # the CEO impersonator
+    for a in by_kind["red_flag"]:
+        assert a.direction == "bearish" and a.claim_status and a.credibility is not None
+
+    (spread,) = by_kind["spreading"]
+    assert spread.message.title.startswith(f"{REPLAY_TAG} 🚩 Bad news spreading: $SMCI - 3 accounts in 60 min")
+    assert spread.red_flag_signal is not None and spread.red_flag_signal.distinct_authors == 3
+    assert "@sample_shortco" in spread.message.body and "@sample_wire" in spread.message.body
+    assert spread.message.priority == "high"
+
+    (denial,) = by_kind["denial"]
+    assert denial.message.title.startswith(f"{REPLAY_TAG} 🛡️ DENIED by @elonmusk: $TSLA")
+    assert "https://x.com/elonmusk_ceo2/status/" in denial.message.body  # links back to the red flag
+
+    (hacked,) = by_kind["compromise"]
+    assert hacked.message.title == f"{REPLAY_TAG} ⚠️ @vladtenev may be HACKED - do not act on this post"
+    assert hacked.message.priority == "high" and hacked.direction == "unclear"
+
+    # anti-fraud marketing is not a red flag; the new account's rumor alone is below the bar (it spreads instead)
+    lines = [line for line in out if line.startswith("[")]
+    assert "no alert" in next(line for line in lines if "@sample_paynews" in line)
+    assert "spreading" in next(line for line in lines if "@sample_flash " in line)
 
 
 async def test_run_replay_keep_times_uses_original_ids(cfg: AppConfig, no_network: None) -> None:

@@ -35,6 +35,7 @@ x_api:
   pricing:                            # docs.x.com/x-api/getting-started/pricing, checked 2026-11-19
     post_read: 0.005
     user_read: 0.010
+    counts_request: 0.005             # GET /2/tweets/counts/recent, per request (`python -m ceoscan counts`)
     monthly_post_cap: 3000000
     checked: "2026-11-19"
 
@@ -149,3 +150,47 @@ claude_duet:
   context_days: 7                     # recent alerts for the same tickers / accounts sent along as context
   subject_prefix: "[ceoscan]"         # the skill looks for subjects starting with this - keep them in sync
   max_text_chars: 60000               # one email body (preface + alert data); the longest fields are cut first
+
+# Red flags and false news: early warning when bad news about one of my tickers appears on X, often a day
+# before the headlines (short reports, fraud or accounting claims, probes, lawsuits, recalls, downgrades,
+# guidance cuts, executive exits, hacks, failed trials). Each alert says how credible the source is:
+# OFFICIAL / CREDIBLE / UNVERIFIED / LIKELY FALSE / DENIED - unverified claims can still move a stock, so
+# they alert too, clearly labeled. Extra alerts: "spreading" (several different accounts post bad news
+# about one ticker within the window), "denied" (a watched company / CEO account denies a recent red
+# flag) and "possible hijack" (a watched account posts scam-like content). Bad news is found by the
+# watchlist's red-flag keyword rules and sources (config/watchlist.yaml) and by the watched accounts.
+# Alerts only: nothing here trades, and an allegation is never presented as fact.
+red_flags:
+  enabled: true
+  min_score: 6                        # red-flag posts about my tickers alert at Claude impact >= this
+                                      # (other posts need scoring.threshold)
+  alert_unverified: true              # alert unverified bad news too (labeled UNVERIFIED - could be false)
+  alert_likely_false: true            # alert likely-false news too (labeled LIKELY FALSE: it can still move a stock)
+  spread_window_minutes: 60           # rolling window for the "spreading" alert (1-1440)
+  spread_min_authors: 3               # distinct authors posting red flags about one ticker within the window
+  spread_cooldown_minutes: 180        # at most one "spreading" alert per ticker per this many minutes
+  denial_lookback_hours: 48           # a denial by a watched account links back to red flags this recent
+  suspicious_account_age_days: 90     # younger accounts posting bad news count as suspicious
+  established_min_followers: 50000    # blue/business-verified with at least this many followers = established
+  trusted_min_followers: 1000000      # business/government-verified this big counts as a credible outlet
+  trusted_domains:                    # links to these sites are a hint, listed in the alert; they never make the
+                                      # author trusted or a claim credible (bare domains, no https://)
+    - sec.gov
+    - justice.gov
+    - ftc.gov
+    - fda.gov
+    - nhtsa.gov
+    - federalregister.gov
+    - courtlistener.com
+    - reuters.com
+    - bloomberg.com
+    - wsj.com
+    - ft.com
+    - cnbc.com
+    - apnews.com
+    - nytimes.com
+    - barrons.com
+    - marketwatch.com
+    - businesswire.com
+    - prnewswire.com
+    - globenewswire.com

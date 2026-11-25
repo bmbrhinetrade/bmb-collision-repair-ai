@@ -41,6 +41,9 @@ EP_USER_TWEETS = "/2/users/:id/tweets"
 EP_STREAM_RULES = "/2/tweets/search/stream/rules"
 EP_USAGE = "/2/usage/tweets"
 EP_STREAM_CONNECTIONS = "/2/connections/filtered_stream"
+EP_COUNTS_RECENT = "/2/tweets/counts/recent"
+COUNTS_QUERY_MAX = 512  # GET /2/tweets/counts/recent query length limit
+COUNTS_GRANULARITIES = ("minute", "hour", "day")
 
 
 # --------------------------------------------------------------------------- rate limits
@@ -410,6 +413,37 @@ class XClient:
         payload = {"delete": {"ids": ids}}
         params = {"dry_run": "true"} if dry_run else None
         return await self._request("POST", EP_STREAM_RULES, EP_STREAM_RULES, params=params, json_body=payload)
+
+    # ------------------------------------------------------------------ post counts (read-only)
+
+    async def count_recent(
+        self,
+        query: str,
+        *,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        granularity: str = "day",
+    ) -> dict:
+        """GET /2/tweets/counts/recent: how many posts matched ``query`` in the last 7 days.
+
+        Returns X's full JSON (``data`` = [{"start", "end", "tweet_count"}], ``meta.total_tweet_count``).
+        Billed per request (``x_api.pricing.counts_request``), not per post; it never touches the
+        filtered stream. Errors raise the usual typed :class:`XApiError` subclasses (402 credits,
+        429 rate limit, 401/403 auth; an invalid query is a plain XApiError with status 400 whose
+        ``body`` carries X's per-parameter messages).
+        """
+        q = " ".join((query or "").split())
+        if not q:
+            raise ValueError("a counts query must not be empty")
+        if len(q) > COUNTS_QUERY_MAX:
+            raise ValueError(f"a counts query is at most {COUNTS_QUERY_MAX} characters (got {len(q)})")
+        if granularity not in COUNTS_GRANULARITIES:
+            raise ValueError(f"granularity must be one of {', '.join(COUNTS_GRANULARITIES)}")
+        params = {"query": q, "granularity": granularity}
+        for key, value in (("start_time", start_time), ("end_time", end_time)):
+            if value is not None:
+                params[key] = value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return await self._request("GET", EP_COUNTS_RECENT, EP_COUNTS_RECENT, params=params)
 
     # ------------------------------------------------------------------ usage / connections
 

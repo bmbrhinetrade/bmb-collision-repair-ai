@@ -65,6 +65,7 @@ from .ops.cost import estimate_monthly_cost, format_cost_estimate
 from .ops.health import HealthServer
 from .ops.scheduler import OpsScheduler
 from .pipeline import Pipeline
+from .redflag_tracker import RedFlagTracker
 from .scoring.claude import ClaudeScorer, OfflineScorer
 from .store import Store
 from .timeutil import now_utc
@@ -457,7 +458,10 @@ class Service:
         self._spawn_background(self._housekeeping(), "housekeeping")
 
         desk, duet = self._start_analysts(stack, store, session)
-        pipeline = Pipeline(cfg, store, scorer, self.dispatcher, self.status, desk=desk, duet=duet)
+        red_flags = self._red_flag_tracker(store)
+        pipeline = Pipeline(
+            cfg, store, scorer, self.dispatcher, self.status, desk=desk, duet=duet, red_flags=red_flags
+        )
         scheduler = OpsScheduler(cfg, store, self.status, self.dispatcher, desk=desk, duet=duet)
         return await self._supervise(
             {
@@ -466,6 +470,26 @@ class Service:
                 "scheduler": scheduler.run(self.stop),
             }
         )
+
+    def _red_flag_tracker(self, store: Store) -> RedFlagTracker:
+        """The red-flag tracker (bad news per ticker, denials, hijack cooldowns), persisted in the store."""
+        rf = self.settings.red_flags
+        tracker = RedFlagTracker(store, rf, self.cfg.watchlist.my_tickers)
+        if rf.enabled:
+            logger.info(
+                "red flags: on - bad news about my tickers alerts at score >= %d%s; spreading at %d accounts within "
+                "%d min (cooldown %d min); denials checked %d h back; %d listed source(s)",
+                rf.min_score,
+                "" if rf.alert_unverified else " (verified claims only)",
+                rf.spread_min_authors,
+                rf.spread_window_minutes,
+                rf.spread_cooldown_minutes,
+                rf.denial_lookback_hours,
+                len(self.cfg.watchlist.sources),
+            )
+        else:
+            logger.info("red flags: off (red_flags.enabled is false)")
+        return tracker
 
     def _start_analysts(
         self, stack: contextlib.AsyncExitStack, store: Store, session: aiohttp.ClientSession
