@@ -60,7 +60,8 @@ def _age(now: datetime, dt: datetime | None) -> float | None:
 
 
 AUTH_REJECTED_REASON = (
-    "X rejects the bearer token (HTTP 401): put the current token in .env (install-server.sh --update-x-token)"
+    "X rejects the bearer token (HTTP 401): put the current token in .env"
+    " (servers set up with install-server.sh: run it with --update-x-token)"
 )
 
 

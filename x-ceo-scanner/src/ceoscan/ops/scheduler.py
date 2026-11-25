@@ -67,7 +67,7 @@ HEALTHY_STATES = frozenset({"connected", "polling"})
 DOWN_STATES = frozenset({"down", "credits_depleted"})
 CONFIG_ERROR_STATE = "config_error"
 #: How to replace a rejected X bearer token on a server set up with deploy/install-server.sh (run in ~/ceoscan).
-AUTH_FIX_COMMAND = "bash x-ceo-scanner/deploy/install-server.sh --update-x-token"
+AUTH_FIX_COMMAND = "cd ~/ceoscan && bash x-ceo-scanner/deploy/install-server.sh --dir ~/ceoscan --update-x-token"
 SMS_MAX_CHARS = 300
 SCORE_ERROR_CHARS = 120
 
@@ -353,11 +353,14 @@ class OpsScheduler:
             "No post alerts can arrive until it reconnects; it keeps retrying automatically.",
         ]
         if auth_rejected:
+            lines[1] = "No post alerts can arrive, and retrying will not fix this: X needs the current token."
             lines += [
                 "Usually the Bearer Token was regenerated or revoked at console.x.com (regenerating cancels the old"
-                " one). Put the current token on the server - in its ceoscan folder run:",
+                " one). Put the current token on the server. Set up with install-server.sh (in ~/ceoscan)? Run:",
                 AUTH_FIX_COMMAND,
                 "(it asks for the token with hidden typing, checks it with X, saves it and restarts ceoscan).",
+                "Other setups: put it in X_BEARER_TOKEN in .env, then docker compose up -d --force-recreate"
+                " (or restart the ceoscan service).",
             ]
         if st.last_error:
             lines.append(f"Last error: {st.last_error}")

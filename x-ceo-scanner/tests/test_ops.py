@@ -402,7 +402,9 @@ async def test_rejected_token_alert_says_how_to_fix_it(cfg: AppConfig, store: St
     assert rec.message.title == "X rejected the API key (HTTP 401) - update X_BEARER_TOKEN"
     body = rec.message.body
     assert "regenerated or revoked at console.x.com" in body
-    assert "bash x-ceo-scanner/deploy/install-server.sh --update-x-token" in body
+    assert "cd ~/ceoscan && bash x-ceo-scanner/deploy/install-server.sh --dir ~/ceoscan --update-x-token" in body
+    assert "retrying will not fix this" in body and "keeps retrying automatically" not in body
+    assert "docker compose up -d --force-recreate" in body  # setups without the installer
     assert body.rstrip().endswith(f"Last error: {last_error}")
     assert rec.message.priority == "high"
     assert len(rec.message.sms_text or "") <= 300
@@ -437,7 +439,10 @@ async def test_credits_depleted_wins_over_a_401_text(cfg: AppConfig, store: Stor
 def test_health_names_a_rejected_token(settings: Settings) -> None:
     now = datetime(2026, 11, 25, 15, 0, tzinfo=UTC)
     started = now - timedelta(hours=12)
-    hint = "X rejects the bearer token (HTTP 401): put the current token in .env (install-server.sh --update-x-token)"
+    hint = (
+        "X rejects the bearer token (HTTP 401): put the current token in .env"
+        " (servers set up with install-server.sh: run it with --update-x-token)"
+    )
     e401 = "HTTP 401 Unauthorized"
     long = IngestStatus(mode="stream", state="backoff", down_since=now - timedelta(hours=10), last_error=e401)
     level, reasons = assess_health(long, settings, now, started)

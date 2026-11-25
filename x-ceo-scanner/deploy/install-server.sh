@@ -68,6 +68,7 @@ while [ $# -gt 0 ]; do
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
+case "$INSTALL_DIR" in /*) ;; *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;; esac  # the script cd's later
 
 [ "$(uname -s)" = "Linux" ] || die "this installer is for Linux servers"
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else
@@ -246,17 +247,27 @@ cd "$APP"
 if [ "$(id -u)" -eq 0 ]; then RUN_UID=10001; RUN_GID=10001; else RUN_UID="$(id -u)"; RUN_GID="$(id -g)"; fi
 
 # --------------------------------------------------------------------------- 4. .env
+# Temp files that hold secrets; removed on every exit (also Ctrl-C) if they were not moved into place.
+NEW_ENV=""; SETENV_TMP=""
+trap 'rm -f -- ${NEW_ENV:+"$NEW_ENV"} ${SETENV_TMP:+"$SETENV_TMP"}' EXIT
 set_env_in() {  # set_env_in FILE KEY VALUE - replace or append KEY=VALUE (value written verbatim)
-    local file="$1" key="$2" val="$3" tmp
-    tmp="$(mktemp "$APP/.env.XXXXXX")"
-    chmod 600 "$tmp"
-    if [ -f "$file" ]; then grep -v "^${key}=" "$file" > "$tmp" || true; fi
-    printf '%s=%s\n' "$key" "$val" >> "$tmp"
-    mv -f "$tmp" "$file"
+    local file="$1" key="$2" val="$3"
+    SETENV_TMP="$(mktemp "$APP/.env.XXXXXX")"
+    chmod 600 "$SETENV_TMP"
+    if [ -f "$file" ]; then LC_ALL=C grep -v "^${key}=" "$file" > "$SETENV_TMP" || true; fi
+    printf '%s=%s\n' "$key" "$val" >> "$SETENV_TMP"
+    mv -f "$SETENV_TMP" "$file"
+    SETENV_TMP=""
 }
 clean_secret() { printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 env_has() { grep -Eq "^$1=.+" .env 2>/dev/null; }
 env_get() { { grep "^$1=" .env 2>/dev/null || true; } | tail -n 1 | cut -d= -f2-; }  # the last one wins, as in Docker
+saved_x_token() {  # the saved token as Docker Compose and ceoscan read it: no CR, outer spaces or one pair of quotes
+    local v
+    v="$(clean_secret "$(env_get X_BEARER_TOKEN)")"
+    case "$v" in \"*\") v="${v#\"}"; v="${v%\"}" ;; \'*\') v="${v#\'}"; v="${v%\'}" ;; esac
+    printf '%s' "$v"
+}
 
 # X's HTTP status for TOKEN on a read-only call that reads no posts (lists the stream rules):
 # 200 = accepted, 401 = rejected, 000 = no answer. The token reaches curl on stdin as a config
@@ -264,7 +275,7 @@ env_get() { { grep "^$1=" .env 2>/dev/null || true; } | tail -n 1 | cut -d= -f2-
 x_token_status() {
     case "$1" in *[!A-Za-z0-9%._~+/=-]*|"") printf 'bad'; return 0 ;; esac
     printf 'header = "Authorization: Bearer %s"\n' "$1" \
-        | curl -s -o /dev/null -w '%{http_code}' -m 20 -K - "https://api.x.com/2/tweets/search/stream/rules" 2>/dev/null \
+        | curl -q -s -o /dev/null -w '%{http_code}' -m 20 -K - "https://api.x.com/2/tweets/search/stream/rules" 2>/dev/null \
         || true
 }
 # read_x_token VAR "question": hidden prompt (up to 3 tries); a token X rejects is asked for again.
@@ -292,17 +303,16 @@ read_x_token() {
     printf -v "$__out" '%s' "$__tok"
 }
 
-NEW_ENV=""
-trap '[ -n "$NEW_ENV" ] && rm -f "$NEW_ENV"' EXIT
 if [ -f .env ] && env_has X_BEARER_TOKEN; then
     say "4/5 Keeping your existing .env (delete it and run this again to start over)"
     env_has CEOSCAN_UID || set_env_in .env CEOSCAN_UID "$RUN_UID"
     env_has CEOSCAN_GID || set_env_in .env CEOSCAN_GID "$RUN_GID"
     # A token regenerated at console.x.com cancels the old one: check the saved token with X.
-    SAVED_X_STATUS="$(x_token_status "$(env_get X_BEARER_TOKEN)")"
+    SAVED_X_STATUS="$(x_token_status "$(saved_x_token)")"
     case "$SAVED_X_STATUS" in
         200) info "X accepts the saved X bearer token" ;;
-        401|bad) warn "X rejects the X bearer token saved in .env (it was probably regenerated at console.x.com)" ;;
+        401) warn "X rejects the X bearer token saved in .env (it was probably regenerated at console.x.com)" ;;
+        bad) warn "the X bearer token saved in .env is empty or does not look like a token" ;;
         *) info "could not check the saved X bearer token with X right now (HTTP ${SAVED_X_STATUS:-no answer})" ;;
     esac
     if [ "$UPDATE_X_TOKEN" -eq 1 ] || [ "$SAVED_X_STATUS" = "401" ] || [ "$SAVED_X_STATUS" = "bad" ]; then
@@ -320,6 +330,14 @@ if [ -f .env ] && env_has X_BEARER_TOKEN; then
             unset NEW_X_TOKEN
             RECREATE=1
             info "saved the new X bearer token in .env (the rest of .env is unchanged)"
+            # Restore alerts now with the image already here; the update below restarts it once more.
+            if [ "$NO_START" -eq 0 ] && [ -n "$($SUDO docker compose ps -q ceoscan 2>/dev/null || true)" ]; then
+                if $SUDO docker compose up -d --force-recreate --no-build >/dev/null 2>&1; then
+                    info "restarted the running ceoscan with the new token"
+                else
+                    warn "could not restart ceoscan yet; it is restarted at the end of this run"
+                fi
+            fi
         fi
     fi
 else
